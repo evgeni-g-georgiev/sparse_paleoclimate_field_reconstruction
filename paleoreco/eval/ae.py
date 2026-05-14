@@ -8,8 +8,7 @@ something AE-shaped:
   ``history`` dict produced by :mod:`paleoreco.train_ae`. A different
   training loop (e.g. diffusion model) produces a different dict shape.
 * :func:`reconstruct_split` assumes the model's forward returns
-  ``(x_hat, z)`` - the AE contract. Diffusion samplers / denoisers
-  have a different signature.
+  ``(x_hat, z)`` - the AE contract. 
 
 Everything else under :mod:`paleoreco.eval` is generic and lives in
 ``shared``.
@@ -33,14 +32,22 @@ def plot_loss_curves(
 ) -> plt.Figure:
     """Two-panel: z-score MSE on the left, °C RMSE on the right.
 
-    Both panels overlay train (solid) and val (dashed) curves. If
-    ``best_epoch`` is given, a vertical line marks it on both panels.
+    Both panels overlay train (solid) and, when present, val (dashed)
+    curves. If ``best_epoch`` is given, a vertical line marks it on
+    both panels.
 
-    The °C panel is omitted if ``train_rmse_celsius`` is missing from
-    ``history`` (i.e. ``train_ae.train`` was called without
-    ``zscore_std``).
+    The val curves are omitted if ``history`` has no ``val_mse_z`` key
+    or it's empty (``train_ae.train`` called with
+    ``val_loader=None``). The °C panel is omitted if
+    ``train_rmse_celsius`` is missing or holds ``None`` (i.e.
+    ``train_ae.train`` called without ``zscore_std``).
     """
     epochs = np.arange(len(history["train_mse_z"]))
+    has_val = (
+        "val_mse_z" in history
+        and history["val_mse_z"] is not None
+        and len(history["val_mse_z"]) > 0
+    )
     has_celsius = (
         history.get("train_rmse_celsius") is not None
         and len(history["train_rmse_celsius"]) > 0
@@ -54,7 +61,8 @@ def plot_loss_curves(
 
     ax = axes[0, 0]
     ax.plot(epochs, history["train_mse_z"], label="train", lw=1.5)
-    ax.plot(epochs, history["val_mse_z"], label="val", lw=1.5, ls="--")
+    if has_val:
+        ax.plot(epochs, history["val_mse_z"], label="val", lw=1.5, ls="--")
     ax.set_xlabel("epoch")
     ax.set_ylabel("masked MSE (z-score units)")
     ax.set_title("Loss curves — z-score units (optimisation target)")
@@ -66,7 +74,11 @@ def plot_loss_curves(
     if has_celsius:
         ax = axes[0, 1]
         ax.plot(epochs, history["train_rmse_celsius"], label="train", lw=1.5)
-        ax.plot(epochs, history["val_rmse_celsius"], label="val", lw=1.5, ls="--")
+        if has_val and history.get("val_rmse_celsius"):
+            # val_rmse_celsius may be [None]*N when zscore_std wasn't
+            # passed; only overlay the curve if it carries real numbers.
+            if history["val_rmse_celsius"][0] is not None:
+                ax.plot(epochs, history["val_rmse_celsius"], label="val", lw=1.5, ls="--")
         ax.set_xlabel("epoch")
         ax.set_ylabel("RMSE (°C)")
         ax.set_title("Loss curves — °C (human-readable)")

@@ -2,15 +2,31 @@
 
 What this module does
 ---------------------
-Given :class:`~paleoreco.models.autoencoder.ConvAE`,
-two PyTorch ``DataLoader``s (train and val), and the ``safe_valid`` mask
-produced by :func:`paleoreco.data.compute_zscore_stats`, this module
-trains the model according to the following recipe:
+Given :class:`~paleoreco.models.autoencoder.ConvAE`, one (required)
+training ``DataLoader``, an optional validation ``DataLoader``, and the
+``safe_valid`` mask produced by
+:func:`paleoreco.data.compute_zscore_stats`, this module trains the
+model according to the following recipe:
 
 * AdamW (``lr=1e-3``, ``weight_decay=1e-4``)
 * CosineAnnealingLR over ``max_epochs``
-* Early stopping on validation masked-MSE (default patience 30 epochs)
-* Best-val-loss checkpoint written to disk
+* Optional early stopping on validation masked-MSE (default patience 30
+  epochs; disabled by ``patience=None``)
+* Optional best-val-loss checkpoint written to disk
+
+Two operating modes
+-------------------
+1. **With validation** (``val_loader`` given):
+   Per-epoch train and val metrics are logged; ``best_*`` keys track
+   the lowest val_mse_z seen. Early stopping fires after ``patience``
+   epochs without val improvement.
+2. **Without validation** (``val_loader=None``): Bousquet-style
+   fixed-epoch training. Only train-side metrics are
+   logged; no early stopping is possible (``patience`` is ignored);
+   ``best_state_dict`` is the *final* epoch's state, ``best_epoch`` is
+   the last epoch index, and ``best_val_loss`` is ``NaN``. If a
+   ``checkpoint_path`` is given, the final state is written once at
+   the end.
 
 The loop optimises masked-MSE **in z-score units** because that's the
 scale the model lives in. For monitoring we additionally
@@ -167,14 +183,14 @@ def evaluate(
 def train(
     model: nn.Module,
     train_loader: DataLoader,
-    val_loader: DataLoader,
-    mask: torch.Tensor | np.ndarray,
+    val_loader: DataLoader | None = None,
+    mask: torch.Tensor | np.ndarray | None = None,
     *,
     zscore_std: torch.Tensor | np.ndarray | None = None,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     max_epochs: int = 500,
-    patience: int = 30,
+    patience: int | None = 30,
     device: str | torch.device = "cpu",
     checkpoint_path: str | None = None,
     seed: int = 0,
@@ -182,7 +198,16 @@ def train(
     log_every: int = 1,
     progress: bool = True,
 ) -> dict[str, Any]:
-    """Train ``model`` with AdamW + cosine LR + early stopping.
+    """Train ``model`` with AdamW + cosine LR, optional val/early stopping.
+
+    Supports two modes (see module docstring for the high-level summary):
+
+    * **With validation** (``val_loader`` not ``None``): train+val
+      metrics per epoch, early stopping on val_mse_z (unless
+      ``patience=None``), ``best_*`` keys track the best val epoch.
+    * **Without validation** (``val_loader=None``): fixed-length
+      training, only train-side history keys, ``best_state_dict`` is
+      the final-epoch state.
 
     Parameters
     ----------
@@ -190,8 +215,12 @@ def train(
         ConvAE (or any module with the same I/O
         contract: takes ``(B, 3, H, W)``, returns ``(x_hat, z)`` where
         ``x_hat`` is ``(B, 2, H, W)``).
-    train_loader, val_loader : DataLoader
-        Wrap ``PaleoFieldDataset`` instances on disjoint age subsets.
+    train_loader : DataLoader
+        Wraps a ``PaleoFieldDataset``. 
+    val_loader : DataLoader or None, default None
+        Wraps a ``PaleoFieldDataset`` on a disjoint age subset. If
+        ``None``, no validation pass is run and no early stopping is
+        possible.
     mask : (H, W) array
         ``safe_valid`` mask. Will be moved to ``device`` and used in the
         masked-MSE loss and in :func:`evaluate`.
@@ -202,15 +231,17 @@ def train(
         AdamW hyperparameters.
     max_epochs : int
         Upper bound on training; cosine LR schedules over this length.
-        Real training usually stops earlier via early stopping.
-    patience : int
-        Number of consecutive epochs without val-loss improvement before
-        early stopping triggers.
+        With early stopping enabled, real training may stop earlier.
+    patience : int or None, default 30
+        Number of consecutive epochs without val-loss improvement
+        before early stopping triggers. ``None`` disables early
+        stopping. Ignored when ``val_loader`` is ``None``.
     device : str or torch.device
         ``"cpu"`` or ``"cuda"``.
     checkpoint_path : str, optional
-        If given, the best-val-loss state dict is written here as a
-        ``.pt`` file every time a new best is found.
+        With validation: the best-val-loss state dict is written here
+        every time a new best is found. Without validation: the final
+        state is written once at the end of training.
     seed : int
         RNG seed.
     verbose : bool
@@ -218,29 +249,34 @@ def train(
     log_every : int
         Logging cadence (epochs between progress prints).
     progress : bool
-        Show a tqdm progress bar with ETA, current val_mse_z and best.
+        Show a tqdm progress bar with ETA, current loss and best.
         Independent of ``verbose`` so the sweep loop can hide per-epoch
         text but still get a per-config progress bar.
 
     Returns
     -------
     dict with keys:
-        ``history``           : dict of lists, one per epoch, keys
-                                ``train_mse_z``, ``val_mse_z``,
-                                ``train_rmse_z``, ``val_rmse_z``,
-                                ``train_rmse_celsius``,
-                                ``val_rmse_celsius``, ``lr``,
-                                ``epoch_seconds``.
-        ``best_val_loss``     : float (z-score MSE).
-        ``best_epoch``        : int.
-        ``best_state_dict``   : OrderedDict of CPU tensors at the best
-                                epoch (suitable for ``model.load_state_dict``).
-        ``stopped_early``     : bool.
+        ``history``           : dict of lists, one per epoch. Always
+                                contains ``train_mse_z``,
+                                ``train_rmse_z``, ``train_rmse_celsius``,
+                                ``lr``, ``epoch_seconds``. With
+                                validation also contains ``val_mse_z``,
+                                ``val_rmse_z``, ``val_rmse_celsius``.
+        ``best_val_loss``     : float (z-score MSE) or ``NaN`` if no val.
+        ``best_epoch``        : int. Best val epoch, or final epoch
+                                index when there is no val loader.
+        ``best_state_dict``   : OrderedDict of CPU tensors (suitable
+                                for ``model.load_state_dict``). Best
+                                val epoch with validation; final epoch
+                                without.
+        ``stopped_early``     : bool. Always ``False`` without val.
         ``epochs_trained``    : int.
     """
     set_seed(seed)
     device = torch.device(device)
     model = model.to(device)
+    if mask is None:
+        raise ValueError("mask is required (the safe_valid mask used in the loss).")
 
     mask_t = torch.as_tensor(mask, dtype=torch.float32, device=device)
     std_t: torch.Tensor | None = None
@@ -250,22 +286,28 @@ def train(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
 
+    # History dict shape depends on mode: val keys are only present when
+    # a val loader is provided. This keeps downstream plot code from
+    # having to render misleading flat-line "val" curves.
+    has_val = val_loader is not None
     history: dict[str, list] = {
         "train_mse_z": [],
-        "val_mse_z": [],
         "train_rmse_z": [],
-        "val_rmse_z": [],
         "train_rmse_celsius": [],
-        "val_rmse_celsius": [],
         "lr": [],
         "epoch_seconds": [],
     }
+    if has_val:
+        history["val_mse_z"] = []
+        history["val_rmse_z"] = []
+        history["val_rmse_celsius"] = []
 
     best_val_loss = float("inf")
     best_epoch = -1
     best_state: dict[str, torch.Tensor] | None = None
     epochs_since_improve = 0
     stopped_early = False
+    early_stop_enabled = has_val and patience is not None
 
     # Wrap the epoch loop with tqdm if progress is requested. We use
     # tqdm.write() for the verbose per-epoch prints so they don't clobber
@@ -286,7 +328,11 @@ def train(
 
         _train_one_epoch(model, train_loader, optimizer, mask_t, device)
         train_metrics = evaluate(model, train_loader, mask_t, device, std_t)
-        val_metrics = evaluate(model, val_loader, mask_t, device, std_t)
+        val_metrics = (
+            evaluate(model, val_loader, mask_t, device, std_t)
+            if has_val
+            else None
+        )
 
         # Step the scheduler once per epoch; current LR is read *before*
         # the step so the logged value matches what the just-completed
@@ -295,62 +341,93 @@ def train(
         scheduler.step()
 
         history["train_mse_z"].append(train_metrics["mse_z"])
-        history["val_mse_z"].append(val_metrics["mse_z"])
         history["train_rmse_z"].append(train_metrics["rmse_z"])
-        history["val_rmse_z"].append(val_metrics["rmse_z"])
         history["train_rmse_celsius"].append(train_metrics["rmse_celsius"])
-        history["val_rmse_celsius"].append(val_metrics["rmse_celsius"])
+        if has_val:
+            assert val_metrics is not None  # for type-checkers
+            history["val_mse_z"].append(val_metrics["mse_z"])
+            history["val_rmse_z"].append(val_metrics["rmse_z"])
+            history["val_rmse_celsius"].append(val_metrics["rmse_celsius"])
         history["epoch_seconds"].append(time.perf_counter() - t0)
 
-        val_loss = val_metrics["mse_z"]
-        improved = val_loss < best_val_loss
-        if improved:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            best_state = {
-                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-            }
-            epochs_since_improve = 0
-            if checkpoint_path is not None:
-                os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "state_dict": best_state,
-                        "val_mse_z": val_loss,
-                    },
-                    checkpoint_path,
-                )
-        else:
-            epochs_since_improve += 1
+        # Best-tracking is only meaningful when val is available. Without
+        # val we defer "best" to the final-epoch snapshot taken after the
+        # loop exits; here we only update the best when val improves.
+        improved = False
+        if has_val:
+            assert val_metrics is not None
+            val_loss = val_metrics["mse_z"]
+            improved = val_loss < best_val_loss
+            if improved:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                best_state = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
+                epochs_since_improve = 0
+                if checkpoint_path is not None:
+                    os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "state_dict": best_state,
+                            "val_mse_z": val_loss,
+                        },
+                        checkpoint_path,
+                    )
+            else:
+                epochs_since_improve += 1
 
-        # Live progress-bar postfix: current val + best + sec/epoch.
+        # Live progress-bar postfix: prefer val_mse_z when available,
+        # fall back to train_mse_z + best (NaN displays sensibly).
         if pbar is not None:
-            pbar.set_postfix(
-                {
-                    "val_mse_z": f"{val_loss:.4f}",
-                    "best": f"{best_val_loss:.4f}",
-                    "s/ep": f"{history['epoch_seconds'][-1]:.1f}",
-                },
-                refresh=False,
-            )
+            if has_val:
+                pbar.set_postfix(
+                    {
+                        "val_mse_z": f"{val_metrics['mse_z']:.4f}",
+                        "best": f"{best_val_loss:.4f}",
+                        "s/ep": f"{history['epoch_seconds'][-1]:.1f}",
+                    },
+                    refresh=False,
+                )
+            else:
+                pbar.set_postfix(
+                    {
+                        "train_mse_z": f"{train_metrics['mse_z']:.4f}",
+                        "s/ep": f"{history['epoch_seconds'][-1]:.1f}",
+                    },
+                    refresh=False,
+                )
 
         if verbose and (epoch % log_every == 0 or improved):
-            c_str = (
-                f"  val_rmse_C={val_metrics['rmse_celsius']:.3f}"
-                if val_metrics["rmse_celsius"] is not None
+            c_train = (
+                f"  train_rmse_C={train_metrics['rmse_celsius']:.3f}"
+                if train_metrics["rmse_celsius"] is not None
                 else ""
             )
-            star = " *" if improved else "  "
-            log(
-                f"epoch {epoch:3d}{star} "
-                f"train_mse_z={train_metrics['mse_z']:.4f}  "
-                f"val_mse_z={val_loss:.4f}{c_str}  "
-                f"lr={history['lr'][-1]:.2e}  "
-                f"({history['epoch_seconds'][-1]:.1f}s)"
-            )
+            if has_val:
+                c_val = (
+                    f"  val_rmse_C={val_metrics['rmse_celsius']:.3f}"
+                    if val_metrics["rmse_celsius"] is not None
+                    else ""
+                )
+                star = " *" if improved else "  "
+                log(
+                    f"epoch {epoch:3d}{star} "
+                    f"train_mse_z={train_metrics['mse_z']:.4f}  "
+                    f"val_mse_z={val_metrics['mse_z']:.4f}{c_val}  "
+                    f"lr={history['lr'][-1]:.2e}  "
+                    f"({history['epoch_seconds'][-1]:.1f}s)"
+                )
+            else:
+                log(
+                    f"epoch {epoch:3d}   "
+                    f"train_mse_z={train_metrics['mse_z']:.4f}{c_train}  "
+                    f"lr={history['lr'][-1]:.2e}  "
+                    f"({history['epoch_seconds'][-1]:.1f}s)"
+                )
 
-        if epochs_since_improve >= patience:
+        if early_stop_enabled and epochs_since_improve >= patience:
             stopped_early = True
             if verbose:
                 log(
@@ -365,6 +442,28 @@ def train(
     # Make sure the bar is closed even if we ran the full max_epochs.
     if pbar is not None and not stopped_early:
         pbar.close()
+
+    # In val-less mode, "best" is the final-epoch state. Bousquet-style
+    # fixed-length training has no model-selection step, so the trained
+    # model *is* the final state. NaN best_val_loss signals to callers
+    # that the concept doesn't apply here.
+    if not has_val:
+        last_epoch = len(history["train_mse_z"]) - 1
+        best_state = {
+            k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+        }
+        best_epoch = last_epoch
+        best_val_loss = float("nan")
+        if checkpoint_path is not None:
+            os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+            torch.save(
+                {
+                    "epoch": last_epoch,
+                    "state_dict": best_state,
+                    "val_mse_z": None,
+                },
+                checkpoint_path,
+            )
 
     return {
         "history": history,
