@@ -29,21 +29,27 @@ from paleoreco.eval.ae import (
     reconstruct_split,
 )
 from paleoreco.eval.shared import (
+    compute_E_d,
     per_cell_rmse_celsius,
     plot_latent_sweep,
     plot_per_cell_rmse,
     plot_recon_distribution,
     plot_reconstructions,
+    pod_fit,
+    pod_predict,
     pod_test_rmse,
 )
 
 __all__ = [
     # shared
+    "compute_E_d",
     "per_cell_rmse_celsius",
     "plot_latent_sweep",
     "plot_per_cell_rmse",
     "plot_recon_distribution",
     "plot_reconstructions",
+    "pod_fit",
+    "pod_predict",
     "pod_test_rmse",
     # ae
     "plot_loss_curves",

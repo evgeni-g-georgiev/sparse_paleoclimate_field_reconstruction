@@ -25,6 +25,20 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
+# Internal helper: mask-restricted column index for the POD design matrix.
+# ---------------------------------------------------------------------------
+def _valid_column_mask(mask: np.ndarray, n_channels: int = 2) -> np.ndarray:
+    """Boolean column-keep mask for a flattened (N, C*H*W) design matrix.
+
+    POD only operates on valid cells so the basis isn't polluted by
+    zero-filled cells outside the mask. The two channels (mtco, mtwa)
+    are stacked along the column axis; each contributes ``mask.sum()``
+    kept columns, giving ``n_channels * mask.sum()`` columns in total.
+    """
+    return np.concatenate([mask.ravel()] * n_channels)
+
+
+# ---------------------------------------------------------------------------
 # Internal helper: z-score -> °C anomaly conversion.
 # ---------------------------------------------------------------------------
 def _zscore_to_anomaly(z: np.ndarray, zscore_stats: dict) -> np.ndarray:
@@ -197,6 +211,137 @@ def plot_per_cell_rmse(
 # ---------------------------------------------------------------------------
 # POD baseline + latent-dim sweep (artefact iv).
 # ---------------------------------------------------------------------------
+def pod_fit(
+    cube_z: np.ndarray,
+    fit_indices: np.ndarray,
+    mask: np.ndarray,
+    max_k: int,
+    random_state: int = 0,
+) -> dict:
+    """Fit a truncated POD basis once, on a chosen set of ages.
+
+    POD is the linear (orthogonal) baseline for the AE compressor. The
+    basis is the top ``max_k`` right singular vectors of the centred
+    fit-set design matrix; smaller ``k`` reconstructions are obtained
+    by slicing this basis (no re-fit needed).
+
+    Only valid cells participate so the basis isn't polluted by
+    zero-filled masked cells. The two channels (mtco, mtwa) are stacked
+    along the column axis so the SVD treats them on equal footing.
+
+    Note on ``fit_indices``
+    -----------------------
+    In v1 (Bousquet-style in-sample probe) pass ``np.arange(N_ages)``:
+    the AE is also fit on every age, so the fair POD baseline is fit
+    on the same data.
+
+    Parameters
+    ----------
+    cube_z : (N_ages, 2, H, W) float
+        Z-scored cube (output of :func:`paleoreco.data.apply_zscore`).
+    fit_indices : int array
+        Indices into the ``N_ages`` axis used for the SVD.
+    mask : (H, W) bool
+        ``safe_valid`` mask.
+    max_k : int
+        Largest latent dimension we'll ever want to evaluate. The
+        returned basis can be sliced down to any ``k <= max_k``.
+    random_state : int
+        Passed to sklearn's TruncatedSVD for reproducibility.
+
+    Returns
+    -------
+    dict with keys
+        ``"mu"`` : (1, D_valid) array — fit-set mean over valid columns.
+        ``"V_max"`` : (max_k, D_valid) array — top-``max_k`` right
+            singular vectors (rows are POD modes).
+        ``"fit_indices_used"`` : ndarray copy of ``fit_indices``.
+        ``"keep_mask"`` : (2*H*W,) bool — column-keep mask used to
+            extract valid columns from a flattened cube.
+        ``"shape"`` : ``(2, H, W)`` — original spatial shape, used by
+            :func:`pod_predict` to scatter reconstructions back.
+    """
+    from sklearn.decomposition import TruncatedSVD
+
+    n_channels, H, W = cube_z.shape[1:]
+    keep = _valid_column_mask(mask, n_channels=n_channels)
+    X_all = cube_z.reshape(cube_z.shape[0], -1)[:, keep]
+    X_fit = X_all[fit_indices]
+
+    mu = X_fit.mean(axis=0, keepdims=True)  # (1, D_valid)
+    X_fit_c = X_fit - mu
+
+    # Fit once at max_k and slice for smaller k - randomised SVD is
+    # much cheaper that way than separate fits per k.
+    svd = TruncatedSVD(
+        n_components=max_k, algorithm="randomized", random_state=random_state,
+    )
+    svd.fit(X_fit_c)
+
+    return {
+        "mu": mu,                                # (1, D_valid)
+        "V_max": svd.components_,                # (max_k, D_valid)
+        "fit_indices_used": np.asarray(fit_indices).copy(),
+        "keep_mask": keep,                       # (2*H*W,)
+        "shape": (n_channels, H, W),
+    }
+
+
+def pod_predict(
+    cube_z: np.ndarray,
+    eval_indices: np.ndarray,
+    pod_basis: dict,
+    k: int,
+) -> np.ndarray:
+    """Reconstruct ``cube_z[eval_indices]`` from a fitted POD basis at rank ``k``.
+
+    The recipe: extract valid columns, centre on the fit-set mean,
+    project onto the top ``k`` POD modes, back-project, add the mean
+    back, and scatter into a full ``(N, 2, H, W)`` array with zero
+    outside the mask. Outputs match the convention of an AE
+    reconstruction (z-score units, zero on masked cells), so the same
+    downstream metric / plot functions consume both.
+
+    Parameters
+    ----------
+    cube_z : (N_ages, 2, H, W) float
+        Z-scored cube. Only ``cube_z[eval_indices]`` is touched.
+    eval_indices : int array
+        Indices into the ``N_ages`` axis to reconstruct.
+    pod_basis : dict
+        Output of :func:`pod_fit`.
+    k : int
+        Number of POD modes to keep. Must satisfy ``1 <= k <= max_k``
+        of the fitted basis.
+
+    Returns
+    -------
+    np.ndarray of shape ``(len(eval_indices), 2, H, W)``.
+        Reconstruction in z-score units, zero outside the mask.
+    """
+    V_max = pod_basis["V_max"]
+    mu = pod_basis["mu"]
+    keep = pod_basis["keep_mask"]
+    n_channels, H, W = pod_basis["shape"]
+    max_k = V_max.shape[0]
+    if not (1 <= k <= max_k):
+        raise ValueError(f"k={k} out of range (basis fit at max_k={max_k}).")
+
+    Vk = V_max[:k]                                # (k, D_valid)
+    X = cube_z.reshape(cube_z.shape[0], -1)[:, keep]
+    X_eval = X[eval_indices]
+    X_c = X_eval - mu
+    X_hat_c = X_c @ Vk.T @ Vk                     # (N_eval, D_valid)
+    X_hat = X_hat_c + mu                          # back to original mean
+
+    # Scatter into full (N_eval, 2*H*W) with zero on masked cells, then
+    # reshape to (N_eval, 2, H, W). Matches the AE output convention.
+    n_eval = X_hat.shape[0]
+    full = np.zeros((n_eval, n_channels * H * W), dtype=cube_z.dtype)
+    full[:, keep] = X_hat.astype(cube_z.dtype, copy=False)
+    return full.reshape(n_eval, n_channels, H, W)
+
+
 def pod_test_rmse(
     cube_z: np.ndarray,
     fit_indices: np.ndarray,
@@ -205,89 +350,102 @@ def pod_test_rmse(
     ks: Sequence[int],
     random_state: int = 0,
 ) -> np.ndarray:
-    """Best linear k-mode reconstruction RMSE on the test split.
+    """Back-compat wrapper: per-``k`` test RMSE in z-score units.
 
-    The POD basis is the truncated SVD of the **fit** data, centred on
-    its own mean. The k-mode reconstruction error on the test split is
-    the fair "linear bound" for a model with ``k`` latent dimensions —
-    a non-linear AE at the same ``latent_dim`` should equal or beat it.
-
-    Note on ``fit_indices`` — fair-data-budget convention
-    -----------------------------------------------------
-    The trained AE consumes both the train ages (gradient updates) and
-    the val ages (early-stopping / best-epoch selection) before being
-    evaluated on test. POD has no model-selection step that needs a
-    held-out val, so for an apples-to-apples comparison we fit the SVD
-    on ``train ∪ val`` - the same total data budget the AE had access
-    to before test eval. Pass ``np.concatenate([split["train"],
-    split["val"]])`` from the caller. Using ``split["train"]`` alone
-    would unfairly handicap POD by ~5% fewer samples, and the missing
-    samples would be a single D-O event adjacent to the test event.
-
-    Parameters
-    ----------
-    cube_z : (N_ages, 2, H, W) float
-        Z-scored cube (output of :func:`paleoreco.data.apply_zscore`).
-    fit_indices, test_indices : int arrays
-        Indices into the ``N_ages`` axis. ``fit_indices`` is what the
-        SVD is computed on; ``test_indices`` is the held-out slice the
-        RMSE is reported on.
-    mask : (H, W) bool
-        ``safe_valid`` mask. Only valid cells participate in the SVD
-        so the basis isn't polluted by zero-filled cells.
-    ks : sequence of int
-        Latent dimensions to evaluate, e.g. ``[2, 4, 8, 16, 32, 64]``.
-    random_state : int
-        Passed to sklearn's TruncatedSVD for reproducibility.
+    Thin wrapper around :func:`pod_fit` + :func:`pod_predict`. Kept
+    for code that still wants the original convenience signature. New
+    code should call ``pod_fit`` / ``pod_predict`` directly and use
+    :func:`compute_E_d` as the headline metric.
 
     Returns
     -------
     np.ndarray of shape ``(len(ks),)``
-        Test RMSE in z-score units, one per ``k``.
+        Per-``k`` masked-RMSE in z-score units over ``test_indices``.
     """
-    from sklearn.decomposition import TruncatedSVD
-
-    # Flatten samples to (N, 2*H*W), then restrict columns to valid cells
-    # (across both channels). The "* 2" stacks both channels along the
-    # column axis - the SVD treats them on equal footing.
-    keep = np.concatenate([mask.ravel(), mask.ravel()])
-    X_all = cube_z.reshape(cube_z.shape[0], -1)[:, keep]
-
-    X_fit = X_all[fit_indices]
-    X_test = X_all[test_indices]
-
-    # Centre on the fit-set mean. POD requires zero-mean data; using the
-    # fit-set mean (not the global mean) keeps the test split honest.
-    mu = X_fit.mean(axis=0, keepdims=True)
-    X_fit_c = X_fit - mu
-    X_test_c = X_test - mu
-
-    # Fit once at max(ks) and slice for smaller k - randomised SVD is
-    # much cheaper that way than separate fits per k.
     max_k = int(max(ks))
-    svd = TruncatedSVD(n_components=max_k, algorithm="randomized", random_state=random_state)
-    svd.fit(X_fit_c)
-    V = svd.components_  # (max_k, D)
-
+    basis = pod_fit(cube_z, fit_indices, mask, max_k, random_state=random_state)
+    truth = cube_z[test_indices]
+    mask_3d = mask[None, None]                    # broadcast over (N, C, H, W)
     rmses = []
     for k in ks:
-        Vk = V[:k]
-        # Project test data onto top-k modes, then back: X̂ = X V_k^T V_k.
-        X_hat = X_test_c @ Vk.T @ Vk
-        rmses.append(float(np.sqrt(np.mean((X_test_c - X_hat) ** 2))))
+        pred = pod_predict(cube_z, test_indices, basis, k)
+        sq = (pred - truth) ** 2 * mask_3d
+        rmses.append(float(np.sqrt(sq.sum() / (truth.shape[0] * 2 * mask.sum()))))
     return np.array(rmses, dtype=np.float64)
+
+
+# ---------------------------------------------------------------------------
+# Bousquet's E_d compression-quality metric.
+# ---------------------------------------------------------------------------
+def compute_E_d(
+    truth_z: np.ndarray,
+    pred_z: np.ndarray,
+    mask: np.ndarray,
+    eps: float = 1e-12,
+) -> float:
+    """Bousquet 2025 Eq. 14: fraction of variance captured, averaged per snapshot.
+
+    .. math::
+
+        E_d = 1 - \\frac{1}{N_t} \\sum_t
+                  \\frac{\\sum_{c,(i,j) \\in \\text{mask}} (u_t - \\hat u_t)^2}
+                       {\\sum_{c,(i,j) \\in \\text{mask}} u_t^2}.
+
+    Two key points:
+
+    * The ratio is computed **per snapshot** and then averaged across
+      snapshots - *not* a single global numerator/denominator ratio.
+      This matches Bousquet exactly and weighs every snapshot equally
+      regardless of its magnitude.
+    * The sum runs over valid cells across **both** channels, so the
+      mask broadcasts to ``(N, 2, H, W)``.
+
+    Parameters
+    ----------
+    truth_z, pred_z : (N, 2, H, W) float
+        Truth and reconstruction in z-score units.
+    mask : (H, W) bool
+        ``safe_valid`` mask.
+    eps : float
+        Guards a snapshot with vanishing ``||u||^2`` (impossible in
+        practice for our z-scored cube, but cheap to defend against).
+
+    Returns
+    -------
+    float
+        ``E_d`` - values near 1 mean near-perfect compression. Bousquet
+        reports values around 0.99+ for periodic flows, dropping to
+        ~0.4-0.8 for the turbulent von Kármán case.
+    """
+    mask_b = mask[None, None].astype(bool)        # (1, 1, H, W)
+    sq_err = ((pred_z - truth_z) ** 2) * mask_b   # zeros outside mask
+    sq_truth = (truth_z ** 2) * mask_b
+
+    # Per-snapshot spatial sums over (channel, valid-cell). Shape: (N,).
+    num = sq_err.reshape(sq_err.shape[0], -1).sum(axis=1)
+    den = sq_truth.reshape(sq_truth.shape[0], -1).sum(axis=1)
+
+    # Per-snapshot ratio, then mean over snapshots.
+    ratio = num / np.maximum(den, eps)
+    return float(1.0 - ratio.mean())
 
 
 def plot_latent_sweep(
     latent_dims: Sequence[int],
-    model_rmse_z: Sequence[float],
-    pod_rmse_z: Sequence[float] | None = None,
+    model_E_d: Sequence[float],
+    pod_E_d: Sequence[float] | None = None,
     model_rmse_celsius: Sequence[float] | None = None,
     model_label: str = "model",
     save_path: str | None = None,
 ) -> plt.Figure:
-    """Sweep curve. Left: z-score unit RMSE with optional POD overlay.
-    Right (if ``model_rmse_celsius`` given): the same curve in °C units.
+    """Bousquet-style latent-dim sweep.
+
+    Primary (left) panel: ``E_d`` vs latent dim with optional POD
+    overlay — the headline AE-vs-POD comparison (Bousquet Fig 3).
+    Secondary (right) panel: ``rmse_celsius`` vs latent dim - the
+    same diagnostic in °C units, model curve only
+    (POD °C-RMSE is omitted; the head-to-head story lives on the
+    E_d panel).
 
     Log-2 x-axis with explicit tick labels at the sweep points.
     ``model_label`` is shown in the legend - defaults to ``"model"`` so
@@ -301,15 +459,15 @@ def plot_latent_sweep(
     )
 
     ax = axes[0, 0]
-    ax.plot(latent_dims, model_rmse_z, "o-", color="C0", label=model_label, lw=1.6)
-    if pod_rmse_z is not None:
-        ax.plot(latent_dims, pod_rmse_z, "s--", color="C3", alpha=0.7, label="POD truncation")
+    ax.plot(latent_dims, model_E_d, "o-", color="C0", label=model_label, lw=1.6)
+    if pod_E_d is not None:
+        ax.plot(latent_dims, pod_E_d, "s--", color="C3", alpha=0.7, label="POD truncation")
     ax.set_xscale("log", base=2)
     ax.set_xticks(list(latent_dims))
     ax.set_xticklabels([str(d) for d in latent_dims])
     ax.set_xlabel("latent dim")
-    ax.set_ylabel("test RMSE (z-score units)")
-    ax.set_title("Latent-dim sweep — z-score (head-to-head with POD)")
+    ax.set_ylabel(r"$E_d$ (Bousquet)")
+    ax.set_title("Latent-dim sweep — $E_d$ (head-to-head with POD)")
     ax.grid(True, alpha=0.3)
     ax.legend()
 
@@ -320,8 +478,8 @@ def plot_latent_sweep(
         ax.set_xticks(list(latent_dims))
         ax.set_xticklabels([str(d) for d in latent_dims])
         ax.set_xlabel("latent dim")
-        ax.set_ylabel("test RMSE (°C)")
-        ax.set_title("Latent-dim sweep — °C")
+        ax.set_ylabel("RMSE (°C)")
+        ax.set_title("Latent-dim sweep — °C (secondary, human-readable)")
         ax.grid(True, alpha=0.3)
 
     if save_path:
