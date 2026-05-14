@@ -1,9 +1,25 @@
-opencv-python
-numpy
-matplotlib
-tqdm
-pandas
-torch
-adao
+# Python dependencies for the sparse-paleoclimate-field-reconstruction project.
 
-ipykernel
+# TODO: Further downstream, pin versions so experiments are reproducable against same library versions.
+# Installed into the venv at ./paleo (gitignored).
+
+# ---- Core scientific Python stack -------------------------------------------
+numpy
+pandas
+matplotlib
+
+# ---- Machine learning -------------------------------------------------------
+torch                 
+scikit-learn          
+
+# ---- Domain-specific --------------------------------------------------------
+adao                  
+
+# ---- Notebook + dev experience ---------------------------------------------
+ipykernel             
+tqdm                  
+
+# ---- Legacy ----------------------------------------------------------------
+# Imported by the reference notebook (notebooks/read_data.ipynb)
+# but not used by paleoreco/ source code. Keep until that notebook is retired.
+opencv-python
