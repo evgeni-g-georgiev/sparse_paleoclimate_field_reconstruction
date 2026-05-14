@@ -44,7 +44,7 @@ import math
 import os
 import random
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -197,6 +197,7 @@ def train(
     verbose: bool = True,
     log_every: int = 1,
     progress: bool = True,
+    epoch_callback: Callable[[int, nn.Module], None] | None = None,
 ) -> dict[str, Any]:
     """Train ``model`` with AdamW + cosine LR, optional val/early stopping.
 
@@ -252,6 +253,16 @@ def train(
         Show a tqdm progress bar with ETA, current loss and best.
         Independent of ``verbose`` so the sweep loop can hide per-epoch
         text but still get a per-config progress bar.
+    epoch_callback : Callable[[int, nn.Module], None] or None
+        Optional hook called at the end of every epoch, after metric
+        logging and best-tracking and **before** the early-stop check
+        or scheduler step. Receives ``(epoch_index, model)``. The model
+        is in ``eval`` mode for the duration of the call and is
+        restored to ``train`` mode immediately after, so callbacks can
+        call ``model.encode(...)`` / ``model(...)`` safely without
+        worrying about BN/dropout state. Used by 02_ae_v1's d=2 deep
+        dive to snapshot per-epoch state dicts for the Bousquet
+        per-mode-learning-curve analysis.
 
     Returns
     -------
@@ -426,6 +437,23 @@ def train(
                     f"lr={history['lr'][-1]:.2e}  "
                     f"({history['epoch_seconds'][-1]:.1f}s)"
                 )
+
+        # Fire the per-epoch hook (notebook deep-dive uses this to
+        # snapshot state dicts / latents). The model is switched to
+        # eval mode under no_grad so the callback can call
+        # ``model.encode(...)`` or ``model(...)`` cleanly without
+        # worrying about BN/dropout state or gradient bookkeeping. We
+        # restore train mode immediately so the next epoch's
+        # ``_train_one_epoch`` call sees the expected state.
+        if epoch_callback is not None:
+            was_training = model.training
+            model.eval()
+            try:
+                with torch.no_grad():
+                    epoch_callback(epoch, model)
+            finally:
+                if was_training:
+                    model.train()
 
         if early_stop_enabled and epochs_since_improve >= patience:
             stopped_early = True
