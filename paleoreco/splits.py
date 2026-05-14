@@ -1,5 +1,19 @@
 """Dansgaard–Oeschger event-aware train/val/test split for the Prior cube.
 
+.. note::
+    **Scope: For downstream models only.** This module exists to support held-out-event
+    evaluation of *conditional reconstruction* in downstream models, where the model
+    is asked to reconstruct a D–O event it has never seen given sparse
+    observations from that event. The v1 autoencoder is trained as a
+    **compressor of the full Prior** and is fit + evaluated on all 804
+    ages with no train/val/test split (see Bousquet 2025 §3.1, the
+    methodological template). Do not call
+    :func:`split_ages_by_do_event` from v1 contexts. The two artefacts
+    that *are* used by v1 — :data:`DO_EVENT_WINDOWS` and
+    :func:`assign_event_label` — are imported only for *presentation*
+    purposes (shading the EDA timeline, colouring the latent-space
+    scatter by D–O event index).
+
 Background
 ----------
 The Prior is a LOVECLIM simulation spanning ~29,100 to ~49,175 yr BP, which
