@@ -199,7 +199,7 @@ def plot_per_cell_rmse(
 # ---------------------------------------------------------------------------
 def pod_test_rmse(
     cube_z: np.ndarray,
-    train_indices: np.ndarray,
+    fit_indices: np.ndarray,
     test_indices: np.ndarray,
     mask: np.ndarray,
     ks: Sequence[int],
@@ -207,17 +207,31 @@ def pod_test_rmse(
 ) -> np.ndarray:
     """Best linear k-mode reconstruction RMSE on the test split.
 
-    The POD basis is the truncated SVD of the **training** data, centred
-    on its own mean. The k-mode reconstruction error on the test split
-    is the fair "linear bound" for a model with ``k`` latent dimensions
-    - a non-linear AE at the same ``latent_dim`` should equal or beat it.
+    The POD basis is the truncated SVD of the **fit** data, centred on
+    its own mean. The k-mode reconstruction error on the test split is
+    the fair "linear bound" for a model with ``k`` latent dimensions —
+    a non-linear AE at the same ``latent_dim`` should equal or beat it.
+
+    Note on ``fit_indices`` — fair-data-budget convention
+    -----------------------------------------------------
+    The trained AE consumes both the train ages (gradient updates) and
+    the val ages (early-stopping / best-epoch selection) before being
+    evaluated on test. POD has no model-selection step that needs a
+    held-out val, so for an apples-to-apples comparison we fit the SVD
+    on ``train ∪ val`` - the same total data budget the AE had access
+    to before test eval. Pass ``np.concatenate([split["train"],
+    split["val"]])`` from the caller. Using ``split["train"]`` alone
+    would unfairly handicap POD by ~5% fewer samples, and the missing
+    samples would be a single D-O event adjacent to the test event.
 
     Parameters
     ----------
     cube_z : (N_ages, 2, H, W) float
         Z-scored cube (output of :func:`paleoreco.data.apply_zscore`).
-    train_indices, test_indices : int arrays
-        Indices into the ``N_ages`` axis.
+    fit_indices, test_indices : int arrays
+        Indices into the ``N_ages`` axis. ``fit_indices`` is what the
+        SVD is computed on; ``test_indices`` is the held-out slice the
+        RMSE is reported on.
     mask : (H, W) bool
         ``safe_valid`` mask. Only valid cells participate in the SVD
         so the basis isn't polluted by zero-filled cells.
@@ -239,20 +253,20 @@ def pod_test_rmse(
     keep = np.concatenate([mask.ravel(), mask.ravel()])
     X_all = cube_z.reshape(cube_z.shape[0], -1)[:, keep]
 
-    X_train = X_all[train_indices]
+    X_fit = X_all[fit_indices]
     X_test = X_all[test_indices]
 
-    # Centre on training mean. POD requires zero-mean data; using the
-    # training mean (not the global mean) keeps the test split honest.
-    mu = X_train.mean(axis=0, keepdims=True)
-    X_train_c = X_train - mu
+    # Centre on the fit-set mean. POD requires zero-mean data; using the
+    # fit-set mean (not the global mean) keeps the test split honest.
+    mu = X_fit.mean(axis=0, keepdims=True)
+    X_fit_c = X_fit - mu
     X_test_c = X_test - mu
 
     # Fit once at max(ks) and slice for smaller k - randomised SVD is
     # much cheaper that way than separate fits per k.
     max_k = int(max(ks))
     svd = TruncatedSVD(n_components=max_k, algorithm="randomized", random_state=random_state)
-    svd.fit(X_train_c)
+    svd.fit(X_fit_c)
     V = svd.components_  # (max_k, D)
 
     rmses = []
