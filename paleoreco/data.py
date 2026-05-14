@@ -129,7 +129,7 @@ def build_prior_cube(
 
 
 def verify_mask_constant_across_ages(cube: np.ndarray) -> bool:
-    """Sanity check the v1 assumption that the valid mask is constant in time.
+    """Sanity check the assumption that the valid mask is constant in time.
 
     Computes a per-age finite-mask and compares each age's mask to age 0.
     Prints a diagnostic if any age disagrees. Used in 01_eda.ipynb.
