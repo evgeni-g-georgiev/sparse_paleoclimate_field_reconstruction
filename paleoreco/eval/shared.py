@@ -488,6 +488,356 @@ def plot_latent_sweep(
 
 
 # ---------------------------------------------------------------------------
+# Bousquet Layer-2 primitives.
+# ---------------------------------------------------------------------------
+# These functions implement the latent-space analysis Bousquet performs
+# at low latent dimension (his §3.2). They are deliberately kept
+# model-agnostic so the same code drives the AE deep-dive in v1 and any
+# downstream model with a 2D latent space.
+# ---------------------------------------------------------------------------
+def compute_pod_time_coefficients(
+    cube_z: np.ndarray,
+    mask: np.ndarray,
+    pod_basis: dict,
+) -> np.ndarray:
+    """Bousquet's POD time-coefficients ``a_k(t)`` (his Eq. 22).
+
+    Each snapshot is centred on the POD fit-set mean and projected onto
+    each POD mode, yielding a single scalar coefficient per (snapshot,
+    mode). The basis is assumed orthonormal (sklearn's ``TruncatedSVD``
+    components are), so the projection is a simple inner product.
+
+    Parameters
+    ----------
+    cube_z : (N_ages, 2, H, W) float
+        Z-scored cube — every age is projected; no slicing here so the
+        full ``a_k(t)`` time series is available.
+    mask : (H, W) bool
+        ``safe_valid`` mask. Only valid cells participate, matching the
+        column convention used in :func:`pod_fit`.
+    pod_basis : dict
+        Output of :func:`pod_fit`. Provides ``mu``, ``V_max``,
+        ``keep_mask``.
+
+    Returns
+    -------
+    np.ndarray of shape ``(N_ages, max_k)``
+        ``a_k(t)`` for each (snapshot, POD-mode index) pair.
+    """
+    V_max = pod_basis["V_max"]                    # (max_k, D_valid)
+    mu = pod_basis["mu"]                          # (1, D_valid)
+    keep = pod_basis["keep_mask"]
+
+    X = cube_z.reshape(cube_z.shape[0], -1)[:, keep]
+    X_c = X - mu
+    # (N_ages, D_valid) @ (D_valid, max_k) = (N_ages, max_k).
+    return X_c @ V_max.T
+
+
+def per_mode_learning_accuracy(
+    pod_a_k: np.ndarray,
+    ae_a_k_per_epoch: np.ndarray,
+) -> np.ndarray:
+    """Bousquet's per-mode learning accuracy ``e_k`` (his Eq. 23).
+
+    For each (epoch, POD-mode) pair:
+
+    .. math::
+
+        e_k = \\max\\left(0,\\ 1 -
+              \\frac{\\sum_t (a_k(t) - \\tilde a_k(t))^2}
+                   {\\sum_t a_k(t)^2}\\right)
+
+    where ``a_k`` is the true POD coefficient and ``\\tilde a_k`` is the
+    coefficient obtained by projecting the **model's reconstruction**
+    onto the same POD mode at that epoch. The ``max(0, ·)`` clip keeps
+    pre-training noise from producing nonsense negative accuracies.
+
+    Parameters
+    ----------
+    pod_a_k : (N_ages, max_k) float
+        Output of :func:`compute_pod_time_coefficients` on the truth.
+    ae_a_k_per_epoch : (n_epochs, N_ages, max_k) float
+        Per-epoch model-reconstruction coefficients. Built in the
+        notebook by snapshotting per-epoch state dicts, replaying
+        forward, and feeding the reconstructions through
+        :func:`compute_pod_time_coefficients`.
+
+    Returns
+    -------
+    np.ndarray of shape ``(n_epochs, max_k)``
+        ``e_k`` per epoch and per POD mode.
+    """
+    n_epochs = ae_a_k_per_epoch.shape[0]
+    den = (pod_a_k ** 2).sum(axis=0)              # (max_k,)
+    out = np.empty((n_epochs, pod_a_k.shape[1]), dtype=np.float64)
+    for e in range(n_epochs):
+        diff = pod_a_k - ae_a_k_per_epoch[e]
+        num = (diff ** 2).sum(axis=0)             # (max_k,)
+        out[e] = np.maximum(0.0, 1.0 - num / np.maximum(den, 1e-12))
+    return out
+
+
+def plot_per_mode_learning_curves(
+    per_mode_acc: np.ndarray,
+    ks_to_show: Sequence[int] | None = None,
+    save_path: str | None = None,
+) -> plt.Figure:
+    """Bousquet Fig 11 / 14: per-POD-mode learning curves vs training epoch.
+
+    The x-axis is log-spaced training epoch (Bousquet's convention); the
+    y-axis is the per-mode learning accuracy ``e_k`` from
+    :func:`per_mode_learning_accuracy`. One coloured line per mode tells
+    you which modes the model picks up first.
+
+    ``ks_to_show`` defaults to all modes the array contains. Pass a
+    short list to highlight specific modes.
+    """
+    n_epochs, max_k = per_mode_acc.shape
+    if ks_to_show is None:
+        ks_to_show = list(range(max_k))
+    epochs = np.arange(1, n_epochs + 1)            # log-x starts at 1.
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5), constrained_layout=True)
+    cmap = plt.get_cmap("viridis")
+    for k in ks_to_show:
+        if not (0 <= k < max_k):
+            continue
+        color = cmap(k / max(max_k - 1, 1))
+        ax.plot(epochs, per_mode_acc[:, k], lw=1.4, color=color, label=f"k={k}")
+    ax.set_xscale("log")
+    ax.set_xlabel("training epoch (log scale)")
+    ax.set_ylabel(r"$e_k$  (per-mode learning accuracy)")
+    ax.set_title("Per-POD-mode learning curves")
+    ax.set_ylim(-0.02, 1.02)
+    ax.grid(True, alpha=0.3)
+    ax.legend(ncol=2, fontsize=8, loc="lower right")
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight", dpi=120)
+    return fig
+
+
+def plot_latent_2d(
+    latents: np.ndarray,
+    color_values: np.ndarray,
+    color_label: str,
+    save_path: str | None = None,
+    title: str = "Latent space (2D)",
+    discrete: bool | None = None,
+) -> plt.Figure:
+    """Bousquet Fig 9 / 10: 2D scatter of the AE's ``(Z_1, Z_2)`` latent.
+
+    ``color_values`` is typically the integer D-O event label (output
+    of :func:`paleoreco.splits.assign_event_label`) or the age in yr
+    BP. ``discrete`` controls colour-bar style; default auto-detects
+    based on whether ``color_values`` is integer-typed with a small
+    cardinality.
+    """
+    if latents.ndim != 2 or latents.shape[1] != 2:
+        raise ValueError(
+            f"plot_latent_2d expects (N, 2) latents, got {latents.shape}"
+        )
+
+    if discrete is None:
+        is_int = np.issubdtype(np.asarray(color_values).dtype, np.integer)
+        discrete = bool(is_int and len(np.unique(color_values)) <= 16)
+
+    fig, ax = plt.subplots(figsize=(6.0, 5.0), constrained_layout=True)
+    if discrete:
+        # Use a categorical-ish colormap so values like 0..8 read as
+        # event indices rather than a continuum.
+        levels = np.unique(color_values)
+        cmap = plt.get_cmap("tab10", max(len(levels), 1))
+        sc = ax.scatter(
+            latents[:, 0], latents[:, 1],
+            c=color_values, cmap=cmap, s=14, alpha=0.85, edgecolor="none",
+        )
+        cbar = plt.colorbar(sc, ax=ax, ticks=levels)
+        cbar.set_label(color_label)
+    else:
+        sc = ax.scatter(
+            latents[:, 0], latents[:, 1],
+            c=color_values, cmap="viridis", s=14, alpha=0.85, edgecolor="none",
+        )
+        cbar = plt.colorbar(sc, ax=ax)
+        cbar.set_label(color_label)
+    ax.set_xlabel(r"$Z_1$")
+    ax.set_ylabel(r"$Z_2$")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.axhline(0, color="k", lw=0.5, alpha=0.4)
+    ax.axvline(0, color="k", lw=0.5, alpha=0.4)
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight", dpi=120)
+    return fig
+
+
+def partition_latent_2d(
+    latents: np.ndarray,
+    criterion: str | int,
+    random_state: int = 0,
+) -> np.ndarray:
+    """Partition snapshots in latent space; returns integer cluster labels.
+
+    Two criteria, both used by Bousquet:
+
+    * ``criterion="z2_sign"``: binary split by the sign of ``Z_2``.
+      Cheap, interpretable, and a useful first cut whenever the 2D
+      latent looks two-lobed (Bousquet Fig 13). Labels: 0 for
+      ``Z_2 < 0``, 1 for ``Z_2 >= 0``.
+    * ``criterion=int n``: KMeans with ``n`` clusters
+      (Bousquet's Fig 15 / 20 partition). ``random_state`` is fixed so
+      cluster IDs are reproducible across runs.
+    """
+    if latents.ndim != 2 or latents.shape[1] != 2:
+        raise ValueError(
+            f"partition_latent_2d expects (N, 2) latents, got {latents.shape}"
+        )
+
+    if criterion == "z2_sign":
+        return (latents[:, 1] >= 0).astype(np.int64)
+    if isinstance(criterion, int):
+        from sklearn.cluster import KMeans
+        km = KMeans(n_clusters=criterion, n_init=10, random_state=random_state)
+        return km.fit_predict(latents).astype(np.int64)
+    raise ValueError(
+        f"unknown criterion {criterion!r}; expected 'z2_sign' or an int."
+    )
+
+
+def plot_per_cluster_pod_distributions(
+    pod_a_k: np.ndarray,
+    cluster_labels: np.ndarray,
+    ks_to_show: Sequence[int],
+    save_path: str | None = None,
+) -> plt.Figure:
+    """Bousquet Fig 15: per-cluster densities of POD time-coefficients.
+
+    One row per POD mode in ``ks_to_show``, one panel per row showing
+    the overlaid per-cluster densities of ``a_k(t)``. This is the
+    Bousquet-style diagnostic for *what each cluster encodes* - if
+    cluster 0 concentrates the negative tail of ``a_1`` and cluster 1
+    the positive tail, the latent has split along the ``a_1`` axis.
+    """
+    if pod_a_k.shape[0] != cluster_labels.shape[0]:
+        raise ValueError(
+            "pod_a_k and cluster_labels must have the same first axis "
+            f"(got {pod_a_k.shape[0]} vs {cluster_labels.shape[0]})."
+        )
+    levels = np.unique(cluster_labels)
+    n_rows = len(ks_to_show)
+    fig, axes = plt.subplots(
+        n_rows, 1, figsize=(7.5, 2.0 * n_rows + 1),
+        squeeze=False, constrained_layout=True,
+    )
+
+    for row, k in enumerate(ks_to_show):
+        ax = axes[row, 0]
+        a_k = pod_a_k[:, k]
+        lo, hi = float(a_k.min()), float(a_k.max())
+        bins = np.linspace(lo, hi, 50)
+        for lev in levels:
+            sub = a_k[cluster_labels == lev]
+            if sub.size == 0:
+                continue
+            ax.hist(
+                sub, bins=bins, alpha=0.55, density=True,
+                label=f"cluster {int(lev)} (n={sub.size})",
+            )
+        ax.axvline(0, color="k", lw=0.6, alpha=0.4)
+        ax.set_xlabel(rf"$a_{{{k}}}(t)$")
+        ax.set_ylabel("density")
+        ax.set_title(rf"POD mode $k={k}$")
+        ax.legend(fontsize=8)
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight", dpi=120)
+    return fig
+
+
+def plot_per_cluster_reconstructions(
+    cube: np.ndarray,
+    cluster_labels: np.ndarray,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    mask: np.ndarray,
+    var_names: Sequence[str] = ("mtco", "mtwa"),
+    unit_label: str = "°C anomaly",
+    save_path: str | None = None,
+) -> plt.Figure:
+    """Bousquet Fig 20: per-cluster mean physical-space field.
+
+    For each cluster, the snapshots assigned to that cluster are
+    averaged and plotted as a map per channel. Useful for asking *what
+    the latent partition actually corresponds to in physical space* -
+    e.g. cluster 0 = "warm interstadial composite", cluster 1 = "cold
+    stadial composite".
+
+    ``cube`` is plotted as-is: the caller decides which units. v1 will
+    typically pass ``cube_z * std`` (°C anomaly) or ``cube_z * std +
+    mean`` (absolute °C). Cells outside ``mask`` are rendered NaN.
+
+    Layout: one row per cluster, one column per channel.
+    """
+    if cube.shape[0] != cluster_labels.shape[0]:
+        raise ValueError(
+            "cube and cluster_labels must have the same first axis "
+            f"(got {cube.shape[0]} vs {cluster_labels.shape[0]})."
+        )
+    levels = np.unique(cluster_labels)
+    n_channels = cube.shape[1]
+    if len(var_names) != n_channels:
+        raise ValueError("var_names must match cube channel count.")
+
+    fig, axes = plt.subplots(
+        len(levels), n_channels,
+        figsize=(4.5 * n_channels + 0.5, 2.6 * len(levels) + 0.5),
+        squeeze=False, constrained_layout=True,
+    )
+    extent = [lons.min(), lons.max(), lats.min(), lats.max()]
+
+    # Symmetric colour scale per channel from the per-cluster means
+    # (so warm/cold composites are directly comparable across rows).
+    per_cluster_means = []
+    for lev in levels:
+        sub = cube[cluster_labels == lev]
+        if sub.size == 0:
+            mean_field = np.full_like(cube[0], np.nan, dtype=np.float64)
+        else:
+            mean_field = sub.mean(axis=0)
+        mean_field = np.where(mask[None], mean_field, np.nan)
+        per_cluster_means.append(mean_field)
+    stacked = np.stack(per_cluster_means)  # (n_levels, C, H, W)
+    vmax = [
+        float(np.nanpercentile(np.abs(stacked[:, c]), 99))
+        for c in range(n_channels)
+    ]
+
+    for r, lev in enumerate(levels):
+        n_in_cluster = int((cluster_labels == lev).sum())
+        for c in range(n_channels):
+            ax = axes[r, c]
+            im = ax.imshow(
+                per_cluster_means[r][c], origin="lower", extent=extent,
+                cmap="RdBu_r", vmin=-vmax[c], vmax=vmax[c], aspect="auto",
+            )
+            if r == 0:
+                ax.set_title(f"{var_names[c]} ({unit_label})")
+            if c == 0:
+                ax.set_ylabel(f"cluster {int(lev)}\n(n={n_in_cluster})")
+            ax.set_xticks([])
+            ax.set_yticks([])
+        fig.colorbar(im, ax=axes[r, :].tolist(), shrink=0.8)
+
+    fig.suptitle("Per-cluster mean field (Bousquet Fig 20-style)", fontsize=11)
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight", dpi=120)
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Reconstruction distribution (artefact v).
 # ---------------------------------------------------------------------------
 def plot_recon_distribution(
