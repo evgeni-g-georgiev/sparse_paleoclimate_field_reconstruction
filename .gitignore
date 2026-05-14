@@ -1,3 +1,38 @@
+# =============================================================================
+# .gitignore for sparse_paleoclimate_field_reconstruction
+# =============================================================================
+# Conventions:
+#   - One section per category, ordered roughly by how "owned" the path is.
+#   - Each section starts with a short comment explaining *why* it is ignored.
+# =============================================================================
+
+# --- Python virtual environment ----------------------------------------------
+# Local venv. Recreated from requirements.txt; never committed.
 paleo/
+
+# --- Python build / cache artefacts ------------------------------------------
+# Bytecode, package metadata, test caches. Always regenerable.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- OS / editor cruft -------------------------------------------------------
 .DS_Store
+
+# --- Project data ------------------------------------------------------------
+# Raw CSVs and derived caches (e.g. data/cache/prior_cube.npz). Large, regenerable,
+# and the raw files are licensed via the upstream sources (Liu26, LOVECLIM run).
 data/
+
+# --- Model outputs -----------------------------------------------------------
+# Trained checkpoints, generated figures, sweep logs. Re-derivable from code + data.
+outputs/
+
+# --- Personal notes and supervisor-provided PDFs -----------------------------
+# Kept locally; not committed (notes may contain in-progress thinking; PDFs are
+# under upstream copyright).
+notes/
+papers/
+paper_notes/
