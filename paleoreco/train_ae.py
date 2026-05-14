@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from paleoreco.losses import masked_mse
 
@@ -179,6 +180,7 @@ def train(
     seed: int = 0,
     verbose: bool = True,
     log_every: int = 1,
+    progress: bool = True,
 ) -> dict[str, Any]:
     """Train ``model`` with AdamW + cosine LR + early stopping.
 
@@ -212,9 +214,13 @@ def train(
     seed : int
         RNG seed.
     verbose : bool
-        Print one line per ``log_every`` epochs.
+        Print one line per ``log_every`` epochs (and on every best-epoch).
     log_every : int
         Logging cadence (epochs between progress prints).
+    progress : bool
+        Show a tqdm progress bar with ETA, current val_mse_z and best.
+        Independent of ``verbose`` so the sweep loop can hide per-epoch
+        text but still get a per-config progress bar.
 
     Returns
     -------
@@ -261,7 +267,21 @@ def train(
     epochs_since_improve = 0
     stopped_early = False
 
-    for epoch in range(max_epochs):
+    # Wrap the epoch loop with tqdm if progress is requested. We use
+    # tqdm.write() for the verbose per-epoch prints so they don't clobber
+    # the bar; without progress, regular print() is used.
+    epoch_iter: Any = range(max_epochs)
+    pbar: tqdm | None = None
+    if progress:
+        latent = getattr(model, "latent_dim", "?")
+        pbar = tqdm(
+            range(max_epochs), desc=f"train(d={latent})",
+            unit="ep", leave=True, dynamic_ncols=True,
+        )
+        epoch_iter = pbar
+    log = (lambda msg: tqdm.write(msg)) if progress else print
+
+    for epoch in epoch_iter:
         t0 = time.perf_counter()
 
         _train_one_epoch(model, train_loader, optimizer, mask_t, device)
@@ -304,6 +324,17 @@ def train(
         else:
             epochs_since_improve += 1
 
+        # Live progress-bar postfix: current val + best + sec/epoch.
+        if pbar is not None:
+            pbar.set_postfix(
+                {
+                    "val_mse_z": f"{val_loss:.4f}",
+                    "best": f"{best_val_loss:.4f}",
+                    "s/ep": f"{history['epoch_seconds'][-1]:.1f}",
+                },
+                refresh=False,
+            )
+
         if verbose and (epoch % log_every == 0 or improved):
             c_str = (
                 f"  val_rmse_C={val_metrics['rmse_celsius']:.3f}"
@@ -311,7 +342,7 @@ def train(
                 else ""
             )
             star = " *" if improved else "  "
-            print(
+            log(
                 f"epoch {epoch:3d}{star} "
                 f"train_mse_z={train_metrics['mse_z']:.4f}  "
                 f"val_mse_z={val_loss:.4f}{c_str}  "
@@ -322,12 +353,18 @@ def train(
         if epochs_since_improve >= patience:
             stopped_early = True
             if verbose:
-                print(
+                log(
                     f"Early stopping at epoch {epoch} - no improvement "
                     f"in {patience} epochs (best val_mse_z={best_val_loss:.4f} "
                     f"at epoch {best_epoch})."
                 )
+            if pbar is not None:
+                pbar.close()
             break
+
+    # Make sure the bar is closed even if we ran the full max_epochs.
+    if pbar is not None and not stopped_early:
+        pbar.close()
 
     return {
         "history": history,
