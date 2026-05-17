@@ -1,55 +1,14 @@
-"""Dansgaard–Oeschger event-aware train/val/test split for the Prior cube.
+"""Train/val/test split utilities for the Prior cube.
 
-.. note::
-    **Scope: For downstream models only.** This module exists to support held-out-event
-    evaluation of *conditional reconstruction* in downstream models, where the model
-    is asked to reconstruct a D–O event it has never seen given sparse
-    observations from that event. The v1 autoencoder is trained as a
-    **compressor of the full Prior** and is fit + evaluated on all 804
-    ages with no train/val/test split (see Bousquet 2025 §3.1, the
-    methodological template). Do not call
-    :func:`split_ages_by_do_event` from v1 contexts. The two artefacts
-    that *are* used by v1 — :data:`DO_EVENT_WINDOWS` and
-    :func:`assign_event_label` — are imported only for *presentation*
-    purposes (shading the EDA timeline, colouring the latent-space
-    scatter by D–O event index).
-
-Background
-----------
-The Prior is a LOVECLIM simulation spanning ~29,100 to ~49,175 yr BP, which
-covers Greenland D–O events 5 through 12. Randomly splitting the 804 ages
-into train/val/test would leak: neighbouring ages are strongly correlated,
-so a held-out random sample is almost the same as a training sample. The
-robust alternative (used here) is to hold out *entire* D–O events.
-
-Following Liu et al. (2026) Sect. 2.4, each D–O event is identified with
-its analysis window: 300 years before to 600 years after the "official"
-Greenland D–O warming start date (Wolff et al. 2010, converted to AICC2012
-timescale). The Liu 2026 main text and supplement do not tabulate the start
-dates themselves; the canonical source for them is Rasmussen et al. 2014,
-*Quat. Sci. Rev.* 106, Table 2, on the GICC05modelext timescale (which
-agrees with AICC2012 to within ~100 yr across MIS 3). Wolff 2010 Table 1
-cites the same pipeline.
-
-Start ages are quoted there in **b2k** (years before 2000 AD). The Prior
-is in **yr BP** (years before 1950 AD), so ``BP = b2k − 50``. The windows
-in ``DO_EVENT_WINDOWS`` below are computed as ``[start_BP − 300,
-start_BP + 600]``, giving a uniform 900-yr window per event, matching the
-Liu 2026 main-text definition exactly.
-
-The memorised b2k values may carry small errors (~10–50 yr per event)
-relative to the printed Rasmussen 2014 table; this should be verified
-against the original table. The 900-yr window is
-wide enough that such errors do not affect which Prior ages fall into
-which split bucket in practice.
-
-Default split
--------------
-* ``test_event = 8`` - a strong, well-resolved event.
-* ``val_event = 7``  - adjacent to DO-8 and also extra-tropics-active.
-* All other ages (DO-5, 6, 9–12, and "between-event" ages) go to train.
-
-The choice of which events to hold out is to confirm with the supervisor.
+Background on the D-O windows
+-----------------------------
+The Prior spans ~29,100 to ~49,175 yr BP, covering Greenland D-O events 5
+through 12. Following Liu et al. (2026) Sect. 2.4, each D-O event is
+defined by an analysis window of 300 years before to 600 years after its
+onset. Onsets are taken from Rasmussen et al. 2014 (*Quat. Sci. Rev.* 106,
+Table 2), reported in **b2k** (years before 2000 AD). The Prior is in
+**yr BP** (years before 1950 AD), so ``BP = b2k - 50``.
+``DO_EVENT_WINDOWS`` applies both conversions in one step.
 """
 
 from __future__ import annotations
@@ -57,9 +16,8 @@ from __future__ import annotations
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# D–O event start ages on the GICC05modelext timescale, from Rasmussen 2014
-# Table 2. The first column is the conventional b2k value; the second column
-# converts to yr BP (b2k − 50) to match the Prior's age column.
+# D-O event onsets in b2k (years before 2000 AD), from Rasmussen 2014
+# Table 2 on the GICC05modelext timescale.
 # ---------------------------------------------------------------------------
 _GI_ONSET_B2K: dict[int, int] = {
     5:  32_500,
@@ -77,20 +35,21 @@ _WINDOW_PRE: int = 300
 _WINDOW_POST: int = 600
 
 # ---------------------------------------------------------------------------
-# D–O event analysis windows in yr BP.
-# Computed as [start_BP − 300, start_BP + 600] where start_BP = b2k − 50.
+# D-O event analysis windows in yr BP, built from _GI_ONSET_B2K
+# minus 50 (b2k→BP) and padded by _WINDOW_PRE / _WINDOW_POST.
 # ---------------------------------------------------------------------------
 DO_EVENT_WINDOWS: dict[int, tuple[int, int]] = {
     event: (b2k - 50 - _WINDOW_PRE, b2k - 50 + _WINDOW_POST)
     for event, b2k in _GI_ONSET_B2K.items()
 }
 
-# All D–O event indices we recognise. Order matters for label-collision tests.
+# Recognised D-O event indices, ascending. Order is load-bearing:
+# overlapping windows in assign_event_label are resolved in this order.
 DO_EVENT_NUMBERS: tuple[int, ...] = tuple(sorted(DO_EVENT_WINDOWS))
 
 
 def assign_event_label(ages: np.ndarray) -> np.ndarray:
-    """Label each age with its D–O event number (5..12), or 0 if between events.
+    """Label each age with its D-O event number (5..12), or 0 if between events.
 
     Parameters
     ----------
@@ -105,8 +64,8 @@ def assign_event_label(ages: np.ndarray) -> np.ndarray:
 
     Notes
     -----
-    If an age happens to fall in two overlapping windows, the *higher-numbered* event
-    wins, because the loop assigns in ascending event order.
+    If an age falls in two overlapping windows, the higher-numbered event
+    wins (the loop assigns in ascending event order).
     """
     ages = np.asarray(ages, dtype=np.int64)
     labels = np.zeros_like(ages)
@@ -122,12 +81,12 @@ def split_ages_by_do_event(
     test_event: int = 8,
     val_event: int = 7,
 ) -> dict[str, np.ndarray]:
-    """Partition ages into train / val / test by D–O event membership.
+    """Partition ages into train / val / test by D-O event membership.
 
     Each age is assigned to exactly one bucket:
       * ``test``  - ages inside the ``test_event`` window.
       * ``val``   - ages inside the ``val_event`` window.
-      * ``train`` - everything else, including ages inside *other* D–O
+      * ``train`` - everything else, including ages inside *other* D-O
                     events and ages between events. Between-event ages
                     default to train rather than being dropped.
 
@@ -176,10 +135,9 @@ def split_ages_by_do_event(
 
 
 def summarize_split(ages: np.ndarray, split: dict[str, np.ndarray]) -> str:
-    """Summary of a split.
+    """Format a split as a easy-to-read summary string.
 
     Reports the number of ages in each bucket and the min/max age covered.
-    Use to print and visually sanity-check before training.
     """
     ages = np.asarray(ages, dtype=np.int64)
     lines = []
