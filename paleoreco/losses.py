@@ -1,11 +1,9 @@
-"""Loss functions for the autoencoder.
+"""Masked MSE / RMSE for reconstruction on the Prior grid.
 
-The AE reconstructs the two temperature channels (``mtco``, ``mtwa``) on the
-``safe_valid`` cells produced by :func:`paleoreco.data.compute_zscore_stats`.
-Cells outside the mask are zero-filled by :func:`paleoreco.data.apply_zscore`
-and would otherwise dominate the loss (asking the network to predict 0 on
-arbitrary cells). The loss in this module multiplies the squared error by
-the mask so masked cells contribute nothing to the gradient.
+Cells outside ``safe_valid`` are zero-filled in the input by
+:func:`paleoreco.data.apply_zscore`; the mask zeroes out their
+contribution to the loss, so a model isn't trained to predict 0 on
+arbitrary cells.
 """
 
 from __future__ import annotations
@@ -24,9 +22,7 @@ def masked_mse(
     Parameters
     ----------
     pred : torch.Tensor of shape (B, C, H, W)
-        Reconstructed fields.
     target : torch.Tensor of shape (B, C, H, W)
-        Ground-truth fields.
     mask : torch.Tensor broadcastable to (B, C, H, W)
         ``1`` (or ``True``) where the loss should contribute, ``0`` elsewhere.
         Typical shapes accepted: ``(H, W)``, ``(1, H, W)``, ``(1, 1, H, W)``,
@@ -46,9 +42,6 @@ def masked_mse(
 
     Notes
     -----
-    * Both inputs are assumed already z-scored. The loss therefore lives in
-      dimensionless units; convert to °C by inverting the z-score before
-      reporting human-readable error.
     * The denominator counts mask terms *after* broadcasting against ``pred``
       so the per-cell mean is correct regardless of whether the caller passes
       a per-batch, per-channel, or shared mask.
@@ -58,9 +51,8 @@ def masked_mse(
             f"pred shape {tuple(pred.shape)} and target shape {tuple(target.shape)} must match"
         )
 
-    # Promote the mask to pred's rank with leading singleton axes. This keeps
-    # the call site clean: the dataset hands us a (H, W) mask and we don't
-    # require it to be reshaped to (1, 1, H, W) at every call.
+    # Promote the mask to pred's rank with leading singleton axes so callers
+    # can pass an (H, W) mask without reshaping.
     while mask.dim() < pred.dim():
         mask = mask.unsqueeze(0)
     mask = mask.to(dtype=pred.dtype)
@@ -70,11 +62,9 @@ def masked_mse(
     if reduction == "sum":
         return sq_err.sum()
     if reduction == "mean":
-        # Count contributing terms with the same broadcast as the loss itself,
-        # so the denominator is exactly "number of (sample, channel, cell)
-        # values that the mask let through". clamp_min(1.0) guards the
-        # degenerate case where the mask is empty (would never happen in v1,
-        # but keeps the function defensible if reused).
+        # Count contributing terms with the same broadcast as the loss itself, so
+        # the denominator is the actual number of valid (sample, channel, cell)
+        # entries. clamp_min(1.0) avoids division by zero on an empty mask.
         n_terms = mask.expand_as(pred).sum().clamp_min(1.0)
         return sq_err.sum() / n_terms
     if reduction == "none":
@@ -90,9 +80,8 @@ def masked_rmse(
     target: torch.Tensor,
     mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Root of :func:`masked_mse` with the default ``"mean"`` reduction.
+    """Square root of :func:`masked_mse` with the default ``"mean"`` reduction.
 
-    Useful for monitoring: RMSE in z-score units has a natural reading
-    ("about how many standard deviations off the model is, per cell").
+    Returned value is in z-score units.
     """
     return masked_mse(pred, target, mask, reduction="mean").sqrt()
