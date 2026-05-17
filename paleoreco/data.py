@@ -1,24 +1,19 @@
 """Data loading, caching, and z-score normalisation for the Prior cube.
 
-This module turns ``Prior.csv`` (~1.6M rows in long format) into a dense
-``(N_ages, 2, n_lat, n_lon)`` cube of ``[mtco, mtwa]`` channels, caches it
-to ``.npz`` so we don't pay the pivot cost more than once, and serves
-PyTorch tensors of shape ``(3, n_lat, n_lon)`` whose third channel is a
-binary valid-mask.
+Turns ``Prior.csv`` (~1.6M rows in long format) into a dense
+``(N_ages, 2, n_lat, n_lon)`` cube of ``[mtco, mtwa]`` channels, caches
+the cube as ``.npz`` for reuse, and serves PyTorch tensors of shape
+``(3, n_lat, n_lon)`` whose third channel is a binary valid-mask.
 
-Key design notes
-----------------
-* The Prior is a LOVECLIM simulation: temperatures are defined on every
-  grid cell, so we do not expect missing values. The valid mask comes
-  out of normalisation rather than from missing data — cells whose
-  per-cell standard deviation is degenerate (e.g. constant) are masked
-  to keep the loss well-defined.
-* Per-cell z-score statistics are computed from **train ages only** to
-  avoid leakage. ``mean`` and ``std`` are saved alongside model
-  checkpoints so we can invert at inference time.
-* The valid mask is assumed constant across ages for v1. A helper
-  ``verify_mask_constant_across_ages`` exposes this assumption to the
-  EDA notebook so we can confirm or flag it.
+The Prior here is a LOVECLIM transient climate simulation; the loader
+is agnostic to the engine.
+
+Key invariants
+--------------
+* The Prior has no missing cells; the only mask that does anything is
+  ``safe_valid``, which drops cells with degenerate std (e.g. permanent ice).
+* Z-score stats use **train ages only** to avoid leakage; ``mean`` and
+  ``std`` are returned so callers can invert at inference.
 """
 
 from __future__ import annotations
@@ -33,10 +28,10 @@ from torch.utils.data import Dataset
 
 
 # ----------------------------------------------------------------------------
-# Constants describing the LOVECLIM grid and channel order.
+# Constants describing the Prior grid and channel order.
 # ----------------------------------------------------------------------------
 GRID_SHAPE: tuple[int, int] = (32, 64)  # (n_lat, n_lon) at 5.625-degree resolution
-VARS: tuple[str, str] = ("mtco", "mtwa")  # channel order — must match elsewhere
+VARS: tuple[str, str] = ("mtco", "mtwa")  # channel order convention used package-wide
 
 
 # ----------------------------------------------------------------------------
@@ -49,29 +44,23 @@ def build_prior_cube(
 ) -> dict:
     """Pivot ``Prior.csv`` into a dense (N_ages, 2, n_lat, n_lon) cube.
 
-    Pivoting one age at a time with a Python-level ``iterrows`` loop 
-    scales poorly to all 804 ages (~1.6M rows). Instead we sort the 
-    unique lat/lon/age values, look up each row's integer index with 
-    ``np.searchsorted``, and assign into the cube with vectorised 
-    advanced indexing.
-
     Parameters
     ----------
     prior_csv : str
         Path to the raw Prior CSV.
     cache_path : str or None
-        Where to read/write the cached npz. ``None`` disables caching.
+        Where to read/write the cached npz; ``None`` disables caching.
     force_rebuild : bool
-        If True, rebuild the cube from CSV even if a cache exists.
+        Rebuild from CSV even if a cache exists.
 
     Returns
     -------
     dict with keys:
-        cube  : (N_ages, 2, n_lat, n_lon) float32 - channels (mtco, mtwa).
+        cube  : (N_ages, 2, n_lat, n_lon) float32, channels (mtco, mtwa).
         ages  : (N_ages,) int64, sorted ascending (yr BP).
         lats  : (n_lat,) float32, sorted ascending.
         lons  : (n_lon,) float32, sorted ascending.
-        valid : (n_lat, n_lon) bool — True where the cube is finite for
+        valid : (n_lat, n_lon) bool. True where the cube is finite for
                 every age and both channels.
     """
     # Use the cache when it's available and the caller hasn't asked us to refresh.
@@ -79,7 +68,7 @@ def build_prior_cube(
         with np.load(cache_path) as z:
             return {k: z[k] for k in z.files}
 
-    # Only load the four columns we actually need — saves memory on the 1.6M-row CSV.
+    # usecols keeps memory bounded on the 1.6M-row CSV.
     df = pd.read_csv(prior_csv, usecols=["lon", "lat", "age", "mtco", "mtwa"])
 
     # Sorted unique axes define the cube's coordinate system.
@@ -87,8 +76,7 @@ def build_prior_cube(
     lats = np.sort(df["lat"].unique())
     lons = np.sort(df["lon"].unique())
 
-    # `searchsorted` against the sorted axes is O(N log K) and fully vectorised —
-    # much faster than the per-row np.where pattern in provided notebooks/read_data.ipynb.
+    # Vectorised index lookup via searchsorted into the sorted unique axes.
     age_idx = np.searchsorted(ages, df["age"].to_numpy())
     lat_idx = np.searchsorted(lats, df["lat"].to_numpy())
     lon_idx = np.searchsorted(lons, df["lon"].to_numpy())
@@ -98,10 +86,8 @@ def build_prior_cube(
     cube[age_idx, 0, lat_idx, lon_idx] = df["mtco"].to_numpy(dtype=np.float32)
     cube[age_idx, 1, lat_idx, lon_idx] = df["mtwa"].to_numpy(dtype=np.float32)
 
-    # Contract: Prior.csv must cover every (age, lat, lon) exactly once. The
-    # LOVECLIM run has 804 * 32 * 64 = 1,646,592 rows, matching this. If a
-    # future dataset has gaps, we want to fail loudly here rather than silently
-    # zero-fill — a synthetic 0 is indistinguishable from a real 0 C reading.
+    # Fail loud rather than silently zero-fill: a real 0 °C reading is
+    # indistinguishable from a missing cell that defaulted to NaN -> 0.
     n_missing = int(np.isnan(cube).sum())
     if n_missing:
         raise ValueError(
@@ -110,7 +96,7 @@ def build_prior_cube(
         )
 
     # A cell is geographically "valid" iff both channels are finite for every age.
-    # For LOVECLIM we expect this to be uniformly True; EDA verifies.
+    # For the Prior this is uniformly True (see verify_mask_constant_across_ages).
     valid = np.isfinite(cube).all(axis=(0, 1))
 
     result = {
@@ -129,10 +115,11 @@ def build_prior_cube(
 
 
 def verify_mask_constant_across_ages(cube: np.ndarray) -> bool:
-    """Sanity check the assumption that the valid mask is constant in time.
+    """Assert per-age finite-masks all match age 0's.
 
-    Computes a per-age finite-mask and compares each age's mask to age 0.
-    Prints a diagnostic if any age disagrees. Used in 01_eda.ipynb.
+    Tautological under the current contract: ``build_prior_cube`` already
+    refuses to build a cube with any NaN. Kept as explicit documentation
+    of the "mask is constant in time" assumption for future data sources.
     """
     per_age = np.isfinite(cube).all(axis=1)  # (N_ages, n_lat, n_lon)
     constant = bool((per_age == per_age[0:1]).all())
@@ -140,8 +127,8 @@ def verify_mask_constant_across_ages(cube: np.ndarray) -> bool:
         n_differing = int((per_age != per_age[0:1]).any(axis=(1, 2)).sum())
         print(
             f"WARNING: per-age valid mask differs from age 0 on "
-            f"{n_differing} / {len(per_age)} ages — v1's constant-mask "
-            "assumption (§3.8) needs revisiting."
+            f"{n_differing} / {len(per_age)} ages; the constant-mask "
+            "assumption needs revisiting."
         )
     return constant
 
@@ -159,26 +146,25 @@ def compute_zscore_stats(
 
     Cells with degenerate std (below ``eps``) on either channel are
     excluded from the training mask. This handles the "permanent ice
-    cell with no variability" case described in the design.
+    cell with no variability" case.
 
     Parameters
     ----------
     cube : (N_ages, 2, n_lat, n_lon) float32
-        Full prior cube (all ages).
-    train_age_indices : int sequence
-        Indices into the N_ages axis defining the training split.
+    train_age_indices
+        Indices into the N_ages axis (not ages themselves).
     valid : (n_lat, n_lon) bool
-        Geographic validity mask from ``build_prior_cube``.
+        Per-cell geographic validity from ``build_prior_cube``.
     eps : float
-        Threshold below which a cell's std is treated as degenerate.
+        Std threshold below which a cell is treated as degenerate.
 
     Returns
     -------
     dict with keys:
-        mean       : (2, n_lat, n_lon) float32 — per-cell train mean.
-        std        : (2, n_lat, n_lon) float32 — per-cell train std,
+        mean       : (2, n_lat, n_lon) float32. Per-cell train mean.
+        std        : (2, n_lat, n_lon) float32. Per-cell train std,
                      clamped to 1.0 on masked cells so division stays safe.
-        safe_valid : (n_lat, n_lon) bool — the loss/mask channel used
+        safe_valid : (n_lat, n_lon) bool. The loss/mask channel used
                      downstream: geographically valid AND both channels
                      have non-degenerate variability.
     """
@@ -215,10 +201,10 @@ def apply_zscore(cube: np.ndarray, stats: dict) -> np.ndarray:
 
 
 def invert_zscore(cube_z: np.ndarray, stats: dict) -> np.ndarray:
-    """Inverse of ``apply_zscore``: returns °C-anomaly values.
+    """Inverse of ``apply_zscore``: returns absolute °C (anomaly + mean).
 
-    Note: masked cells will return ``mean[c, i, j]`` because they were
-    zero-filled. Always inspect outputs through the same mask.
+    Masked cells return ``mean[c, i, j]`` because they were zero-filled.
+    Always inspect outputs through the same mask.
     """
     return (cube_z * stats["std"] + stats["mean"]).astype(np.float32)
 
