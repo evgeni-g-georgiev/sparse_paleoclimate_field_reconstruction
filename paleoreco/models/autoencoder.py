@@ -1,43 +1,13 @@
-"""Convolutional autoencoder for the Prior cube.
+"""Convolutional building blocks and autoencoders for the Prior grid.
 
-Architecture
-------------
-The AE compresses ``(in_channels, H, W)`` images to a ``latent_dim``-vector
-and reconstructs ``(out_channels, H, W)``. Default channel order:
+The blocks (``CircularLonPad2d``, ``ConvBlock``, ``UpBlock``) all use
+**circular padding on longitude** (W axis) and zero padding on latitude
+(H axis), respecting that Earth wraps at ±180° but the poles do not
+neighbour each other. They can be composed into arbitrary convolutional
+encoder/decoder stacks.
 
-* input  channels = (mtco_z, mtwa_z, valid_mask)
-* output channels = (mtco_z, mtwa_z), the mask is *conditioning input*,
-  not part of what the AE is asked to reconstruct.
-
-Encoder pipeline ``(B, 3, 32, 64) -> (B, latent_dim)``:
-
-  Conv stride-2 stack:
-      (3, 32, 64) -> (32, 16, 32) -> (64, 8, 16) -> (128, 4, 8)
-  Flatten -> Linear(4096 -> latent_dim).
-
-Decoder pipeline ``(B, latent_dim) -> (B, 2, 32, 64)``:
-
-  Linear(latent_dim -> 4096) -> reshape to (128, 4, 8).
-  Upsample(2x) + 3x3 conv stack:
-      (128, 4, 8) -> (64, 8, 16) -> (32, 16, 32) -> (16, 32, 64)
-  Final 3x3 conv -> (2, 32, 64). No activation, no norm.
-
-All convolutions use **circular padding on longitude** (W axis) and zero
-padding on latitude (H axis), via the :class:`CircularLonPad2d` module
-below. This respects the fact that Earth wraps at ±180° but the poles
-are not adjacent to each other.
-
-Design choices flagged in code comments
----------------------------------------
-* GroupNorm instead of BatchNorm: robust to batch-size variation, and
-  the standard choice in modern diffusion-adjacent models (this encoder
-  is intended for reuse).
-* SiLU instead of ReLU: smoother gradients, modern default.
-* Upsample+Conv instead of ConvTranspose: avoids checkerboard artefacts.
-* No skip connections: bottleneck must be a true compression so the
-  latent is interpretable for the Bousquet POD-vs-latent probe.
-* No activation on the final layer: output is in z-score units
-  (~N(0, 1)), so no range constraint is needed (or correct).
+:class:`ConvAE` is one such assembly: see its docstring for shape
+contracts and design choices.
 """
 
 from __future__ import annotations
@@ -74,10 +44,9 @@ class CircularLonPad2d(nn.Module):
 def _gn_groups(num_channels: int) -> int:
     """Pick a GroupNorm group count: 8 if it divides cleanly, else 4, else 1.
 
-    GroupNorm requires that ``num_channels % num_groups == 0``. For the
-    channel counts we use (16, 32, 64, 128) every option divides cleanly
-    into 8 groups; the fallbacks exist so ``base_channels`` can be tweaked
-    without immediately breaking the model.
+    GroupNorm requires ``num_channels % num_groups == 0``. The default
+    channel counts (16, 32, 64, 128) all divide cleanly into 8; the
+    fallbacks keep the model alive if ``base_channels`` is tweaked.
     """
     if num_channels % 8 == 0:
         return 8
@@ -131,33 +100,57 @@ class UpBlock(nn.Module):
 class ConvAE(nn.Module):
     """Convolutional autoencoder with circular-longitude padding.
 
+    Pipeline (with default ``base_channels=32``):
+
+      Encoder ``(B, 3, 32, 64) -> (B, latent_dim)``:
+          Conv stride-2 stack:
+              (3, 32, 64) -> (32, 16, 32) -> (64, 8, 16) -> (128, 4, 8)
+          Flatten -> Linear(4096 -> latent_dim).
+
+      Decoder ``(B, latent_dim) -> (B, 2, 32, 64)``:
+          Linear(latent_dim -> 4096) -> reshape to (128, 4, 8).
+          Upsample(2x) + 3x3 conv stack:
+              (128, 4, 8) -> (64, 8, 16) -> (32, 16, 32) -> (16, 32, 64)
+          Final 3x3 conv -> (2, 32, 64). No activation, no norm.
+
+    Default channels: input = (mtco_z, mtwa_z, valid_mask); output =
+    (mtco_z, mtwa_z). The mask is conditioning input, not reconstructed.
+
+    Design choices
+    --------------
+    * GroupNorm instead of BatchNorm: robust to batch-size variation and
+      standard in diffusion-adjacent architectures.
+    * SiLU instead of ReLU: smoother gradients.
+    * Upsample+Conv instead of ConvTranspose: avoids checkerboard artefacts.
+    * No skip connections: bottleneck must be a true compression so the
+      latent is interpretable for the Bousquet POD-vs-latent probe.
+    * No activation on the final layer: output is in z-score units
+      (~N(0, 1)), so no range constraint is appropriate.
+
     Parameters
     ----------
     latent_dim : int
-        Size of the bottleneck vector. Parametric to support the v1
-        latent-dim sweep over ``{2, 4, 8, 16, 32, 64}``.
+        Size of the bottleneck vector.
     in_channels : int, default 3
         Number of input channels. Default matches the dataset's
         ``(mtco_z, mtwa_z, valid_mask)`` layout.
     out_channels : int, default 2
-        Number of channels reconstructed by the decoder. The mask is not
-        reconstructed - it is conditioning input only - so the default
-        is 2, matching the temperature channels.
+        Number of channels reconstructed by the decoder. The mask is
+        conditioning input, not reconstructed; default 2 matches the
+        temperature channels.
     base_channels : int, default 32
         Channel multiplier. Encoder doubles per stage:
         ``base, 2*base, 4*base``. Decoder mirrors, then halves once more
         before the final conv.
     grid_shape : tuple[int, int], default (32, 64)
-        ``(H, W)``. Currently locked to the LOVECLIM 5.625° grid; the
-        architecture assumes three stride-2 downsamples are possible, so
-        both axes must be divisible by 8.
+        ``(H, W)``. The architecture assumes three stride-2 downsamples
+        are possible, so both axes must be divisible by 8.
 
     Attributes
     ----------
     bottleneck_shape : tuple[int, int, int]
-        The pre-flatten encoder output shape ``(4*base, H/8, W/8)``.
-        Exposed so the training loop / Bousquet probe / latent diffusion
-        head can introspect.
+        The pre-flatten encoder output shape ``(4*base, H/8, W/8)``,
+        exposed for downstream introspection.
     """
 
     def __init__(
@@ -176,8 +169,7 @@ class ConvAE(nn.Module):
                 "axes (three stride-2 downsamples)."
             )
         if base_channels % 2:
-            # We halve base_channels in the last UpBlock, so it needs to be
-            # divisible by 2. (Default base_channels=32 obviously satisfies this.)
+            # The last UpBlock outputs base_channels // 2, so the value must be even.
             raise ValueError(
                 f"base_channels={base_channels} must be even (last UpBlock "
                 "outputs base_channels // 2)."
@@ -187,7 +179,6 @@ class ConvAE(nn.Module):
         H_low, W_low = H // 8, W // 8
         flat_dim = c3 * H_low * W_low
 
-        # Public attributes .
         self.latent_dim = latent_dim
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -221,8 +212,7 @@ class ConvAE(nn.Module):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Map ``(B, in_channels, H, W)`` to ``(B, latent_dim)``.
 
-        Exposed separately so the Bousquet probe and downstream latent
-        diffusion can call the encoder without running the decoder.
+        Exposed separately so callers can run the encoder without the decoder.
         """
         h = self.encoder_conv(x)
         h = h.flatten(start_dim=1)
@@ -232,8 +222,7 @@ class ConvAE(nn.Module):
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """Map ``(B, latent_dim)`` to ``(B, out_channels, H, W)``.
 
-        Exposed separately for latent traversals and for the downstream
-        unconditional latent diffusion sampler.
+        Exposed separately for latent traversals and decoder-only sampling.
         """
         h = self.decoder_fc(z)
         h = h.view(-1, *self.bottleneck_shape)
@@ -244,9 +233,8 @@ class ConvAE(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(x_hat, z)``.
 
-        Returning both saves a redundant encode pass when the training
-        loop wants to log latent statistics (norm, sparsity) alongside
-        the reconstruction loss.
+        Returning both saves a redundant encode pass when the caller wants
+        to inspect the latent alongside the reconstruction.
         """
         z = self.encode(x)
         x_hat = self.decode(z)
@@ -254,7 +242,7 @@ class ConvAE(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Convenience: parameter count, for the latent-dim sweep notebook.
+# Convenience: parameter count.
 # ---------------------------------------------------------------------------
 def count_parameters(model: nn.Module) -> int:
     """Total number of trainable parameters in ``model``."""
