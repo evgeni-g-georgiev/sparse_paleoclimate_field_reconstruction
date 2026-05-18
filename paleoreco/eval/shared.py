@@ -2,8 +2,7 @@
 
 Everything in this module operates on numpy arrays of truth /
 reconstruction pairs. There's no coupling to a specific model class
-or training-loop history dict. The same functions will be used to
-evaluate downstream models.
+or training-loop history dict.
 
 Conventions
 -----------
@@ -44,10 +43,9 @@ def _valid_column_mask(mask: np.ndarray, n_channels: int = 2) -> np.ndarray:
 def _zscore_to_anomaly(z: np.ndarray, zscore_stats: dict) -> np.ndarray:
     """Convert z-score data to °C anomaly (``x − mean``).
 
-    Anomaly is what climatologists read on a map - absolute °C is
-    dominated visually by the climatology (e.g. −40 °C over Antarctica).
-    Because ``z = (x − mean) / std``, anomaly = ``z * std`` directly;
-    no mean needed.
+    Anomaly is what climatologists read on a map; absolute °C is
+    visually dominated by the climatology (e.g. −40 °C over Antarctica).
+    Because ``z = (x − mean) / std``, anomaly = ``z * std`` directly.
 
     Broadcasts ``std`` of shape ``(2, H, W)`` against ``z`` of any
     leading shape ``(..., 2, H, W)``.
@@ -56,7 +54,7 @@ def _zscore_to_anomaly(z: np.ndarray, zscore_stats: dict) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Reconstruction grid (artefact ii).
+# Reconstruction grid.
 # ---------------------------------------------------------------------------
 def plot_reconstructions(
     truth_z: np.ndarray,
@@ -157,7 +155,7 @@ def plot_reconstructions(
 
 
 # ---------------------------------------------------------------------------
-# Per-cell RMSE map (artefact iii).
+# Per-cell RMSE map.
 # ---------------------------------------------------------------------------
 def per_cell_rmse_celsius(
     truth_z: np.ndarray,
@@ -209,7 +207,7 @@ def plot_per_cell_rmse(
 
 
 # ---------------------------------------------------------------------------
-# POD baseline + latent-dim sweep (artefact iv).
+# POD baseline + latent-dim sweep.
 # ---------------------------------------------------------------------------
 def pod_fit(
     cube_z: np.ndarray,
@@ -229,12 +227,6 @@ def pod_fit(
     zero-filled masked cells. The two channels (mtco, mtwa) are stacked
     along the column axis so the SVD treats them on equal footing.
 
-    Note on ``fit_indices``
-    -----------------------
-    In v1 (Bousquet-style in-sample probe) pass ``np.arange(N_ages)``:
-    the AE is also fit on every age, so the fair POD baseline is fit
-    on the same data.
-
     Parameters
     ----------
     cube_z : (N_ages, 2, H, W) float
@@ -244,21 +236,21 @@ def pod_fit(
     mask : (H, W) bool
         ``safe_valid`` mask.
     max_k : int
-        Largest latent dimension we'll ever want to evaluate. The
-        returned basis can be sliced down to any ``k <= max_k``.
+        Largest latent dimension to be evaluated; the returned basis
+        can be sliced down to any ``k <= max_k``.
     random_state : int
         Passed to sklearn's TruncatedSVD for reproducibility.
 
     Returns
     -------
-    dict with keys
-        ``"mu"`` : (1, D_valid) array — fit-set mean over valid columns.
-        ``"V_max"`` : (max_k, D_valid) array — top-``max_k`` right
+    dict with keys:
+        ``"mu"`` : (1, D_valid) array. Fit-set mean over valid columns.
+        ``"V_max"`` : (max_k, D_valid) array. Top-``max_k`` right
             singular vectors (rows are POD modes).
         ``"fit_indices_used"`` : ndarray copy of ``fit_indices``.
-        ``"keep_mask"`` : (2*H*W,) bool — column-keep mask used to
+        ``"keep_mask"`` : (2*H*W,) bool. Column-keep mask used to
             extract valid columns from a flattened cube.
-        ``"shape"`` : ``(2, H, W)`` — original spatial shape, used by
+        ``"shape"`` : ``(2, H, W)``. Original spatial shape, used by
             :func:`pod_predict` to scatter reconstructions back.
     """
     from sklearn.decomposition import TruncatedSVD
@@ -271,8 +263,8 @@ def pod_fit(
     mu = X_fit.mean(axis=0, keepdims=True)  # (1, D_valid)
     X_fit_c = X_fit - mu
 
-    # Fit once at max_k and slice for smaller k - randomised SVD is
-    # much cheaper that way than separate fits per k.
+    # Fit once at max_k and slice for smaller k; randomised SVD is
+    # cheaper that way than separate fits per k.
     svd = TruncatedSVD(
         n_components=max_k, algorithm="randomized", random_state=random_state,
     )
@@ -350,12 +342,10 @@ def pod_test_rmse(
     ks: Sequence[int],
     random_state: int = 0,
 ) -> np.ndarray:
-    """Back-compat wrapper: per-``k`` test RMSE in z-score units.
+    """Per-``k`` test RMSE in z-score units; convenience wrapper.
 
-    Thin wrapper around :func:`pod_fit` + :func:`pod_predict`. Kept
-    for code that still wants the original convenience signature. New
-    code should call ``pod_fit`` / ``pod_predict`` directly and use
-    :func:`compute_E_d` as the headline metric.
+    Thin wrapper around :func:`pod_fit` + :func:`pod_predict`. The
+    headline AE-vs-POD comparison uses :func:`compute_E_d`.
 
     Returns
     -------
@@ -393,8 +383,8 @@ def compute_E_d(
 
     Two key points:
 
-    * The ratio is computed **per snapshot** and then averaged across
-      snapshots - *not* a single global numerator/denominator ratio.
+    * The ratio is computed **per snapshot** then averaged across
+      snapshots, *not* a single global numerator/denominator ratio.
       This matches Bousquet exactly and weighs every snapshot equally
       regardless of its magnitude.
     * The sum runs over valid cells across **both** channels, so the
@@ -407,13 +397,13 @@ def compute_E_d(
     mask : (H, W) bool
         ``safe_valid`` mask.
     eps : float
-        Guards a snapshot with vanishing ``||u||^2`` (impossible in
-        practice for our z-scored cube, but cheap to defend against).
+        Guards against a snapshot with vanishing ``||u||^2`` (cheap
+        defence; not expected on z-scored data).
 
     Returns
     -------
     float
-        ``E_d`` - values near 1 mean near-perfect compression. Bousquet
+        ``E_d``: values near 1 mean near-perfect compression. Bousquet
         reports values around 0.99+ for periodic flows, dropping to
         ~0.4-0.8 for the turbulent von Kármán case.
     """
@@ -441,15 +431,13 @@ def plot_latent_sweep(
     """Bousquet-style latent-dim sweep.
 
     Primary (left) panel: ``E_d`` vs latent dim with optional POD
-    overlay — the headline AE-vs-POD comparison (Bousquet Fig 3).
-    Secondary (right) panel: ``rmse_celsius`` vs latent dim - the
-    same diagnostic in °C units, model curve only
-    (POD °C-RMSE is omitted; the head-to-head story lives on the
-    E_d panel).
+    overlay (the headline AE-vs-POD comparison, Bousquet Fig 3).
+    Secondary (right) panel: ``rmse_celsius`` vs latent dim, model
+    curve only (POD °C-RMSE is omitted; the head-to-head story lives
+    on the E_d panel).
 
     Log-2 x-axis with explicit tick labels at the sweep points.
-    ``model_label`` is shown in the legend - defaults to ``"model"`` so
-    this plotter can be reused by AE, latent diffusion, etc.
+    ``model_label`` is shown in the legend; defaults to ``"model"``.
     """
     has_celsius = model_rmse_celsius is not None
     n_panels = 2 if has_celsius else 1
@@ -491,9 +479,8 @@ def plot_latent_sweep(
 # Bousquet Layer-2 primitives.
 # ---------------------------------------------------------------------------
 # These functions implement the latent-space analysis Bousquet performs
-# at low latent dimension (his §3.2). They are deliberately kept
-# model-agnostic so the same code drives the AE deep-dive in v1 and any
-# downstream model with a 2D latent space.
+# at low latent dimension (his §3.2). Kept model-agnostic so the same
+# code can drive any model with a 2D latent space.
 # ---------------------------------------------------------------------------
 def compute_pod_time_coefficients(
     cube_z: np.ndarray,
@@ -510,8 +497,8 @@ def compute_pod_time_coefficients(
     Parameters
     ----------
     cube_z : (N_ages, 2, H, W) float
-        Z-scored cube — every age is projected; no slicing here so the
-        full ``a_k(t)`` time series is available.
+        Z-scored cube; every age is projected (no slicing) so the full
+        ``a_k(t)`` time series is available.
     mask : (H, W) bool
         ``safe_valid`` mask. Only valid cells participate, matching the
         column convention used in :func:`pod_fit`.
@@ -558,9 +545,8 @@ def per_mode_learning_accuracy(
     pod_a_k : (N_ages, max_k) float
         Output of :func:`compute_pod_time_coefficients` on the truth.
     ae_a_k_per_epoch : (n_epochs, N_ages, max_k) float
-        Per-epoch model-reconstruction coefficients. Built in the
-        notebook by snapshotting per-epoch state dicts, replaying
-        forward, and feeding the reconstructions through
+        Per-epoch model-reconstruction coefficients, obtained by
+        projecting the model's reconstruction at each epoch through
         :func:`compute_pod_time_coefficients`.
 
     Returns
@@ -717,7 +703,7 @@ def plot_per_cluster_pod_distributions(
 
     One row per POD mode in ``ks_to_show``, one panel per row showing
     the overlaid per-cluster densities of ``a_k(t)``. This is the
-    Bousquet-style diagnostic for *what each cluster encodes* - if
+    Bousquet-style diagnostic for *what each cluster encodes*: if
     cluster 0 concentrates the negative tail of ``a_1`` and cluster 1
     the positive tail, the latent has split along the ``a_1`` axis.
     """
@@ -771,13 +757,13 @@ def plot_per_cluster_reconstructions(
 
     For each cluster, the snapshots assigned to that cluster are
     averaged and plotted as a map per channel. Useful for asking *what
-    the latent partition actually corresponds to in physical space* -
+    the latent partition actually corresponds to in physical space*:
     e.g. cluster 0 = "warm interstadial composite", cluster 1 = "cold
     stadial composite".
 
-    ``cube`` is plotted as-is: the caller decides which units. v1 will
-    typically pass ``cube_z * std`` (°C anomaly) or ``cube_z * std +
-    mean`` (absolute °C). Cells outside ``mask`` are rendered NaN.
+    ``cube`` is plotted as-is: the caller decides which units. Typical
+    inputs are ``cube_z * std`` (°C anomaly) or ``cube_z * std + mean``
+    (absolute °C). Cells outside ``mask`` are rendered NaN.
 
     Layout: one row per cluster, one column per channel.
     """
@@ -838,7 +824,7 @@ def plot_per_cluster_reconstructions(
 
 
 # ---------------------------------------------------------------------------
-# Reconstruction distribution (artefact v).
+# Reconstruction distribution.
 # ---------------------------------------------------------------------------
 def plot_recon_distribution(
     truth_z: np.ndarray,
