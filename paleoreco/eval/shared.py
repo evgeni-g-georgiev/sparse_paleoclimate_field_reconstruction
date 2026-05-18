@@ -147,7 +147,7 @@ def plot_reconstructions(
         shrink=0.55, location="right", label="mtwa err (°C)",
     )
 
-    fig.suptitle("Reconstructions — °C anomaly", fontsize=12)
+    fig.suptitle("Reconstructions: °C anomaly", fontsize=12)
 
     if save_path:
         fig.savefig(save_path, bbox_inches="tight", dpi=120)
@@ -455,7 +455,7 @@ def plot_latent_sweep(
     ax.set_xticklabels([str(d) for d in latent_dims])
     ax.set_xlabel("latent dim")
     ax.set_ylabel(r"$E_d$ (Bousquet)")
-    ax.set_title("Latent-dim sweep — $E_d$ (head-to-head with POD)")
+    ax.set_title("Latent-dim sweep: $E_d$ (head-to-head with POD)")
     ax.grid(True, alpha=0.3)
     ax.legend()
 
@@ -467,7 +467,7 @@ def plot_latent_sweep(
         ax.set_xticklabels([str(d) for d in latent_dims])
         ax.set_xlabel("latent dim")
         ax.set_ylabel("RMSE (°C)")
-        ax.set_title("Latent-dim sweep — °C (secondary, human-readable)")
+        ax.set_title("Latent-dim sweep: °C (secondary)")
         ax.grid(True, alpha=0.3)
 
     if save_path:
@@ -630,16 +630,25 @@ def plot_latent_2d(
         discrete = bool(is_int and len(np.unique(color_values)) <= 16)
 
     fig, ax = plt.subplots(figsize=(6.0, 5.0), constrained_layout=True)
+
     if discrete:
-        # Use a categorical-ish colormap so values like 0..8 read as
-        # event indices rather than a continuum.
         levels = np.unique(color_values)
-        cmap = plt.get_cmap("tab10", max(len(levels), 1))
+        n_levels = len(levels)
+        
+        cmap = plt.get_cmap("tab10", n_levels)
+        
+        mapped_colors = np.zeros_like(color_values)
+        for i, val in enumerate(levels):
+            mapped_colors[color_values == val] = i
+
         sc = ax.scatter(
             latents[:, 0], latents[:, 1],
-            c=color_values, cmap=cmap, s=14, alpha=0.85, edgecolor="none",
+            c=mapped_colors, cmap=cmap, s=14, alpha=0.85, edgecolor="none",
+            vmin=-0.5, vmax=n_levels - 0.5
         )
-        cbar = plt.colorbar(sc, ax=ax, ticks=levels)
+        
+        cbar = plt.colorbar(sc, ax=ax, ticks=np.arange(n_levels))
+        cbar.ax.set_yticklabels(levels) 
         cbar.set_label(color_label)
     else:
         sc = ax.scatter(
@@ -857,7 +866,7 @@ def plot_recon_distribution(
         ax.axvline(0, color="k", lw=0.8, alpha=0.5)
         ax.set_xlabel(f"{name} anomaly (°C)")
         ax.set_ylabel("density")
-        ax.set_title(f"{name} — truth vs reconstruction (valid cells)")
+        ax.set_title(f"{name}: truth vs reconstruction (valid cells)")
         ax.legend()
 
     if save_path:
