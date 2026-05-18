@@ -56,16 +56,32 @@ def _train_one_epoch(
     optimizer: torch.optim.Optimizer,
     mask: torch.Tensor,
     device: str | torch.device,
-) -> float:
-    """Run one training epoch. Returns mean masked-MSE (z-score units).
+    zscore_std: torch.Tensor | None = None,
+) -> dict[str, float | None]:
+    """Run one training epoch. Returns the same metrics dict as ``evaluate``.
 
-    The returned value uses in-progress weights so it lags the post-epoch
-    evaluation by half a step. Diagnostic only; ``evaluate`` produces the
-    authoritative train metric.
+    Metrics aggregate squared errors across the epoch's optimisation
+    trajectory (in-progress weights), so train curves are not strictly
+    apples-to-apples with val curves (which are measured on end-of-epoch
+    weights via ``evaluate``). The asymmetry is invisible at typical
+    training horizons and is the price of avoiding a second forward pass
+    over the train loader per epoch.
     """
     model.train()
-    running_loss = 0.0
-    n_batches = 0
+
+    has_std = zscore_std is not None
+    if has_std:
+        # (1, 2, H, W) so it broadcasts against (B, 2, H, W) squared errors.
+        std_sq = zscore_std.to(device).unsqueeze(0) ** 2
+
+    sum_sq_z = 0.0
+    sum_sq_c = 0.0
+    n_terms = 0.0
+    mask = mask.to(device)
+    # 2 channels per sample, mask shared: each sample contributes
+    # 2 * mask.sum() terms to the masked-MSE denominator.
+    terms_per_sample = float(2 * mask.sum().item())
+
     for batch in loader:
         batch = batch.to(device, non_blocking=True)
         target = batch[:, :2]                       # mtco_z, mtwa_z
@@ -74,9 +90,23 @@ def _train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-        running_loss += loss.item()
-        n_batches += 1
-    return running_loss / max(n_batches, 1)
+
+        with torch.no_grad():
+            sq_err_z = (x_hat - target) ** 2 * mask
+            sum_sq_z += sq_err_z.sum().item()
+            if has_std:
+                sum_sq_c += (sq_err_z * std_sq).sum().item()
+            n_terms += batch.shape[0] * terms_per_sample
+
+    if n_terms <= 0:
+        return {"mse_z": float("nan"), "rmse_z": float("nan"), "rmse_celsius": None}
+
+    mse_z = sum_sq_z / n_terms
+    return {
+        "mse_z": mse_z,
+        "rmse_z": math.sqrt(mse_z),
+        "rmse_celsius": math.sqrt(sum_sq_c / n_terms) if has_std else None,
+    }
 
 
 @torch.no_grad()
@@ -145,6 +175,65 @@ def evaluate(
         "rmse_celsius": math.sqrt(sum_sq_c / n_terms) if has_std else None,
     }
     return out
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers.
+# ---------------------------------------------------------------------------
+def _snapshot_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Detached CPU clone of ``model.state_dict()``; survives further training."""
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+
+def _save_checkpoint(
+    path: str,
+    epoch: int,
+    state: dict[str, torch.Tensor],
+    val_mse_z: float | None,
+) -> None:
+    """Write a checkpoint ``{"epoch", "state_dict", "val_mse_z"}``; mkdir-p parent.
+
+    ``val_mse_z`` is ``None`` in val-less mode.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save({"epoch": epoch, "state_dict": state, "val_mse_z": val_mse_z}, path)
+
+
+# ---------------------------------------------------------------------------
+# Log formatting.
+# ---------------------------------------------------------------------------
+def _format_epoch_line(
+    epoch: int,
+    train_metrics: dict[str, float | None],
+    val_metrics: dict[str, float | None] | None,
+    *,
+    lr: float,
+    s_ep: float,
+    improved: bool,
+    has_val: bool,
+) -> str:
+    """Format one verbose-mode epoch summary. ``*`` marks val improvements.
+
+    ``train_rmse_C`` shows in val-less mode and ``val_rmse_C`` with-val,
+    to keep the line short.
+    """
+    tail = f"lr={lr:.2e}  ({s_ep:.1f}s)"
+    if has_val:
+        assert val_metrics is not None
+        c = val_metrics["rmse_celsius"]
+        c_val = f"  val_rmse_C={c:.3f}" if c is not None else ""
+        star = " *" if improved else "  "
+        return (
+            f"epoch {epoch:3d}{star} "
+            f"train_mse_z={train_metrics['mse_z']:.4f}  "
+            f"val_mse_z={val_metrics['mse_z']:.4f}{c_val}  " + tail
+        )
+    c = train_metrics["rmse_celsius"]
+    c_train = f"  train_rmse_C={c:.3f}" if c is not None else ""
+    return (
+        f"epoch {epoch:3d}   "
+        f"train_mse_z={train_metrics['mse_z']:.4f}{c_train}  " + tail
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -220,22 +309,24 @@ def train(
         ``stopped_early``   : bool.
         ``epochs_trained``  : int.
     """
-    set_seed(seed)
-    device = torch.device(device)
-    model = model.to(device)
+    set_seed(seed) # set seed for reproducability 
+    device = torch.device(device) 
+    model = model.to(device) # move model to requested device (CPU or GPU)
     if mask is None:
         raise ValueError("mask is required (the safe_valid mask used in the loss).")
 
+    # convert mask and std arrays to PyTorch tensors on device
     mask_t = torch.as_tensor(mask, dtype=torch.float32, device=device)
     std_t: torch.Tensor | None = None
     if zscore_std is not None:
         std_t = torch.as_tensor(zscore_std, dtype=torch.float32, device=device)
 
+    # create the optimiser and LR scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
 
-    # Val keys are only present when a val loader is given, so plot code
-    # doesn't render misleading flat-line "val" curves.
+    # builds dict initiated with empty lists appended at end of each epoch
+    # adds val_ keys only if val_loader is given to avoid flatline "val" plot
     has_val = val_loader is not None
     history: dict[str, list] = {
         "train_mse_z": [],
@@ -249,6 +340,7 @@ def train(
         history["val_rmse_z"] = []
         history["val_rmse_celsius"] = []
 
+    # best-state tracking
     best_val_loss = float("inf")
     best_epoch = -1
     best_state: dict[str, torch.Tensor] | None = None
@@ -269,23 +361,24 @@ def train(
         epoch_iter = pbar
     log = (lambda msg: tqdm.write(msg)) if progress else print
 
-    for epoch in epoch_iter:
+    for epoch in epoch_iter:     # main loop -> each iteration is one epoch
         t0 = time.perf_counter()
 
-        _train_one_epoch(model, train_loader, optimizer, mask_t, device)
-        train_metrics = evaluate(model, train_loader, mask_t, device, std_t)
+        train_metrics = _train_one_epoch(
+            model, train_loader, optimizer, mask_t, device, std_t,
+        ) # train one epoch
         val_metrics = (
             evaluate(model, val_loader, mask_t, device, std_t)
             if has_val
             else None
-        )
+        ) # evaluate on val, if there is a val loader
 
         # Log the LR before stepping, so the logged value matches what
         # the just-completed epoch actually trained with.
         history["lr"].append(optimizer.param_groups[0]["lr"])
         scheduler.step()
 
-        history["train_mse_z"].append(train_metrics["mse_z"])
+        history["train_mse_z"].append(train_metrics["mse_z"]) # append metrics to hist
         history["train_rmse_z"].append(train_metrics["rmse_z"])
         history["train_rmse_celsius"].append(train_metrics["rmse_celsius"])
         if has_val:
@@ -305,71 +398,38 @@ def train(
             if improved:
                 best_val_loss = val_loss
                 best_epoch = epoch
-                best_state = {
-                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-                }
+                best_state = _snapshot_state_dict(model)
                 epochs_since_improve = 0
                 if checkpoint_path is not None:
-                    os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
-                    torch.save(
-                        {
-                            "epoch": epoch,
-                            "state_dict": best_state,
-                            "val_mse_z": val_loss,
-                        },
-                        checkpoint_path,
-                    )
+                    _save_checkpoint(checkpoint_path, epoch, best_state, val_loss)
             else:
                 epochs_since_improve += 1
 
         # Live progress-bar postfix: prefer val_mse_z when available,
-        # fall back to train_mse_z + best (NaN displays sensibly).
+        # fall back to train_mse_z (NaN displays sensibly).
         if pbar is not None:
-            if has_val:
-                pbar.set_postfix(
-                    {
-                        "val_mse_z": f"{val_metrics['mse_z']:.4f}",
-                        "best": f"{best_val_loss:.4f}",
-                        "s/ep": f"{history['epoch_seconds'][-1]:.1f}",
-                    },
-                    refresh=False,
-                )
-            else:
-                pbar.set_postfix(
-                    {
-                        "train_mse_z": f"{train_metrics['mse_z']:.4f}",
-                        "s/ep": f"{history['epoch_seconds'][-1]:.1f}",
-                    },
-                    refresh=False,
-                )
+            postfix = (
+                {
+                    "val_mse_z": f"{val_metrics['mse_z']:.4f}",
+                    "best": f"{best_val_loss:.4f}",
+                    "s/ep": f"{history['epoch_seconds'][-1]:.1f}",
+                }
+                if has_val
+                else {
+                    "train_mse_z": f"{train_metrics['mse_z']:.4f}",
+                    "s/ep": f"{history['epoch_seconds'][-1]:.1f}",
+                }
+            )
+            pbar.set_postfix(postfix, refresh=False)
 
         if verbose and (epoch % log_every == 0 or improved):
-            c_train = (
-                f"  train_rmse_C={train_metrics['rmse_celsius']:.3f}"
-                if train_metrics["rmse_celsius"] is not None
-                else ""
-            )
-            if has_val:
-                c_val = (
-                    f"  val_rmse_C={val_metrics['rmse_celsius']:.3f}"
-                    if val_metrics["rmse_celsius"] is not None
-                    else ""
-                )
-                star = " *" if improved else "  "
-                log(
-                    f"epoch {epoch:3d}{star} "
-                    f"train_mse_z={train_metrics['mse_z']:.4f}  "
-                    f"val_mse_z={val_metrics['mse_z']:.4f}{c_val}  "
-                    f"lr={history['lr'][-1]:.2e}  "
-                    f"({history['epoch_seconds'][-1]:.1f}s)"
-                )
-            else:
-                log(
-                    f"epoch {epoch:3d}   "
-                    f"train_mse_z={train_metrics['mse_z']:.4f}{c_train}  "
-                    f"lr={history['lr'][-1]:.2e}  "
-                    f"({history['epoch_seconds'][-1]:.1f}s)"
-                )
+            log(_format_epoch_line(
+                epoch, train_metrics, val_metrics,
+                lr=history["lr"][-1],
+                s_ep=history["epoch_seconds"][-1],
+                improved=improved,
+                has_val=has_val,
+            ))
 
         # Switch to eval mode under no_grad so the callback can call
         # model.encode(...) cleanly, then restore train mode for the
@@ -404,21 +464,11 @@ def train(
     # final-epoch state and best_val_loss is NaN.
     if not has_val:
         last_epoch = len(history["train_mse_z"]) - 1
-        best_state = {
-            k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-        }
+        best_state = _snapshot_state_dict(model)
         best_epoch = last_epoch
         best_val_loss = float("nan")
         if checkpoint_path is not None:
-            os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
-            torch.save(
-                {
-                    "epoch": last_epoch,
-                    "state_dict": best_state,
-                    "val_mse_z": None,
-                },
-                checkpoint_path,
-            )
+            _save_checkpoint(checkpoint_path, last_epoch, best_state, None)
 
     return {
         "history": history,
