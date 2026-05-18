@@ -3,12 +3,10 @@
 Two functions live here because they have a hard dependency on
 something AE-shaped:
 
-* :func:`plot_loss_curves` reads keys (``train_mse_z``, ``val_mse_z``,
-  ``train_rmse_celsius``, ``val_rmse_celsius``) that come from the
-  ``history`` dict produced by :mod:`paleoreco.train_ae`. A different
-  training loop (e.g. diffusion model) produces a different dict shape.
+* :func:`plot_loss_curves` reads the ``history`` dict shape produced
+  by :mod:`paleoreco.train_ae`.
 * :func:`reconstruct_split` assumes the model's forward returns
-  ``(x_hat, z)`` - the AE contract. 
+  ``(x_hat, z)`` (the AE contract).
 
 Everything else under :mod:`paleoreco.eval` is generic and lives in
 ``shared``.
@@ -23,24 +21,19 @@ from torch.utils.data import DataLoader, Dataset
 
 
 # ---------------------------------------------------------------------------
-# Loss curves (artefact i).
+# Loss curves.
 # ---------------------------------------------------------------------------
 def plot_loss_curves(
     history: dict,
     best_epoch: int | None = None,
     save_path: str | None = None,
 ) -> plt.Figure:
-    """Two-panel: z-score MSE on the left, °C RMSE on the right.
+    """Two-panel loss curves: z-score MSE on the left, °C RMSE on the right.
 
     Both panels overlay train (solid) and, when present, val (dashed)
     curves. If ``best_epoch`` is given, a vertical line marks it on
-    both panels.
-
-    The val curves are omitted if ``history`` has no ``val_mse_z`` key
-    or it's empty (``train_ae.train`` called with
-    ``val_loader=None``). The °C panel is omitted if
-    ``train_rmse_celsius`` is missing or holds ``None`` (i.e.
-    ``train_ae.train`` called without ``zscore_std``).
+    both panels. Val curves and the °C panel are omitted when their
+    data is missing or ``None``.
     """
     epochs = np.arange(len(history["train_mse_z"]))
     has_val = (
@@ -108,9 +101,8 @@ def reconstruct_split(
     in z-score units, with ``N == len(dataset)``. Order matches the
     dataset's age-index order (``shuffle=False`` internally).
 
-    Assumes the model's forward returns ``(x_hat, z)`` - this is the
-    contract :class:`paleoreco.models.autoencoder.ConvAE` follows. A
-    model returning just ``x_hat`` won't unpack correctly.
+    Assumes the model's forward returns ``(x_hat, z)`` (the
+    :class:`paleoreco.models.autoencoder.ConvAE` contract).
     """
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     truths, preds = [], []
