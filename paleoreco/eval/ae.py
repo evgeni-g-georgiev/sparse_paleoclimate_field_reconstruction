@@ -58,7 +58,7 @@ def plot_loss_curves(
         ax.plot(epochs, history["val_mse_z"], label="val", lw=1.5, ls="--")
     ax.set_xlabel("epoch")
     ax.set_ylabel("masked MSE (z-score units)")
-    ax.set_title("Loss curves — z-score units (optimisation target)")
+    ax.set_title("Loss curves: z-score units (optimisation target)")
     ax.grid(True, alpha=0.3)
     if best_epoch is not None and best_epoch >= 0:
         ax.axvline(best_epoch, color="k", lw=1, alpha=0.4, label=f"best ep {best_epoch}")
@@ -74,7 +74,7 @@ def plot_loss_curves(
                 ax.plot(epochs, history["val_rmse_celsius"], label="val", lw=1.5, ls="--")
         ax.set_xlabel("epoch")
         ax.set_ylabel("RMSE (°C)")
-        ax.set_title("Loss curves — °C (human-readable)")
+        ax.set_title("Loss curves: °C")
         ax.grid(True, alpha=0.3)
         if best_epoch is not None and best_epoch >= 0:
             ax.axvline(best_epoch, color="k", lw=1, alpha=0.4)
