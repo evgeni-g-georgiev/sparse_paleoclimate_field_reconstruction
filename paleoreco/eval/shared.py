@@ -375,37 +375,11 @@ def compute_E_d(
 ) -> float:
     """Bousquet 2025 Eq. 14: fraction of variance captured, averaged per snapshot.
 
-    .. math::
-
-        E_d = 1 - \\frac{1}{N_t} \\sum_t
-                  \\frac{\\sum_{c,(i,j) \\in \\text{mask}} (u_t - \\hat u_t)^2}
-                       {\\sum_{c,(i,j) \\in \\text{mask}} u_t^2}.
-
-    Two key points:
-
-    * The ratio is computed **per snapshot** then averaged across
-      snapshots, *not* a single global numerator/denominator ratio.
-      This matches Bousquet exactly and weighs every snapshot equally
-      regardless of its magnitude.
-    * The sum runs over valid cells across **both** channels, so the
-      mask broadcasts to ``(N, 2, H, W)``.
-
-    Parameters
-    ----------
-    truth_z, pred_z : (N, 2, H, W) float
-        Truth and reconstruction in z-score units.
-    mask : (H, W) bool
-        ``safe_valid`` mask.
-    eps : float
-        Guards against a snapshot with vanishing ``||u||^2`` (cheap
-        defence; not expected on z-scored data).
-
-    Returns
-    -------
-    float
-        ``E_d``: values near 1 mean near-perfect compression. Bousquet
-        reports values around 0.99+ for periodic flows, dropping to
-        ~0.4-0.8 for the turbulent von Kármán case.
+    For each snapshot t, compute ``sum(err^2) / sum(truth^2)`` summed over
+    valid cells across both channels; average those ratios across snapshots,
+    then subtract from 1. Per-snapshot-then-average (rather than pooled-
+    then-divide) weighs every snapshot equally regardless of magnitude.
+    ``eps`` guards against a snapshot with vanishing ``||u||^2``.
     """
     mask_b = mask[None, None].astype(bool)        # (1, 1, H, W)
     sq_err = ((pred_z - truth_z) ** 2) * mask_b   # zeros outside mask
@@ -418,6 +392,56 @@ def compute_E_d(
     # Per-snapshot ratio, then mean over snapshots.
     ratio = num / np.maximum(den, eps)
     return float(1.0 - ratio.mean())
+
+
+# ---------------------------------------------------------------------------
+# Split-level metric bundle.
+# ---------------------------------------------------------------------------
+def compute_split_metrics(
+    truth_z: np.ndarray,
+    pred_z: np.ndarray,
+    mask: np.ndarray,
+) -> dict[str, float]:
+    """Bundle of five reconstruction metrics computed on z-scored truth/pred.
+
+    All metrics use valid cells only (``mask`` broadcast to ``(N, C, H, W)``).
+    Feeding z-scored inputs (rather than °C) weights every cell equally in
+    the pooled sums regardless of its natural std; with °C anomaly inputs
+    the high-variance cells would dominate.
+
+    Returns
+    -------
+    dict with keys:
+        ``"mse_z"``     : per-cell mean squared error (z-score units squared).
+        ``"rmse_z"``    : ``sqrt(mse_z)`` (z-score units).
+        ``"rrmse"``     : ``sqrt(sum(err^2 * m) / sum(truth^2 * m))``;
+                          dimensionless.
+        ``"r_squared"`` : ``1 - rrmse**2``. R² > 0 means reconstruct better 
+                            than just predicting the per-cell long-term mean.
+        ``"E_d"``       : Bousquet 2025 Eq. 14, per-snapshot variance
+                          captured; dimensionless. Delegates to
+                          :func:`compute_E_d`.
+    """
+    mask_b = mask[None, None].astype(bool)
+    err2 = ((pred_z - truth_z) ** 2) * mask_b
+    truth2 = (truth_z ** 2) * mask_b
+
+    n_valid = truth_z.shape[0] * truth_z.shape[1] * int(mask.sum())
+    sum_err2 = float(err2.sum())
+    sum_truth2 = float(truth2.sum())
+
+    mse_z = sum_err2 / n_valid
+    rmse_z = float(np.sqrt(mse_z))
+    rrmse = float(np.sqrt(sum_err2 / max(sum_truth2, 1e-12)))
+    r_squared = 1.0 - rrmse ** 2
+
+    return {
+        "mse_z":     float(mse_z),
+        "rmse_z":    rmse_z,
+        "rrmse":     rrmse,
+        "r_squared": float(r_squared),
+        "E_d":       compute_E_d(truth_z, pred_z, mask),
+    }
 
 
 def plot_latent_sweep(
