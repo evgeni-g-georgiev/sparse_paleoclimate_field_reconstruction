@@ -100,113 +100,100 @@ class UpBlock(nn.Module):
 class ConvAE(nn.Module):
     """Convolutional autoencoder with circular-longitude padding.
 
-    Pipeline (with default ``base_channels=32``):
+    Architecture
+    ------------
+    The encoder is ``depth`` stride-2 ConvBlocks doubling channels per
+    stage (``base, 2*base, ..., 2**(depth-1) * base``), followed by a
+    flatten and a linear projection to ``latent_dim``. The decoder mirrors
+    the encoder via UpBlocks; the last halves to ``base // 2`` before a
+    final 3x3 conv to ``out_channels``. No activation or norm on the
+    final layer; output is in z-score units (~N(0, 1)).
 
-      Encoder ``(B, 3, 32, 64) -> (B, latent_dim)``:
-          Conv stride-2 stack:
-              (3, 32, 64) -> (32, 16, 32) -> (64, 8, 16) -> (128, 4, 8)
-          Flatten -> Linear(4096 -> latent_dim).
-
-      Decoder ``(B, latent_dim) -> (B, 2, 32, 64)``:
-          Linear(latent_dim -> 4096) -> reshape to (128, 4, 8).
-          Upsample(2x) + 3x3 conv stack:
-              (128, 4, 8) -> (64, 8, 16) -> (32, 16, 32) -> (16, 32, 64)
-          Final 3x3 conv -> (2, 32, 64). No activation, no norm.
-
-    Default channels: input = (mtco_z, mtwa_z, valid_mask); output =
+    Default IO channels: input = (mtco_z, mtwa_z, valid_mask); output =
     (mtco_z, mtwa_z). The mask is conditioning input, not reconstructed.
 
     Design choices
     --------------
-    * GroupNorm instead of BatchNorm: robust to batch-size variation and
-      standard in diffusion-adjacent architectures.
-    * SiLU instead of ReLU: smoother gradients.
-    * Upsample+Conv instead of ConvTranspose: avoids checkerboard artefacts.
-    * No skip connections: bottleneck must be a true compression so the
-      latent is interpretable for the Bousquet POD-vs-latent probe.
-    * No activation on the final layer: output is in z-score units
-      (~N(0, 1)), so no range constraint is appropriate.
+    * GroupNorm, not BatchNorm: robust to batch-size variation.
+    * SiLU, not ReLU: smoother gradients.
+    * Upsample+Conv, not ConvTranspose: avoids checkerboard artefacts.
+    * No skip connections: the bottleneck must be a true compression so
+      the latent stays interpretable for downstream probes.
 
-    Parameters
-    ----------
-    latent_dim : int
-        Size of the bottleneck vector.
-    in_channels : int, default 3
-        Number of input channels. Default matches the dataset's
-        ``(mtco_z, mtwa_z, valid_mask)`` layout.
-    out_channels : int, default 2
-        Number of channels reconstructed by the decoder. The mask is
-        conditioning input, not reconstructed; default 2 matches the
-        temperature channels.
-    base_channels : int, default 32
-        Channel multiplier. Encoder doubles per stage:
-        ``base, 2*base, 4*base``. Decoder mirrors, then halves once more
-        before the final conv.
-    grid_shape : tuple[int, int], default (32, 64)
-        ``(H, W)``. The architecture assumes three stride-2 downsamples
-        are possible, so both axes must be divisible by 8.
+    Constraints
+    -----------
+    ``H`` and ``W`` must be divisible by ``2 ** depth``. ``base_channels``
+    must be even (the last UpBlock halves it). ``depth >= 1``.
 
     Attributes
     ----------
-    bottleneck_shape : tuple[int, int, int]
-        The pre-flatten encoder output shape ``(4*base, H/8, W/8)``,
-        exposed for downstream introspection.
+    bottleneck_shape : ``(base * 2**(depth-1), H // 2**depth, W // 2**depth)``.
     """
 
     def __init__(
         self,
         latent_dim: int,
+        *,
         in_channels: int = 3,
         out_channels: int = 2,
         base_channels: int = 32,
+        depth: int = 3,
         grid_shape: tuple[int, int] = (32, 64),
     ):
         super().__init__()
         H, W = grid_shape
-        if H % 8 or W % 8:
+        if depth < 1:
+            raise ValueError(f"depth must be >= 1; got {depth}")
+        factor = 2 ** depth
+        if H % factor or W % factor:
             raise ValueError(
-                f"grid_shape={grid_shape} must be divisible by 8 on both "
-                "axes (three stride-2 downsamples)."
+                f"grid_shape={grid_shape} must be divisible by 2**depth="
+                f"{factor} on both axes."
             )
         if base_channels % 2:
-            # The last UpBlock outputs base_channels // 2, so the value must be even.
             raise ValueError(
                 f"base_channels={base_channels} must be even (last UpBlock "
                 "outputs base_channels // 2)."
             )
 
-        c1, c2, c3 = base_channels, 2 * base_channels, 4 * base_channels
-        H_low, W_low = H // 8, W // 8
-        flat_dim = c3 * H_low * W_low
+        enc_channels = [base_channels * (2 ** i) for i in range(depth)]
+        c_top = enc_channels[-1]
+        H_low, W_low = H // factor, W // factor
+        flat_dim = c_top * H_low * W_low
 
         self.latent_dim = latent_dim
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.base_channels = base_channels
+        self.depth = depth
         self.grid_shape = grid_shape
-        self.bottleneck_shape: tuple[int, int, int] = (c3, H_low, W_low)
+        self.bottleneck_shape: tuple[int, int, int] = (c_top, H_low, W_low)
 
         # ---- Encoder ------------------------------------------------------
+        enc_pairs = [(in_channels, enc_channels[0])] + [
+            (enc_channels[i - 1], enc_channels[i]) for i in range(1, depth)
+        ]
         self.encoder_conv = nn.Sequential(
-            ConvBlock(in_channels, c1, stride=2),   # (H, W)     -> (H/2, W/2)
-            ConvBlock(c1, c2, stride=2),            # (H/2, W/2) -> (H/4, W/4)
-            ConvBlock(c2, c3, stride=2),            # (H/4, W/4) -> (H/8, W/8)
+            *[ConvBlock(c_in, c_out, stride=2) for c_in, c_out in enc_pairs]
         )
         self.encoder_fc = nn.Linear(flat_dim, latent_dim)
 
         # ---- Decoder ------------------------------------------------------
+        # Mirror the encoder; the last UpBlock halves base_channels.
+        dec_pairs = [
+            (enc_channels[i], enc_channels[i - 1])
+            for i in range(depth - 1, 0, -1)
+        ] + [(base_channels, base_channels // 2)]
         self.decoder_fc = nn.Linear(latent_dim, flat_dim)
         self.decoder_conv = nn.Sequential(
-            UpBlock(c3, c2),                        # (H/8, W/8) -> (H/4, W/4)
-            UpBlock(c2, c1),                        # (H/4, W/4) -> (H/2, W/2)
-            UpBlock(c1, c1 // 2),                   # (H/2, W/2) -> (H,   W)
+            *[UpBlock(c_in, c_out) for c_in, c_out in dec_pairs]
         )
-        # Final conv collapses to ``out_channels``. Bias enabled so the
-        # output can have a non-zero mean. No activation and no norm: the
-        # target lives in z-score units (~N(0, 1)), so any squashing
-        # non-linearity would clip or bias the output.
+        # Final conv collapses to ``out_channels``. No activation and no
+        # norm: the target lives in z-score units (~N(0, 1)), so any
+        # squashing non-linearity would clip or bias the output.
         self.out_pad = CircularLonPad2d(padding=1)
         self.out_conv = nn.Conv2d(
-            c1 // 2, out_channels, kernel_size=3, stride=1, padding=0
+            base_channels // 2, out_channels, kernel_size=3, stride=1, padding=0
         )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
