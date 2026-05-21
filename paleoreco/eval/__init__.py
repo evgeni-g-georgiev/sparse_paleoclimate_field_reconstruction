@@ -12,9 +12,12 @@ generic primitives without depending on AE-specific contracts:
 * :mod:`paleoreco.eval.ae`
     Autoencoder specific helpers that depend on either the model's
     forward contract (``model(x) -> (x_hat, z)``) or the ``history``
-    dict produced by :mod:`paleoreco.train_ae`. When downstream model 
-    eval modules arrive, they live alongside as ``paleoreco.eval.diffusion`` etc.,
-    and keep using everything in :mod:`paleoreco.eval.shared`.
+    dict produced by :mod:`paleoreco.train_ae`.
+
+* :mod:`paleoreco.eval.vae`
+    Beta-VAE specific helpers that depend on the VAE forward contract
+    (``model(x) -> (x_hat, mu, logvar, z)``) or the ``history`` dict
+    produced by :mod:`paleoreco.train_vae`.
 
 For convenience the public API of both submodules is re-exported here,
 so callers can simply do::
@@ -27,6 +30,11 @@ without reaching into the submodules.
 from paleoreco.eval.ae import (
     plot_loss_curves,
     reconstruct_split,
+)
+from paleoreco.eval.vae import (
+    compute_vae_diagnostics,
+    plot_loss_curves_vae,
+    reconstruct_split_vae,
 )
 from paleoreco.eval.shared import (
     compute_E_d,
@@ -69,4 +77,8 @@ __all__ = [
     # ae
     "plot_loss_curves",
     "reconstruct_split",
+    # vae
+    "compute_vae_diagnostics",
+    "plot_loss_curves_vae",
+    "reconstruct_split_vae",
 ]
