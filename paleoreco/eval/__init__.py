@@ -33,6 +33,7 @@ from paleoreco.eval.ae import (
 )
 from paleoreco.eval.vae import (
     compute_vae_diagnostics,
+    latent_traversal,
     plot_loss_curves_vae,
     reconstruct_split_vae,
 )
@@ -42,8 +43,11 @@ from paleoreco.eval.shared import (
     partition_latent_2d,
     per_cell_rmse_celsius,
     per_mode_learning_accuracy,
+    plot_decoded_samples,
     plot_latent_2d,
+    plot_latent_2d_with_sigma,
     plot_latent_sweep,
+    plot_latent_traversal,
     plot_per_cell_rmse,
     plot_per_cluster_pod_distributions,
     plot_per_cluster_reconstructions,
@@ -74,11 +78,16 @@ __all__ = [
     "plot_per_cluster_pod_distributions",
     "plot_per_cluster_reconstructions",
     "plot_per_mode_learning_curves",
+    # shared - beta-VAE rendering primitives
+    "plot_decoded_samples",
+    "plot_latent_2d_with_sigma",
+    "plot_latent_traversal",
     # ae
     "plot_loss_curves",
     "reconstruct_split",
     # vae
     "compute_vae_diagnostics",
+    "latent_traversal",
     "plot_loss_curves_vae",
     "reconstruct_split_vae",
 ]

@@ -9,6 +9,8 @@ produced by :mod:`paleoreco.train_vae`. Everything else under
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -92,6 +94,49 @@ def compute_vae_diagnostics(
         "mu_norm": mu_norm,
         "post_cov_diag_mean": post_cov_diag_mean,
     }
+
+
+# ---------------------------------------------------------------------------
+# Decoder-side latent probes.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def latent_traversal(
+    model: torch.nn.Module,
+    mu_ref: np.ndarray,
+    sigma_post: np.ndarray,
+    dims: Sequence[int],
+    n_steps: int = 7,
+    device: str | torch.device = "cpu",
+) -> tuple[np.ndarray, np.ndarray]:
+    """For each dim in ``dims``, sweep ``mu_ref`` +/- ``2 * sigma_post`` and decode.
+
+    Holds the other dims at ``mu_ref`` and decodes ``len(dims) * n_steps``
+    fields in a single forward pass. Returned arrays are numpy in z-score
+    units; the caller renders with :func:`paleoreco.eval.shared.plot_latent_traversal`.
+
+    Returns
+    -------
+    decoded : ``(len(dims), n_steps, C, H, W)`` z-score reconstructions.
+    z_values : ``(len(dims), n_steps)`` the sweep values used per dim.
+    """
+    d = mu_ref.shape[0]
+    dims = list(dims)
+    n_dims = len(dims)
+    z_values = np.zeros((n_dims, n_steps), dtype=mu_ref.dtype)
+    all_z = np.broadcast_to(mu_ref[None], (n_dims * n_steps, d)).copy()
+    for i, k in enumerate(dims):
+        sweep = np.linspace(
+            mu_ref[k] - 2.0 * sigma_post[k],
+            mu_ref[k] + 2.0 * sigma_post[k],
+            n_steps,
+        )
+        z_values[i] = sweep
+        all_z[i * n_steps:(i + 1) * n_steps, k] = sweep
+    model.eval()
+    z_t = torch.from_numpy(all_z).to(device)
+    decoded_flat = model.decode(z_t).cpu().numpy()
+    decoded = decoded_flat.reshape(n_dims, n_steps, *decoded_flat.shape[1:])
+    return decoded, z_values
 
 
 # ---------------------------------------------------------------------------

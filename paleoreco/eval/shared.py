@@ -857,6 +857,223 @@ def plot_per_cluster_reconstructions(
 
 
 # ---------------------------------------------------------------------------
+# Beta-VAE latent-space rendering primitives.
+# ---------------------------------------------------------------------------
+# These extend the Layer-2 toolkit with renderers specific to Gaussian-
+# latent models: per-point sigma bands around the (mu_1, mu_2) scatter,
+# latent-traversal grids, and decoded prior samples. All consume numpy
+# inputs; the compute step that runs the decoder lives in
+# :mod:`paleoreco.eval.vae`.
+# ---------------------------------------------------------------------------
+def plot_latent_2d_with_sigma(
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    color_values: np.ndarray,
+    color_label: str,
+    save_path: str | None = None,
+    title: str = "Latent space (2D) with posterior sigma bands",
+    discrete: bool | None = None,
+    band_alpha: float = 0.08,
+) -> plt.Figure:
+    """Bousquet Fig 10b / 12b / 13b / 19b: 2D latent scatter with sigma bands.
+
+    For each ``(mu_1, mu_2)`` point, draws a horizontal orange segment of
+    length ``2 * sigma_1`` and a vertical blue segment of length
+    ``2 * sigma_2``. With many overlapping points these form the coloured
+    cloud Bousquet uses to visualise per-axis posterior spread. The mu
+    scatter is drawn on top, coloured by ``color_values`` (continuous or
+    discrete, auto-detected).
+    """
+    if mu.ndim != 2 or mu.shape[1] != 2 or sigma.shape != mu.shape:
+        raise ValueError(
+            f"expected mu, sigma of shape (N, 2); got mu={mu.shape}, sigma={sigma.shape}"
+        )
+    from matplotlib.collections import LineCollection
+
+    fig, ax = plt.subplots(figsize=(6.0, 5.0), constrained_layout=True)
+
+    # Sigma bands as line segments; LineCollection batches them for speed.
+    N = mu.shape[0]
+    h_segs = np.empty((N, 2, 2))
+    h_segs[:, 0, 0] = mu[:, 0] - sigma[:, 0]
+    h_segs[:, 0, 1] = mu[:, 1]
+    h_segs[:, 1, 0] = mu[:, 0] + sigma[:, 0]
+    h_segs[:, 1, 1] = mu[:, 1]
+    v_segs = np.empty((N, 2, 2))
+    v_segs[:, 0, 0] = mu[:, 0]
+    v_segs[:, 0, 1] = mu[:, 1] - sigma[:, 1]
+    v_segs[:, 1, 0] = mu[:, 0]
+    v_segs[:, 1, 1] = mu[:, 1] + sigma[:, 1]
+    ax.add_collection(
+        LineCollection(h_segs, colors="tab:orange", alpha=band_alpha, lw=2)
+    )
+    ax.add_collection(
+        LineCollection(v_segs, colors="tab:blue", alpha=band_alpha, lw=2)
+    )
+
+    # Discrete / continuous colour handling, same as plot_latent_2d. Inlined
+    # here to keep this commit purely additive; a refactor can extract.
+    if discrete is None:
+        is_int = np.issubdtype(np.asarray(color_values).dtype, np.integer)
+        discrete = bool(is_int and len(np.unique(color_values)) <= 16)
+    if discrete:
+        levels = np.unique(color_values)
+        n_levels = len(levels)
+        cmap = plt.get_cmap("tab10", n_levels)
+        mapped_colors = np.zeros_like(color_values)
+        for i, val in enumerate(levels):
+            mapped_colors[color_values == val] = i
+        sc = ax.scatter(
+            mu[:, 0], mu[:, 1],
+            c=mapped_colors, cmap=cmap, s=14, alpha=0.95, edgecolor="none",
+            vmin=-0.5, vmax=n_levels - 0.5,
+        )
+        cbar = plt.colorbar(sc, ax=ax, ticks=np.arange(n_levels))
+        cbar.ax.set_yticklabels(levels)
+        cbar.set_label(color_label)
+    else:
+        sc = ax.scatter(
+            mu[:, 0], mu[:, 1],
+            c=color_values, cmap="viridis", s=14, alpha=0.95, edgecolor="none",
+        )
+        cbar = plt.colorbar(sc, ax=ax)
+        cbar.set_label(color_label)
+
+    ax.set_xlabel(r"$\mu_1$")
+    ax.set_ylabel(r"$\mu_2$")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.axhline(0, color="k", lw=0.5, alpha=0.4)
+    ax.axvline(0, color="k", lw=0.5, alpha=0.4)
+    ax.autoscale_view()
+
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight", dpi=120)
+    return fig
+
+
+def plot_latent_traversal(
+    decoded: np.ndarray,
+    z_values: np.ndarray,
+    dim_labels: Sequence[int | str],
+    zscore_stats: dict,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    var_names: Sequence[str] = ("mtco", "mtwa"),
+    save_path: str | None = None,
+) -> plt.Figure:
+    """Plot a ``(n_dims, n_steps, n_channels)`` traversal grid in deg C anomaly.
+
+    Layout: ``2 * n_dims`` rows by ``n_steps`` cols. Rows interleave
+    channels so the per-dim effect on both fields is visible side by
+    side: row 0 = mtco for dim_labels[0], row 1 = mtwa for dim_labels[0],
+    row 2 = mtco for dim_labels[1], etc. Each column shows one z-step;
+    the column header reports its ``z_values`` entry. Symmetric diverging
+    colour scale per channel from the 99th-percentile of the decoded
+    anomalies across all (dim, step) pairs.
+
+    ``decoded`` and ``z_values`` are typically produced by
+    :func:`paleoreco.eval.vae.latent_traversal`.
+    """
+    n_dims, n_steps, n_channels = decoded.shape[:3]
+    if len(dim_labels) != n_dims:
+        raise ValueError(
+            f"dim_labels must have length n_dims={n_dims}, got {len(dim_labels)}"
+        )
+    if n_channels != len(var_names):
+        raise ValueError(
+            f"decoded has {n_channels} channels but var_names has {len(var_names)}"
+        )
+
+    anomaly = decoded * zscore_stats["std"][None, None]
+    vmax_c = [
+        float(np.nanpercentile(np.abs(anomaly[..., c, :, :]), 99))
+        for c in range(n_channels)
+    ]
+
+    fig, axes = plt.subplots(
+        2 * n_dims, n_steps,
+        figsize=(1.5 * n_steps + 0.8, 1.2 * 2 * n_dims + 0.5),
+        squeeze=False, constrained_layout=True,
+    )
+    extent = [lons.min(), lons.max(), lats.min(), lats.max()]
+
+    for di, label in enumerate(dim_labels):
+        for ci, name in enumerate(var_names):
+            row = 2 * di + ci
+            for si in range(n_steps):
+                ax = axes[row, si]
+                ax.imshow(
+                    anomaly[di, si, ci], origin="lower", extent=extent,
+                    cmap="RdBu_r", vmin=-vmax_c[ci], vmax=vmax_c[ci],
+                    aspect="auto",
+                )
+                ax.set_xticks([]); ax.set_yticks([])
+                if row == 0:
+                    ax.set_title(f"z={z_values[di, si]:.2f}", fontsize=8)
+            axes[row, 0].set_ylabel(f"dim {label}\n{name}", fontsize=9)
+
+    fig.suptitle("Latent traversal (deg C anomaly)", fontsize=11)
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight", dpi=120)
+    return fig
+
+
+def plot_decoded_samples(
+    decoded: np.ndarray,
+    zscore_stats: dict,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    var_names: Sequence[str] = ("mtco", "mtwa"),
+    save_path: str | None = None,
+    title: str = "Decoded N(0, I) samples (deg C anomaly)",
+) -> plt.Figure:
+    """Render decoded prior samples as a grid of deg C anomaly maps.
+
+    Layout: ``N`` rows by ``n_channels`` cols. Symmetric diverging colour
+    scale per channel from the 99th percentile of all rendered anomalies.
+    """
+    N, n_channels = decoded.shape[:2]
+    if n_channels != len(var_names):
+        raise ValueError(
+            f"decoded has {n_channels} channels but var_names has {len(var_names)}"
+        )
+    anomaly = decoded * zscore_stats["std"][None]
+    vmax_c = [
+        float(np.nanpercentile(np.abs(anomaly[:, c]), 99))
+        for c in range(n_channels)
+    ]
+    fig, axes = plt.subplots(
+        N, n_channels,
+        figsize=(4.0 * n_channels + 0.5, 2.2 * N + 0.5),
+        squeeze=False, constrained_layout=True,
+    )
+    extent = [lons.min(), lons.max(), lats.min(), lats.max()]
+    for n in range(N):
+        for c in range(n_channels):
+            ax = axes[n, c]
+            ax.imshow(
+                anomaly[n, c], origin="lower", extent=extent,
+                cmap="RdBu_r", vmin=-vmax_c[c], vmax=vmax_c[c],
+                aspect="auto",
+            )
+            ax.set_xticks([]); ax.set_yticks([])
+            if n == 0:
+                ax.set_title(var_names[c])
+            if c == 0:
+                ax.set_ylabel(f"sample {n}")
+    for c in range(n_channels):
+        fig.colorbar(
+            axes[0, c].images[0], ax=axes[:, c].tolist(),
+            shrink=0.7, label=f"{var_names[c]} anomaly (deg C)",
+        )
+    fig.suptitle(title)
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight", dpi=120)
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Reconstruction distribution.
 # ---------------------------------------------------------------------------
 def plot_recon_distribution(
