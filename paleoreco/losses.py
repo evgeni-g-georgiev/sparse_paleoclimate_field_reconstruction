@@ -1,8 +1,8 @@
-"""Masked MSE / RMSE for reconstruction on the Prior grid.
+"""Masked reconstruction losses for fields on the Prior grid.
 
 Cells outside ``safe_valid`` are zero-filled in the input by
 :func:`paleoreco.data.apply_zscore`; the mask zeroes out their
-contribution to the loss, so a model isn't trained to predict 0 on
+contribution to the loss so a model isn't trained to predict 0 on
 arbitrary cells.
 """
 
@@ -85,3 +85,28 @@ def masked_rmse(
     Returned value is in z-score units.
     """
     return masked_mse(pred, target, mask, reduction="mean").sqrt()
+
+
+def vae_elbo_loss(
+    x_hat: torch.Tensor,
+    target: torch.Tensor,
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    mask: torch.Tensor,
+    beta: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Beta-VAE ELBO: masked-MSE reconstruction + ``beta`` * KL to N(0, I).
+
+    The KL term is summed over latent dims and averaged over the batch. ``beta`` 
+    here is the per-step coefficient; KL-annealing schedules are the trainer's 
+    job, not this function's.
+
+    Returns ``(loss, recon_term, kl_term)`` so the trainer can log the
+    two terms separately even though only ``loss`` carries grad.
+    """
+    recon_term = masked_mse(x_hat, target, mask)
+    # 0.5 * (mu^2 + sigma^2 - log sigma^2 - 1), summed over latent dims.
+    kl_per_sample = 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1.0).sum(dim=1)
+    kl_term = kl_per_sample.mean()
+    loss = recon_term + beta * kl_term
+    return loss, recon_term, kl_term
