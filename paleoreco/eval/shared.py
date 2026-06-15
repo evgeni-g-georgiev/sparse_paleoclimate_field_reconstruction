@@ -1113,3 +1113,54 @@ def plot_recon_distribution(
     if save_path:
         fig.savefig(save_path, bbox_inches="tight", dpi=120)
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Latent geometry health (compressor selection alongside reconstruction).
+# ---------------------------------------------------------------------------
+def latent_tidiness(codes: np.ndarray) -> dict[str, float]:
+    """Quantitative latent-geometry health for a code matrix ``(N, d)``.
+
+    Complements reconstruction error when choosing a compressor: a latent that a
+    Gaussian-B assimilation and a diffusion prior can use wants decorrelated,
+    well-conditioned, comparably-scaled dims. These numbers say nothing about
+    physical meaningfulness of the axes or decoder smoothness, which stay visual.
+
+    Returns
+    -------
+    dict with keys:
+        ``"decorr_offdiag"`` : mean ``|off-diagonal|`` of the latent correlation
+            matrix; 0 = fully decorrelated dims.
+        ``"cov_cond"``       : condition number of the code covariance
+            (largest/smallest eigenvalue); 1 = isotropic, large = ill-conditioned.
+        ``"effective_rank"`` : participation ratio of the covariance eigenvalues
+            ``(sum L)^2 / sum(L^2)``; how many dims carry variance (<= d).
+        ``"dim_mean_abs"``   : mean ``|per-dim mean|``; 0 = centred.
+        ``"dim_var_cv"``     : coefficient of variation across per-dim variances;
+            0 = one shared scale, large = a few dims dominate.
+    """
+    codes = np.asarray(codes, dtype=np.float64)
+    if codes.ndim != 2 or codes.shape[0] < 2 or codes.shape[1] < 2:
+        raise ValueError(f"need (N>=2, d>=2) codes; got shape {codes.shape}")
+    d = codes.shape[1]
+
+    corr = np.corrcoef(codes, rowvar=False)
+    offdiag = corr[~np.eye(d, dtype=bool)]
+    decorr_offdiag = float(np.nanmean(np.abs(offdiag)))
+
+    cov = np.cov(codes, rowvar=False)
+    eig = np.clip(np.linalg.eigvalsh(cov), 0.0, None)
+    cov_cond = float(eig.max() / max(eig.min(), 1e-12))
+    effective_rank = float(eig.sum() ** 2 / max((eig ** 2).sum(), 1e-12))
+
+    dim_var = codes.var(axis=0)
+    dim_mean_abs = float(np.abs(codes.mean(axis=0)).mean())
+    dim_var_cv = float(dim_var.std() / max(dim_var.mean(), 1e-12))
+
+    return {
+        "decorr_offdiag": decorr_offdiag,
+        "cov_cond": cov_cond,
+        "effective_rank": effective_rank,
+        "dim_mean_abs": dim_mean_abs,
+        "dim_var_cv": dim_var_cv,
+    }
