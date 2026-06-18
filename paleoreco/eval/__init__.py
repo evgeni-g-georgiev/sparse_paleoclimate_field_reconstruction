@@ -24,6 +24,11 @@ generic primitives without depending on AE-specific contracts:
     data-assimilation diagnostics. Takes numpy arrays of standardised
     innovations.
 
+* :mod:`paleoreco.eval.projection`
+    Principal-component projections of a field stack, the 1-D linear
+    projections used to inspect a sample of fields for departures from
+    Gaussianity.
+
 For convenience the public API of both submodules is re-exported here,
 so callers can simply do::
 
@@ -45,6 +50,9 @@ from paleoreco.eval.vae import (
 from paleoreco.eval.gaussianity import (
     plot_innovation_gaussianity,
     plot_pairwise_gaussianity,
+)
+from paleoreco.eval.projection import (
+    pca_scores,
 )
 from paleoreco.eval.shared import (
     compute_E_d,
@@ -102,4 +110,6 @@ __all__ = [
     # gaussianity
     "plot_innovation_gaussianity",
     "plot_pairwise_gaussianity",
+    # projection
+    "pca_scores",
 ]
