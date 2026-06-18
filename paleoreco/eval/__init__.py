@@ -19,6 +19,11 @@ generic primitives without depending on AE-specific contracts:
     (``model(x) -> (x_hat, mu, logvar, z)``) or the ``history`` dict
     produced by :mod:`paleoreco.train_vae`.
 
+* :mod:`paleoreco.eval.gaussianity`
+    Pooled-innovation Gaussianity plots (histogram and normal QQ) for
+    data-assimilation diagnostics. Takes numpy arrays of standardised
+    innovations.
+
 For convenience the public API of both submodules is re-exported here,
 so callers can simply do::
 
@@ -36,6 +41,10 @@ from paleoreco.eval.vae import (
     latent_traversal,
     plot_loss_curves_vae,
     reconstruct_split_vae,
+)
+from paleoreco.eval.gaussianity import (
+    plot_innovation_gaussianity,
+    plot_pairwise_gaussianity,
 )
 from paleoreco.eval.shared import (
     compute_E_d,
@@ -90,4 +99,7 @@ __all__ = [
     "latent_traversal",
     "plot_loss_curves_vae",
     "reconstruct_split_vae",
+    # gaussianity
+    "plot_innovation_gaussianity",
+    "plot_pairwise_gaussianity",
 ]
