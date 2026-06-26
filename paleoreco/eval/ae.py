@@ -4,7 +4,7 @@ Two functions live here because they have a hard dependency on
 something AE-shaped:
 
 * :func:`plot_loss_curves` reads the ``history`` dict shape produced
-  by :mod:`paleoreco.train_ae`.
+  by :mod:`paleoreco.training.trainer_ae`.
 * :func:`reconstruct_split` assumes the model's forward returns
   ``(x_hat, z)`` (the AE contract).
 

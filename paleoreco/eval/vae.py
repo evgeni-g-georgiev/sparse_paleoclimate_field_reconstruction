@@ -2,7 +2,7 @@
 
 Three functions live here that depend on either the VAE forward contract
 (``forward(x) -> (x_hat, mu, logvar, z)``) or on the ``history`` dict
-produced by :mod:`paleoreco.train_vae`. Everything else under
+produced by :mod:`paleoreco.training.trainer_vae`. Everything else under
 :mod:`paleoreco.eval` is model-family-agnostic and lives in
 :mod:`~paleoreco.eval.shared`.
 """
