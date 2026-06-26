@@ -13,7 +13,9 @@ torch
 scikit-learn          
 
 # ---- Domain-specific --------------------------------------------------------
-adao                  
+adao
+xarray                # labelled grids for the CCSM4 -> LOVECLIM regrid
+xarray-regrid         # conservative rectilinear regridding, pure-Python (no ESMF)
 
 # ---- Notebook + dev experience ---------------------------------------------
 ipykernel             
