@@ -19,8 +19,9 @@ xarray                # labelled grids for the CCSM4 -> LOVECLIM regrid
 xarray-regrid         # conservative rectilinear regridding, pure-Python (no ESMF)
 
 # ---- Notebook + dev experience ---------------------------------------------
-ipykernel             
-tqdm                  
+ipykernel
+tqdm
+pytest                # unit + integration test suite (tests/)
 
 # ---- Legacy ----------------------------------------------------------------
 # Imported by the reference notebook (notebooks/read_data.ipynb)
