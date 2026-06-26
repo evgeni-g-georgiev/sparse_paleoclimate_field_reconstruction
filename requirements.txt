@@ -7,6 +7,7 @@
 numpy
 pandas
 matplotlib
+scikit-image          # SSIM for field reconstructions (paleoreco.eval.da)
 
 # ---- Machine learning -------------------------------------------------------
 torch                 
