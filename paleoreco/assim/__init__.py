@@ -38,6 +38,7 @@ from paleoreco.assim.innovation import (
     obs_cell_index,
     obs_operator_scale,
     predicted_sd,
+    r_diagonal,
     standardise,
 )
 from paleoreco.assim.joint import (
@@ -66,6 +67,7 @@ __all__ = [
     "obs_cell_index",
     "obs_operator_scale",
     "predicted_sd",
+    "r_diagonal",
     "standardise",
     "rank_pairs",
     "whitened_pair",
