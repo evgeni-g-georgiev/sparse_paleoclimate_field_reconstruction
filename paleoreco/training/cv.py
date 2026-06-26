@@ -1,12 +1,12 @@
 """Cross-validation drivers for the compressor sweeps.
 
 Fold-loop mechanics shared by the AE and VAE architecture sweeps: per-fold
-z-scoring (recomputed on each fold's train ages so validation never leaks into
-the normalisation), dataset/loader construction, and aggregation of whatever
-scalar metrics a caller's fit/eval closure returns. Model-specific logic
-(building the net, calling the right ``train``, evaluating val) stays in the
-caller's closure; this module only owns the fold loop and the final refit on a
-chosen index pool.
+anomaly centring (the climatology is recomputed on each fold's train ages so
+validation never leaks into it), dataset/loader construction, and aggregation
+of whatever scalar metrics a caller's fit/eval closure returns. Model-specific
+logic (building the net, calling the right ``train``, evaluating val) stays in
+the caller's closure; this module only owns the fold loop and the final refit
+on a chosen index pool.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Callable
 import numpy as np
 from torch.utils.data import DataLoader
 
-from ..data import PaleoFieldDataset, apply_zscore, compute_zscore_stats
+from ..data import PaleoFieldDataset, apply_anomaly, compute_zscore_stats
 
 
 def cross_validate(
@@ -30,8 +30,8 @@ def cross_validate(
     """Run ``fit_eval_fn`` on every fold and aggregate its scalar outputs.
 
     ``folds`` is the ``"folds"`` list from :func:`paleoreco.data.splits.make_blocked_cv`.
-    Each fold gets its own z-score stats fit on ``fold["train"]`` only, so the
-    validation ages stay out of the normalisation. ``fit_eval_fn`` receives
+    Each fold gets its own per-cell stats fit on ``fold["train"]`` only, so the
+    validation ages stay out of the climatology. ``fit_eval_fn`` receives
     ``(train_loader, val_loader, mask, stats, val_ds)``, builds and trains a
     model, and returns a flat dict of scalar metrics (including ``"best_epoch"``).
 
@@ -41,10 +41,10 @@ def cross_validate(
     per_fold: list[dict[str, float]] = []
     for fold in folds:
         stats = compute_zscore_stats(cube, fold["train"], valid)
-        cube_z = apply_zscore(cube, stats)
+        cube_anom = apply_anomaly(cube, stats)
         mask = stats["safe_valid"]
-        train_ds = PaleoFieldDataset(cube_z, mask, fold["train"])
-        val_ds = PaleoFieldDataset(cube_z, mask, fold["val"])
+        train_ds = PaleoFieldDataset(cube_anom, mask, fold["train"])
+        val_ds = PaleoFieldDataset(cube_anom, mask, fold["val"])
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
         per_fold.append(fit_eval_fn(train_loader, val_loader, mask, stats, val_ds))
@@ -75,22 +75,22 @@ def fit_on_indices(
     Used to retrain a chosen winner on the full non-test pool once the sweep has
     settled its architecture and a stopping epoch. ``epochs`` is the sweep's
     mean best-epoch for that config; ``patience=None`` and no val loader mean the
-    model trains exactly that many epochs. Z-score stats are fit on ``train_idx``.
+    model trains exactly that many epochs. Per-cell stats are fit on ``train_idx``.
 
     Returns ``(model, stats, mask)`` with the trained model loaded with its
     final-epoch weights.
     """
     stats = compute_zscore_stats(cube, train_idx, valid)
-    cube_z = apply_zscore(cube, stats)
+    cube_anom = apply_anomaly(cube, stats)
     mask = stats["safe_valid"]
     loader = DataLoader(
-        PaleoFieldDataset(cube_z, mask, train_idx),
+        PaleoFieldDataset(cube_anom, mask, train_idx),
         batch_size=batch_size, shuffle=True,
     )
     model = build_model()
     out = train_fn(
         model, loader, None,
-        mask=mask, zscore_std=stats["std"],
+        mask=mask,
         max_epochs=epochs, patience=None, device=device,
         **train_kwargs,
     )

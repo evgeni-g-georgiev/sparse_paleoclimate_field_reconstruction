@@ -33,13 +33,13 @@ def test_cross_validate_aggregates_scalar_metrics(cube, valid):
         assert mask.shape == valid.shape
         assert stats["mean"].shape[0] == 2
         calls["n"] += 1
-        return {"best_epoch": calls["n"], "val_mse_z": float(calls["n"])}
+        return {"best_epoch": calls["n"], "val_mse": float(calls["n"])}
 
     agg = cross_validate(cube, valid, folds, fit_eval_fn, batch_size=4)
 
     assert agg["n_folds"] == 2
     assert len(agg["per_fold"]) == 2
     # Mean of {1, 2} = 1.5 for both reported scalars.
-    assert agg["val_mse_z_mean"] == 1.5
+    assert agg["val_mse_mean"] == 1.5
     assert agg["best_epoch_mean"] == 1.5
-    assert "val_mse_z_std" in agg
+    assert "val_mse_std" in agg

@@ -52,10 +52,10 @@ def test_train_runs_and_reports_history():
 
     for key in ("history", "best_state_dict", "best_epoch", "epochs_trained"):
         assert key in out
-    assert "train_mse_z" in out["history"]
-    assert len(out["history"]["train_mse_z"]) == 3
+    assert "train_mse" in out["history"]
+    assert len(out["history"]["train_mse"]) == 3
     # Loss should not increase end-to-start over a short run.
-    losses = out["history"]["train_mse_z"]
+    losses = out["history"]["train_mse"]
     assert losses[-1] <= losses[0] + 1e-6
 
 
@@ -66,7 +66,7 @@ def test_training_is_deterministic_under_fixed_seed():
         model = _build()
         out = train(model, loader, val_loader=None, mask=mask, max_epochs=2,
                     patience=None, seed=0, verbose=False, progress=False)
-        return out["history"]["train_mse_z"]
+        return out["history"]["train_mse"]
 
     a = run()
     b = run()

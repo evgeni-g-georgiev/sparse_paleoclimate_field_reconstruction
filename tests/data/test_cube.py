@@ -1,4 +1,4 @@
-"""Tests for the Prior-cube loader and z-score helpers (paleoreco.data.cube)."""
+"""Tests for the Prior-cube loader and anomaly helpers (paleoreco.data.cube)."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ from paleoreco.data import (
     GRID_SHAPE,
     VARS,
     PaleoFieldDataset,
-    apply_zscore,
+    apply_anomaly,
     build_prior_cube,
     compute_zscore_stats,
-    invert_zscore,
+    invert_anomaly,
 )
 
 
@@ -60,7 +60,7 @@ def test_grid_and_vars_constants():
     assert VARS == ("mtco", "mtwa")
 
 
-def test_zscore_roundtrip_and_degenerate_masking(cube, valid):
+def test_anomaly_roundtrip_and_degenerate_masking(cube, valid):
     # Make one cell constant across ages on the mtco channel -> degenerate std.
     cube = cube.copy()
     cube[:, 0, 2, 3] = -4.0
@@ -70,11 +70,11 @@ def test_zscore_roundtrip_and_degenerate_masking(cube, valid):
     assert stats["safe_valid"][2, 3] == False  # noqa: E712 - degenerate cell dropped
     assert stats["safe_valid"].sum() == valid.sum() - 1
 
-    z = apply_zscore(cube, stats)
-    # Masked cell is zeroed in z-space.
-    assert np.allclose(z[:, 0, 2, 3], 0.0)
+    a = apply_anomaly(cube, stats)
+    # Masked cell is zeroed in anomaly space.
+    assert np.allclose(a[:, 0, 2, 3], 0.0)
     # Round-trip recovers the original on safe cells.
-    recovered = invert_zscore(z, stats)
+    recovered = invert_anomaly(a, stats)
     safe = stats["safe_valid"]
     assert np.allclose(recovered[:, 0, safe], cube[:, 0, safe], atol=1e-4)
 
@@ -82,8 +82,8 @@ def test_zscore_roundtrip_and_degenerate_masking(cube, valid):
 def test_dataset_returns_field_plus_mask(cube, valid):
     train_idx = np.arange(cube.shape[0])
     stats = compute_zscore_stats(cube, train_idx, valid)
-    z = apply_zscore(cube, stats)
-    ds = PaleoFieldDataset(z, stats["safe_valid"], train_idx)
+    a = apply_anomaly(cube, stats)
+    ds = PaleoFieldDataset(a, stats["safe_valid"], train_idx)
 
     assert len(ds) == cube.shape[0]
     sample = ds[0]

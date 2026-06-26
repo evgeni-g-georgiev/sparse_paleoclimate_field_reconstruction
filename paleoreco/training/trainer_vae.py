@@ -54,10 +54,10 @@ def beta_at_epoch(
 # ---------------------------------------------------------------------------
 # Per-epoch helpers.
 # ---------------------------------------------------------------------------
-def _empty_metrics() -> dict[str, float | None]:
+def _empty_metrics() -> dict[str, float]:
     nan = float("nan")
     return {
-        "mse_z": nan, "rmse_z": nan, "rmse_celsius": None,
+        "mse": nan, "rmse": nan,
         "kl": nan, "total_loss": nan,
     }
 
@@ -69,23 +69,17 @@ def _train_one_epoch_vae(
     mask: torch.Tensor,
     beta_eff: float,
     device: str | torch.device,
-    zscore_std: torch.Tensor | None = None,
-) -> dict[str, float | None]:
+) -> dict[str, float]:
     """Run one training epoch at fixed ``beta_eff``.
 
-    Returns ``{mse_z, rmse_z, rmse_celsius, kl, total_loss}``. Same
-    in-progress-weights caveat as ``train_ae._train_one_epoch``: train
-    metrics aggregate the optimisation trajectory; val metrics
-    (evaluated with eval-mode forward) are one step ahead.
+    Returns ``{mse, rmse, kl, total_loss}``. Same in-progress-weights
+    caveat as ``train_ae._train_one_epoch``: train metrics aggregate the
+    optimisation trajectory; val metrics (evaluated with eval-mode
+    forward) are one step ahead.
     """
     model.train()
 
-    has_std = zscore_std is not None
-    if has_std:
-        std_sq = zscore_std.to(device).unsqueeze(0) ** 2
-
-    sum_sq_z = 0.0
-    sum_sq_c = 0.0
+    sum_sq = 0.0
     sum_kl = 0.0
     sum_total = 0.0
     n_samples = 0
@@ -103,10 +97,7 @@ def _train_one_epoch_vae(
         optimizer.step()
 
         with torch.no_grad():
-            sq_err_z = (x_hat - target) ** 2 * mask
-            sum_sq_z += sq_err_z.sum().item()
-            if has_std:
-                sum_sq_c += (sq_err_z * std_sq).sum().item()
+            sum_sq += ((x_hat - target) ** 2 * mask).sum().item()
             B = batch.shape[0]
             sum_kl += kl.item() * B
             sum_total += loss.item() * B
@@ -115,11 +106,10 @@ def _train_one_epoch_vae(
 
     if n_terms <= 0 or n_samples == 0:
         return _empty_metrics()
-    mse_z = sum_sq_z / n_terms
+    mse = sum_sq / n_terms
     return {
-        "mse_z":        mse_z,
-        "rmse_z":       math.sqrt(mse_z),
-        "rmse_celsius": math.sqrt(sum_sq_c / n_terms) if has_std else None,
+        "mse":          mse,
+        "rmse":         math.sqrt(mse),
         "kl":           sum_kl / n_samples,
         "total_loss":   sum_total / n_samples,
     }
@@ -132,8 +122,7 @@ def evaluate_vae(
     mask: torch.Tensor,
     beta_eff: float,
     device: str | torch.device,
-    zscore_std: torch.Tensor | None = None,
-) -> dict[str, float | None]:
+) -> dict[str, float]:
     """Recon metrics + KL + total loss over ``loader``.
 
     Model is set to eval mode internally; the VAE's reparameterise()
@@ -142,12 +131,8 @@ def evaluate_vae(
     total loss reported here.
     """
     model.eval()
-    has_std = zscore_std is not None
-    if has_std:
-        std_sq = zscore_std.to(device).unsqueeze(0) ** 2
 
-    sum_sq_z = 0.0
-    sum_sq_c = 0.0
+    sum_sq = 0.0
     sum_kl = 0.0
     sum_total = 0.0
     n_samples = 0
@@ -160,10 +145,7 @@ def evaluate_vae(
         target = batch[:, :2]
         x_hat, mu, logvar, _ = model(batch)
         loss, _, kl = vae_elbo_loss(x_hat, target, mu, logvar, mask, beta_eff)
-        sq_err_z = (x_hat - target) ** 2 * mask
-        sum_sq_z += sq_err_z.sum().item()
-        if has_std:
-            sum_sq_c += (sq_err_z * std_sq).sum().item()
+        sum_sq += ((x_hat - target) ** 2 * mask).sum().item()
         B = batch.shape[0]
         sum_kl += kl.item() * B
         sum_total += loss.item() * B
@@ -172,11 +154,10 @@ def evaluate_vae(
 
     if n_terms <= 0 or n_samples == 0:
         return _empty_metrics()
-    mse_z = sum_sq_z / n_terms
+    mse = sum_sq / n_terms
     return {
-        "mse_z":        mse_z,
-        "rmse_z":       math.sqrt(mse_z),
-        "rmse_celsius": math.sqrt(sum_sq_c / n_terms) if has_std else None,
+        "mse":          mse,
+        "rmse":         math.sqrt(mse),
         "kl":           sum_kl / n_samples,
         "total_loss":   sum_total / n_samples,
     }
@@ -201,8 +182,8 @@ def _save_checkpoint(
 
 def _format_epoch_line_vae(
     epoch: int,
-    train_metrics: dict[str, float | None],
-    val_metrics: dict[str, float | None] | None,
+    train_metrics: dict[str, float],
+    val_metrics: dict[str, float] | None,
     *,
     lr: float,
     beta_eff: float,
@@ -219,13 +200,13 @@ def _format_epoch_line_vae(
             f"epoch {epoch:3d}{star} "
             f"train_total={train_metrics['total_loss']:.4f}  "
             f"val_total={val_metrics['total_loss']:.4f}  "
-            f"val_mse_z={val_metrics['mse_z']:.4f}  "
+            f"val_mse={val_metrics['mse']:.4f}  "
             f"val_kl={val_metrics['kl']:.3f}  " + tail
         )
     return (
         f"epoch {epoch:3d}   "
         f"train_total={train_metrics['total_loss']:.4f}  "
-        f"train_mse_z={train_metrics['mse_z']:.4f}  "
+        f"train_mse={train_metrics['mse']:.4f}  "
         f"train_kl={train_metrics['kl']:.3f}  " + tail
     )
 
@@ -241,7 +222,6 @@ def train(
     *,
     beta: float,
     kl_warmup_epochs: int = 30,
-    zscore_std: torch.Tensor | np.ndarray | None = None,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     max_epochs: int = 250,
@@ -271,7 +251,7 @@ def train(
     dict with the same shape as ``train_ae.train`` plus history keys
     ``train_kl``, ``val_kl``, ``train_total_loss``, ``val_total_loss``,
     ``beta_effective_per_epoch``. ``best_val_loss`` here is the lowest
-    seen ``val_total_loss`` (not ``val_mse_z``).
+    seen ``val_total_loss`` (not ``val_mse``).
     """
     if kl_warmup_epochs >= max_epochs:
         raise ValueError(
@@ -285,18 +265,14 @@ def train(
         raise ValueError("mask is required (the safe_valid mask used in the loss).")
 
     mask_t = torch.as_tensor(mask, dtype=torch.float32, device=device)
-    std_t: torch.Tensor | None = None
-    if zscore_std is not None:
-        std_t = torch.as_tensor(zscore_std, dtype=torch.float32, device=device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
 
     has_val = val_loader is not None
     history: dict[str, list] = {
-        "train_mse_z": [],
-        "train_rmse_z": [],
-        "train_rmse_celsius": [],
+        "train_mse": [],
+        "train_rmse": [],
         "train_kl": [],
         "train_total_loss": [],
         "beta_effective_per_epoch": [],
@@ -304,9 +280,8 @@ def train(
         "epoch_seconds": [],
     }
     if has_val:
-        history["val_mse_z"] = []
-        history["val_rmse_z"] = []
-        history["val_rmse_celsius"] = []
+        history["val_mse"] = []
+        history["val_rmse"] = []
         history["val_kl"] = []
         history["val_total_loss"] = []
 
@@ -334,10 +309,10 @@ def train(
         beta_eff = beta_at_epoch(epoch, beta, kl_warmup_epochs)
 
         train_metrics = _train_one_epoch_vae(
-            model, train_loader, optimizer, mask_t, beta_eff, device, std_t,
+            model, train_loader, optimizer, mask_t, beta_eff, device,
         )
         val_metrics = (
-            evaluate_vae(model, val_loader, mask_t, beta_eff, device, std_t)
+            evaluate_vae(model, val_loader, mask_t, beta_eff, device)
             if has_val
             else None
         )
@@ -345,17 +320,15 @@ def train(
         history["lr"].append(optimizer.param_groups[0]["lr"])
         scheduler.step()
 
-        history["train_mse_z"].append(train_metrics["mse_z"])
-        history["train_rmse_z"].append(train_metrics["rmse_z"])
-        history["train_rmse_celsius"].append(train_metrics["rmse_celsius"])
+        history["train_mse"].append(train_metrics["mse"])
+        history["train_rmse"].append(train_metrics["rmse"])
         history["train_kl"].append(train_metrics["kl"])
         history["train_total_loss"].append(train_metrics["total_loss"])
         history["beta_effective_per_epoch"].append(beta_eff)
         if has_val:
             assert val_metrics is not None
-            history["val_mse_z"].append(val_metrics["mse_z"])
-            history["val_rmse_z"].append(val_metrics["rmse_z"])
-            history["val_rmse_celsius"].append(val_metrics["rmse_celsius"])
+            history["val_mse"].append(val_metrics["mse"])
+            history["val_rmse"].append(val_metrics["rmse"])
             history["val_kl"].append(val_metrics["kl"])
             history["val_total_loss"].append(val_metrics["total_loss"])
         history["epoch_seconds"].append(time.perf_counter() - t0)

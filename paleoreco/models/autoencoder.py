@@ -107,10 +107,10 @@ class ConvAE(nn.Module):
     flatten and a linear projection to ``latent_dim``. The decoder mirrors
     the encoder via UpBlocks; the last halves to ``base // 2`` before a
     final 3x3 conv to ``out_channels``. No activation or norm on the
-    final layer; output is in z-score units (~N(0, 1)).
+    final layer; output is in °C anomaly (zero-centred per cell, unbounded).
 
-    Default IO channels: input = (mtco_z, mtwa_z, valid_mask); output =
-    (mtco_z, mtwa_z). The mask is conditioning input, not reconstructed.
+    Default IO channels: input = (mtco_anom, mtwa_anom, valid_mask); output =
+    (mtco_anom, mtwa_anom). The mask is conditioning input, not reconstructed.
 
     Design choices
     --------------
@@ -189,8 +189,8 @@ class ConvAE(nn.Module):
             *[UpBlock(c_in, c_out) for c_in, c_out in dec_pairs]
         )
         # Final conv collapses to ``out_channels``. No activation and no
-        # norm: the target lives in z-score units (~N(0, 1)), so any
-        # squashing non-linearity would clip or bias the output.
+        # norm: the target lives in °C anomaly (zero-centred, unbounded), so
+        # any squashing non-linearity would clip or bias the output.
         self.out_pad = CircularLonPad2d(padding=1)
         self.out_conv = nn.Conv2d(
             base_channels // 2, out_channels, kernel_size=3, stride=1, padding=0

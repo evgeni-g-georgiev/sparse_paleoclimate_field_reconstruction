@@ -29,13 +29,13 @@ def reconstruct_split_vae(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Run a ConvBetaVAE-shaped ``model`` over every sample of ``dataset``.
 
-    Returns ``(truth_z, pred_z, mu, logvar)`` numpy arrays in z-score units;
-    ``truth_z`` and ``pred_z`` have shape ``(N, 2, H, W)``; ``mu`` and
+    Returns ``(truth, pred, mu, logvar)`` numpy arrays in °C anomaly units;
+    ``truth`` and ``pred`` have shape ``(N, 2, H, W)``; ``mu`` and
     ``logvar`` have shape ``(N, latent_dim)``. Order matches the dataset's
     age-index order (``shuffle=False`` internally).
 
     Model is set to eval mode; the VAE's ``reparameterise()`` returns the
-    posterior mean in that mode, so ``pred_z`` is the deterministic decode
+    posterior mean in that mode, so ``pred`` is the deterministic decode
     of ``mu``.
     """
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -111,12 +111,12 @@ def latent_traversal(
     """For each dim in ``dims``, sweep ``mu_ref`` +/- ``2 * sigma_post`` and decode.
 
     Holds the other dims at ``mu_ref`` and decodes ``len(dims) * n_steps``
-    fields in a single forward pass. Returned arrays are numpy in z-score
+    fields in a single forward pass. Returned arrays are numpy in °C anomaly
     units; the caller renders with :func:`paleoreco.eval.shared.plot_latent_traversal`.
 
     Returns
     -------
-    decoded : ``(len(dims), n_steps, C, H, W)`` z-score reconstructions.
+    decoded : ``(len(dims), n_steps, C, H, W)`` °C anomaly reconstructions.
     z_values : ``(len(dims), n_steps)`` the sweep values used per dim.
     """
     d = mu_ref.shape[0]
@@ -150,7 +150,7 @@ def plot_loss_curves_vae(
     """Loss-curve grid: total loss, recon MSE, KL, and the schedule.
 
     2x2 layout: total loss (the optimisation target, optional best-epoch
-    marker), masked MSE in z-score units (recon-only quality), KL term
+    marker), masked MSE in °C anomaly (recon-only quality), KL term
     in nats, and the beta-effective + LR schedule on twin axes. Val curves
     are overlaid where ``history`` carries the ``val_*`` keys.
     """
@@ -177,13 +177,13 @@ def plot_loss_curves_vae(
                    label=f"best ep {best_epoch}")
     ax.legend()
 
-    # Recon MSE in z-score units.
+    # Recon MSE in °C anomaly.
     ax = axes[0, 1]
-    ax.plot(epochs, history["train_mse_z"], label="train", lw=1.5)
+    ax.plot(epochs, history["train_mse"], label="train", lw=1.5)
     if has_val:
-        ax.plot(epochs, history["val_mse_z"], label="val", lw=1.5, ls="--")
+        ax.plot(epochs, history["val_mse"], label="val", lw=1.5, ls="--")
     ax.set_xlabel("epoch")
-    ax.set_ylabel("masked MSE (z-score units)")
+    ax.set_ylabel("masked MSE (°C² anomaly)")
     ax.set_title("Reconstruction MSE")
     ax.grid(True, alpha=0.3)
     ax.legend()

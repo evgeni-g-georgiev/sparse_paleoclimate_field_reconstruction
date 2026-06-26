@@ -1,16 +1,15 @@
 """Training loop for the autoencoder.
 
 Trains a :class:`~paleoreco.models.autoencoder.ConvAE` with AdamW +
-CosineAnnealingLR, optimising masked-MSE in z-score units. Two modes:
+CosineAnnealingLR, optimising masked-MSE in °C anomaly units. Two modes:
 
 * **With** ``val_loader``: per-epoch val metrics, best-val checkpointing,
   early stopping after ``patience`` epochs without improvement.
 * **Without** ``val_loader``: fixed-length training with no model
   selection; ``best_state_dict`` is the final-epoch state.
 
-The masked-MSE loss lives in z-score units (the model's working scale);
-``evaluate`` additionally reports RMSE in °C when ``zscore_std`` is
-given.
+The masked-MSE loss lives in °C anomaly units (the model's working scale),
+so ``rmse`` is already on the temperature scale.
 """
 
 from __future__ import annotations
@@ -39,8 +38,7 @@ def _train_one_epoch(
     optimizer: torch.optim.Optimizer,
     mask: torch.Tensor,
     device: str | torch.device,
-    zscore_std: torch.Tensor | None = None,
-) -> dict[str, float | None]:
+) -> dict[str, float]:
     """Run one training epoch. Returns the same metrics dict as ``evaluate``.
 
     Metrics aggregate squared errors across the epoch's optimisation
@@ -52,13 +50,7 @@ def _train_one_epoch(
     """
     model.train()
 
-    has_std = zscore_std is not None
-    if has_std:
-        # (1, 2, H, W) so it broadcasts against (B, 2, H, W) squared errors.
-        std_sq = zscore_std.to(device).unsqueeze(0) ** 2
-
-    sum_sq_z = 0.0
-    sum_sq_c = 0.0
+    sum_sq = 0.0
     n_terms = 0.0
     mask = mask.to(device)
     # 2 channels per sample, mask shared: each sample contributes
@@ -67,7 +59,7 @@ def _train_one_epoch(
 
     for batch in loader:
         batch = batch.to(device, non_blocking=True)
-        target = batch[:, :2]                       # mtco_z, mtwa_z
+        target = batch[:, :2]                       # mtco_anom, mtwa_anom
         x_hat, _ = model(batch)
         loss = masked_mse(x_hat, target, mask)
         optimizer.zero_grad(set_to_none=True)
@@ -75,21 +67,14 @@ def _train_one_epoch(
         optimizer.step()
 
         with torch.no_grad():
-            sq_err_z = (x_hat - target) ** 2 * mask
-            sum_sq_z += sq_err_z.sum().item()
-            if has_std:
-                sum_sq_c += (sq_err_z * std_sq).sum().item()
+            sum_sq += ((x_hat - target) ** 2 * mask).sum().item()
             n_terms += batch.shape[0] * terms_per_sample
 
     if n_terms <= 0:
-        return {"mse_z": float("nan"), "rmse_z": float("nan"), "rmse_celsius": None}
+        return {"mse": float("nan"), "rmse": float("nan")}
 
-    mse_z = sum_sq_z / n_terms
-    return {
-        "mse_z": mse_z,
-        "rmse_z": math.sqrt(mse_z),
-        "rmse_celsius": math.sqrt(sum_sq_c / n_terms) if has_std else None,
-    }
+    mse = sum_sq / n_terms
+    return {"mse": mse, "rmse": math.sqrt(mse)}
 
 
 @torch.no_grad()
@@ -98,8 +83,7 @@ def evaluate(
     loader: DataLoader,
     mask: torch.Tensor,
     device: str | torch.device,
-    zscore_std: torch.Tensor | None = None,
-) -> dict[str, float | None]:
+) -> dict[str, float]:
     """Compute per-valid-cell MSE / RMSE on a loader.
 
     Parameters
@@ -107,28 +91,19 @@ def evaluate(
     model : nn.Module
         Set to ``eval`` mode internally.
     loader : DataLoader
-        Batches are ``(B, 3, H, W)`` = ``(mtco_z, mtwa_z, valid_mask)``;
+        Batches are ``(B, 3, H, W)`` = ``(mtco_anom, mtwa_anom, valid_mask)``;
         target is the first two channels.
     mask : torch.Tensor of shape (H, W) or broadcastable
         ``safe_valid`` mask used to weight the loss.
     device : str or torch.device
-    zscore_std : torch.Tensor or None, default None
-        Per-cell std ``(2, H, W)``. If given, the returned dict's
-        ``rmse_celsius`` is populated; otherwise it is ``None``.
 
     Returns
     -------
-    dict with keys ``mse_z``, ``rmse_z``, ``rmse_celsius``.
+    dict with keys ``mse``, ``rmse`` (°C anomaly units).
     """
     model.eval()
 
-    has_std = zscore_std is not None
-    if has_std:
-        # (1, 2, H, W) so it broadcasts against (B, 2, H, W) squared errors.
-        std_sq = zscore_std.to(device).unsqueeze(0) ** 2
-
-    sum_sq_z = 0.0
-    sum_sq_c = 0.0
+    sum_sq = 0.0
     n_terms = 0.0
 
     mask = mask.to(device)
@@ -140,24 +115,14 @@ def evaluate(
         batch = batch.to(device, non_blocking=True)
         target = batch[:, :2]
         x_hat, _ = model(batch)
-
-        # sq_err_z: (B, 2, H, W), already masked.
-        sq_err_z = (x_hat - target) ** 2 * mask
-        sum_sq_z += sq_err_z.sum().item()
-        if has_std:
-            sum_sq_c += (sq_err_z * std_sq).sum().item()
+        sum_sq += ((x_hat - target) ** 2 * mask).sum().item()
         n_terms += batch.shape[0] * terms_per_sample
 
     if n_terms <= 0:
-        return {"mse_z": float("nan"), "rmse_z": float("nan"), "rmse_celsius": None}
+        return {"mse": float("nan"), "rmse": float("nan")}
 
-    mse_z = sum_sq_z / n_terms
-    out: dict[str, float | None] = {
-        "mse_z": mse_z,
-        "rmse_z": math.sqrt(mse_z),
-        "rmse_celsius": math.sqrt(sum_sq_c / n_terms) if has_std else None,
-    }
-    return out
+    mse = sum_sq / n_terms
+    return {"mse": mse, "rmse": math.sqrt(mse)}
 
 
 # ---------------------------------------------------------------------------
@@ -167,14 +132,14 @@ def _save_checkpoint(
     path: str,
     epoch: int,
     state: dict[str, torch.Tensor],
-    val_mse_z: float | None,
+    val_mse: float | None,
 ) -> None:
-    """Write a checkpoint ``{"epoch", "state_dict", "val_mse_z"}``; mkdir-p parent.
+    """Write a checkpoint ``{"epoch", "state_dict", "val_mse"}``; mkdir-p parent.
 
-    ``val_mse_z`` is ``None`` in val-less mode.
+    ``val_mse`` is ``None`` in val-less mode.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    torch.save({"epoch": epoch, "state_dict": state, "val_mse_z": val_mse_z}, path)
+    torch.save({"epoch": epoch, "state_dict": state, "val_mse": val_mse}, path)
 
 
 # ---------------------------------------------------------------------------
@@ -182,35 +147,29 @@ def _save_checkpoint(
 # ---------------------------------------------------------------------------
 def _format_epoch_line(
     epoch: int,
-    train_metrics: dict[str, float | None],
-    val_metrics: dict[str, float | None] | None,
+    train_metrics: dict[str, float],
+    val_metrics: dict[str, float] | None,
     *,
     lr: float,
     s_ep: float,
     improved: bool,
     has_val: bool,
 ) -> str:
-    """Format one verbose-mode epoch summary. ``*`` marks val improvements.
-
-    ``train_rmse_C`` shows in val-less mode and ``val_rmse_C`` with-val,
-    to keep the line short.
-    """
+    """Format one verbose-mode epoch summary. ``*`` marks val improvements."""
     tail = f"lr={lr:.2e}  ({s_ep:.1f}s)"
     if has_val:
         assert val_metrics is not None
-        c = val_metrics["rmse_celsius"]
-        c_val = f"  val_rmse_C={c:.3f}" if c is not None else ""
         star = " *" if improved else "  "
         return (
             f"epoch {epoch:3d}{star} "
-            f"train_mse_z={train_metrics['mse_z']:.4f}  "
-            f"val_mse_z={val_metrics['mse_z']:.4f}{c_val}  " + tail
+            f"train_mse={train_metrics['mse']:.4f}  "
+            f"val_mse={val_metrics['mse']:.4f}  "
+            f"val_rmse={val_metrics['rmse']:.3f}  " + tail
         )
-    c = train_metrics["rmse_celsius"]
-    c_train = f"  train_rmse_C={c:.3f}" if c is not None else ""
     return (
         f"epoch {epoch:3d}   "
-        f"train_mse_z={train_metrics['mse_z']:.4f}{c_train}  " + tail
+        f"train_mse={train_metrics['mse']:.4f}  "
+        f"train_rmse={train_metrics['rmse']:.3f}  " + tail
     )
 
 
@@ -223,7 +182,6 @@ def train(
     val_loader: DataLoader | None = None,
     mask: torch.Tensor | np.ndarray | None = None,
     *,
-    zscore_std: torch.Tensor | np.ndarray | None = None,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     max_epochs: int = 500,
@@ -250,8 +208,6 @@ def train(
         ``None`` disables validation and early stopping.
     mask : (H, W) array
         ``safe_valid`` mask used by the loss and by ``evaluate``.
-    zscore_std : (2, H, W) array, optional
-        Per-cell std; if given, history includes ``rmse_celsius``.
     lr, weight_decay : float
         AdamW hyperparameters.
     max_epochs : int
@@ -278,8 +234,8 @@ def train(
     -------
     dict with keys:
         ``history``         : dict of per-epoch lists (always
-            ``train_mse_z``, ``train_rmse_z``, ``train_rmse_celsius``,
-            ``lr``, ``epoch_seconds``; with val also the ``val_*`` keys).
+            ``train_mse``, ``train_rmse``, ``lr``, ``epoch_seconds``;
+            with val also the ``val_*`` keys).
         ``best_val_loss``   : float or ``NaN`` (no val).
         ``best_epoch``      : int.
         ``best_state_dict`` : OrderedDict of CPU tensors. Best-val epoch
@@ -293,11 +249,8 @@ def train(
     if mask is None:
         raise ValueError("mask is required (the safe_valid mask used in the loss).")
 
-    # convert mask and std arrays to PyTorch tensors on device
+    # convert mask array to a PyTorch tensor on device
     mask_t = torch.as_tensor(mask, dtype=torch.float32, device=device)
-    std_t: torch.Tensor | None = None
-    if zscore_std is not None:
-        std_t = torch.as_tensor(zscore_std, dtype=torch.float32, device=device)
 
     # create the optimiser and LR scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -307,16 +260,14 @@ def train(
     # adds val_ keys only if val_loader is given to avoid flatline "val" plot
     has_val = val_loader is not None
     history: dict[str, list] = {
-        "train_mse_z": [],
-        "train_rmse_z": [],
-        "train_rmse_celsius": [],
+        "train_mse": [],
+        "train_rmse": [],
         "lr": [],
         "epoch_seconds": [],
     }
     if has_val:
-        history["val_mse_z"] = []
-        history["val_rmse_z"] = []
-        history["val_rmse_celsius"] = []
+        history["val_mse"] = []
+        history["val_rmse"] = []
 
     # best-state tracking
     best_val_loss = float("inf")
@@ -343,10 +294,10 @@ def train(
         t0 = time.perf_counter()
 
         train_metrics = _train_one_epoch(
-            model, train_loader, optimizer, mask_t, device, std_t,
+            model, train_loader, optimizer, mask_t, device,
         ) # train one epoch
         val_metrics = (
-            evaluate(model, val_loader, mask_t, device, std_t)
+            evaluate(model, val_loader, mask_t, device)
             if has_val
             else None
         ) # evaluate on val, if there is a val loader
@@ -356,14 +307,12 @@ def train(
         history["lr"].append(optimizer.param_groups[0]["lr"])
         scheduler.step()
 
-        history["train_mse_z"].append(train_metrics["mse_z"]) # append metrics to hist
-        history["train_rmse_z"].append(train_metrics["rmse_z"])
-        history["train_rmse_celsius"].append(train_metrics["rmse_celsius"])
+        history["train_mse"].append(train_metrics["mse"]) # append metrics to hist
+        history["train_rmse"].append(train_metrics["rmse"])
         if has_val:
             assert val_metrics is not None
-            history["val_mse_z"].append(val_metrics["mse_z"])
-            history["val_rmse_z"].append(val_metrics["rmse_z"])
-            history["val_rmse_celsius"].append(val_metrics["rmse_celsius"])
+            history["val_mse"].append(val_metrics["mse"])
+            history["val_rmse"].append(val_metrics["rmse"])
         history["epoch_seconds"].append(time.perf_counter() - t0)
 
         # Best-tracking only runs with a val loader; in the val-less
@@ -371,7 +320,7 @@ def train(
         improved = False
         if has_val:
             assert val_metrics is not None
-            val_loss = val_metrics["mse_z"]
+            val_loss = val_metrics["mse"]
             improved = val_loss < best_val_loss
             if improved:
                 best_val_loss = val_loss
@@ -383,18 +332,18 @@ def train(
             else:
                 epochs_since_improve += 1
 
-        # Live progress-bar postfix: prefer val_mse_z when available,
-        # fall back to train_mse_z (NaN displays sensibly).
+        # Live progress-bar postfix: prefer val_mse when available,
+        # fall back to train_mse (NaN displays sensibly).
         if pbar is not None:
             postfix = (
                 {
-                    "val_mse_z": f"{val_metrics['mse_z']:.4f}",
+                    "val_mse": f"{val_metrics['mse']:.4f}",
                     "best": f"{best_val_loss:.4f}",
                     "s/ep": f"{history['epoch_seconds'][-1]:.1f}",
                 }
                 if has_val
                 else {
-                    "train_mse_z": f"{train_metrics['mse_z']:.4f}",
+                    "train_mse": f"{train_metrics['mse']:.4f}",
                     "s/ep": f"{history['epoch_seconds'][-1]:.1f}",
                 }
             )
@@ -427,7 +376,7 @@ def train(
             if verbose:
                 log(
                     f"Early stopping at epoch {epoch} - no improvement "
-                    f"in {patience} epochs (best val_mse_z={best_val_loss:.4f} "
+                    f"in {patience} epochs (best val_mse={best_val_loss:.4f} "
                     f"at epoch {best_epoch})."
                 )
             if pbar is not None:
@@ -441,7 +390,7 @@ def train(
     # Val-less mode has no model-selection step, so "best" is the
     # final-epoch state and best_val_loss is NaN.
     if not has_val:
-        last_epoch = len(history["train_mse_z"]) - 1
+        last_epoch = len(history["train_mse"]) - 1
         best_state = _snapshot_state_dict(model)
         best_epoch = last_epoch
         best_val_loss = float("nan")
@@ -454,5 +403,5 @@ def train(
         "best_epoch": best_epoch,
         "best_state_dict": best_state,
         "stopped_early": stopped_early,
-        "epochs_trained": len(history["train_mse_z"]),
+        "epochs_trained": len(history["train_mse"]),
     }

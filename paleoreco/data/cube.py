@@ -1,4 +1,4 @@
-"""Data loading, caching, and z-score normalisation for the Prior cube.
+"""Data loading, caching, and per-cell statistics for the Prior cube.
 
 Turns ``Prior.csv`` (~1.6M rows in long format) into a dense
 ``(N_ages, 2, n_lat, n_lon)`` cube of ``[mtco, mtwa]`` channels, caches
@@ -12,8 +12,9 @@ Key invariants
 --------------
 * The Prior has no missing cells; the only mask that does anything is
   ``safe_valid``, which drops cells with degenerate std (e.g. permanent ice).
-* Z-score stats use **train ages only** to avoid leakage; ``mean`` and
-  ``std`` are returned so callers can invert at inference.
+* Per-cell stats use **train ages only** to avoid leakage; ``mean`` centres
+  the cube to anomaly, and ``std`` is kept for the assimilation's normalised
+  path (it is not used to scale the network inputs).
 """
 
 from __future__ import annotations
@@ -134,7 +135,7 @@ def verify_mask_constant_across_ages(cube: np.ndarray) -> bool:
 
 
 # ----------------------------------------------------------------------------
-# Per-cell z-score statistics.
+# Per-cell statistics (mean, std, valid mask).
 # ----------------------------------------------------------------------------
 def compute_zscore_stats(
     cube: np.ndarray,
@@ -188,37 +189,37 @@ def compute_zscore_stats(
     }
 
 
-def apply_zscore(cube: np.ndarray, stats: dict) -> np.ndarray:
-    """Z-score the cube per cell and zero out masked cells.
+def apply_anomaly(cube: np.ndarray, stats: dict) -> np.ndarray:
+    """Centre the cube to per-cell anomaly and zero out masked cells.
 
     Output shape matches ``cube``. Zeroing out masked cells means the
     AE never sees the raw values on degenerate/invalid cells, and the
     binary mask channel tells it where those zeros are real vs filled.
     """
-    z = (cube - stats["mean"]) / stats["std"]
+    anom = cube - stats["mean"]
     mask = stats["safe_valid"].astype(np.float32)  # broadcasts (n_lat, n_lon) over leading dims
-    return (z * mask).astype(np.float32)
+    return (anom * mask).astype(np.float32)
 
 
-def invert_zscore(cube_z: np.ndarray, stats: dict) -> np.ndarray:
-    """Inverse of ``apply_zscore``: returns absolute °C (anomaly + mean).
+def invert_anomaly(cube_anom: np.ndarray, stats: dict) -> np.ndarray:
+    """Inverse of ``apply_anomaly``: add the climatology back for absolute °C.
 
     Masked cells return ``mean[c, i, j]`` because they were zero-filled.
     Always inspect outputs through the same mask.
     """
-    return (cube_z * stats["std"] + stats["mean"]).astype(np.float32)
+    return (cube_anom + stats["mean"]).astype(np.float32)
 
 
 # ----------------------------------------------------------------------------
 # PyTorch dataset.
 # ----------------------------------------------------------------------------
 class PaleoFieldDataset(Dataset):
-    """Serves (3, n_lat, n_lon) tensors: [mtco_z, mtwa_z, valid_mask].
+    """Serves (3, n_lat, n_lon) tensors: [mtco_anom, mtwa_anom, valid_mask].
 
     Parameters
     ----------
-    cube_z : np.ndarray, shape (N_ages, 2, n_lat, n_lon), float32
-        Full z-scored cube (output of ``apply_zscore``).
+    cube : np.ndarray, shape (N_ages, 2, n_lat, n_lon), float32
+        Full anomaly cube (output of ``apply_anomaly``).
     mask : np.ndarray, shape (n_lat, n_lon), bool
         ``safe_valid`` mask. Becomes the third input channel and is also
         used by ``masked_mse`` for the loss.
@@ -229,18 +230,18 @@ class PaleoFieldDataset(Dataset):
 
     def __init__(
         self,
-        cube_z: np.ndarray,
+        cube: np.ndarray,
         mask: np.ndarray,
         age_indices: Sequence[int] | np.ndarray,
     ) -> None:
-        if cube_z.ndim != 4 or cube_z.shape[1] != 2:
+        if cube.ndim != 4 or cube.shape[1] != 2:
             raise ValueError(
-                f"cube_z must have shape (N_ages, 2, n_lat, n_lon); got {cube_z.shape}"
+                f"cube must have shape (N_ages, 2, n_lat, n_lon); got {cube.shape}"
             )
-        self.cube_z = np.ascontiguousarray(cube_z, dtype=np.float32)
+        self.cube = np.ascontiguousarray(cube, dtype=np.float32)
         self.mask = np.ascontiguousarray(mask, dtype=bool)
         self.age_indices = np.asarray(age_indices, dtype=np.int64)
-        # Pre-compute the mask tensor once; it's shared across samples in v1.
+        # Pre-compute the mask tensor once; it is shared across samples.
         self._mask_chan = torch.from_numpy(self.mask.astype(np.float32)).unsqueeze(0)
 
     def __len__(self) -> int:
@@ -248,5 +249,5 @@ class PaleoFieldDataset(Dataset):
 
     def __getitem__(self, i: int) -> torch.Tensor:
         a = int(self.age_indices[i])
-        field = torch.from_numpy(self.cube_z[a])  # (2, n_lat, n_lon)
+        field = torch.from_numpy(self.cube[a])  # (2, n_lat, n_lon)
         return torch.cat([field, self._mask_chan], dim=0)  # (3, n_lat, n_lon)

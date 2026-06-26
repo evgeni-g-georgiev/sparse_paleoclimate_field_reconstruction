@@ -1,7 +1,7 @@
 """Masked reconstruction losses for fields on the Prior grid.
 
 Cells outside ``safe_valid`` are zero-filled in the input by
-:func:`paleoreco.data.apply_zscore`; the mask zeroes out their
+:func:`paleoreco.data.apply_anomaly`; the mask zeroes out their
 contribution to the loss so a model isn't trained to predict 0 on
 arbitrary cells.
 """
@@ -82,7 +82,7 @@ def masked_rmse(
 ) -> torch.Tensor:
     """Square root of :func:`masked_mse` with the default ``"mean"`` reduction.
 
-    Returned value is in z-score units.
+    Returned value is in field units (°C anomaly).
     """
     return masked_mse(pred, target, mask, reduction="mean").sqrt()
 

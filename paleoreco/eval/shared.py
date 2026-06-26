@@ -6,12 +6,9 @@ or training-loop history dict.
 
 Conventions
 -----------
-* ``truth_z`` and ``pred_z`` are ``(N, 2, H, W)`` float arrays in
-  **z-score units** (output of :func:`paleoreco.data.apply_zscore` or a
-  decoder operating in that space).
-* ``zscore_stats`` is the dict returned by
-  :func:`paleoreco.data.compute_zscore_stats`, used to invert the
-  z-score back to °C anomaly for plotting.
+* ``truth`` and ``pred`` are ``(N, 2, H, W)`` float arrays in **°C anomaly**
+  units (output of :func:`paleoreco.data.apply_anomaly` or a decoder operating
+  in that space), so they plot directly without a rescale.
 * ``mask`` is the ``safe_valid`` boolean mask of shape ``(H, W)``.
 """
 
@@ -38,28 +35,11 @@ def _valid_column_mask(mask: np.ndarray, n_channels: int = 2) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Internal helper: z-score -> °C anomaly conversion.
-# ---------------------------------------------------------------------------
-def _zscore_to_anomaly(z: np.ndarray, zscore_stats: dict) -> np.ndarray:
-    """Convert z-score data to °C anomaly (``x − mean``).
-
-    Anomaly is what climatologists read on a map; absolute °C is
-    visually dominated by the climatology (e.g. −40 °C over Antarctica).
-    Because ``z = (x − mean) / std``, anomaly = ``z * std`` directly.
-
-    Broadcasts ``std`` of shape ``(2, H, W)`` against ``z`` of any
-    leading shape ``(..., 2, H, W)``.
-    """
-    return z * zscore_stats["std"][None]
-
-
-# ---------------------------------------------------------------------------
 # Reconstruction grid.
 # ---------------------------------------------------------------------------
 def plot_reconstructions(
-    truth_z: np.ndarray,
-    pred_z: np.ndarray,
-    zscore_stats: dict,
+    truth: np.ndarray,
+    pred: np.ndarray,
     ages: np.ndarray,
     lats: np.ndarray,
     lons: np.ndarray,
@@ -74,21 +54,19 @@ def plot_reconstructions(
     colour scale (99th percentile of ``|truth|`` over the input set).
     The error column has its own scale (99th percentile of ``|err|``).
 
-    ``sample_indices`` selects which rows of ``truth_z`` to plot.
+    ``sample_indices`` selects which rows of ``truth`` to plot.
     Default: 5 evenly-spaced indices spanning the input set.
     """
     if sample_indices is None:
-        sample_indices = np.linspace(0, len(truth_z) - 1, 5).astype(int).tolist()
+        sample_indices = np.linspace(0, len(truth) - 1, 5).astype(int).tolist()
     assert len(sample_indices) == 5, "expected 5 sample indices"
 
-    truth_a = _zscore_to_anomaly(truth_z, zscore_stats)
-    pred_a = _zscore_to_anomaly(pred_z, zscore_stats)
-    err_a = pred_a - truth_a
+    err = pred - truth
 
     # 99th-percentile clipping so a single polar outlier doesn't squash
     # the rest of the figure into a single midtone.
-    vmax_data = [float(np.nanpercentile(np.abs(truth_a[:, c]), 99)) for c in range(2)]
-    vmax_err = [float(np.nanpercentile(np.abs(err_a[:, c]), 99)) for c in range(2)]
+    vmax_data = [float(np.nanpercentile(np.abs(truth[:, c]), 99)) for c in range(2)]
+    vmax_err = [float(np.nanpercentile(np.abs(err[:, c]), 99)) for c in range(2)]
 
     fig, axes = plt.subplots(5, 6, figsize=(14, 11), constrained_layout=True)
     extent = [lons.min(), lons.max(), lats.min(), lats.max()]
@@ -107,15 +85,15 @@ def plot_reconstructions(
             v_err = vmax_err[c]
 
             im0 = axes[row_i, base].imshow(
-                truth_a[idx, c], origin="lower", extent=extent,
+                truth[idx, c], origin="lower", extent=extent,
                 cmap="RdBu_r", vmin=-v_data, vmax=v_data, aspect="auto",
             )
             axes[row_i, base + 1].imshow(
-                pred_a[idx, c], origin="lower", extent=extent,
+                pred[idx, c], origin="lower", extent=extent,
                 cmap="RdBu_r", vmin=-v_data, vmax=v_data, aspect="auto",
             )
             im2 = axes[row_i, base + 2].imshow(
-                err_a[idx, c], origin="lower", extent=extent,
+                err[idx, c], origin="lower", extent=extent,
                 cmap="PuOr_r", vmin=-v_err, vmax=v_err, aspect="auto",
             )
             im_for_cbar[c * 2] = im0
@@ -158,19 +136,18 @@ def plot_reconstructions(
 # Per-cell RMSE map.
 # ---------------------------------------------------------------------------
 def per_cell_rmse_celsius(
-    truth_z: np.ndarray,
-    pred_z: np.ndarray,
-    zscore_stats: dict,
+    truth: np.ndarray,
+    pred: np.ndarray,
     mask: np.ndarray,
 ) -> np.ndarray:
     """Per-cell RMSE in °C. Returns ``(2, H, W)`` with NaN outside the mask.
 
-    The z-score error ``(pred - truth)`` multiplied by the per-cell
-    ``std`` is the °C error. Squaring, averaging across the samples,
-    and taking sqrt gives per-cell °C RMSE.
+    Inputs are already °C anomaly, so the error ``pred - truth`` is in °C.
+    Squaring, averaging across the samples, and taking sqrt gives per-cell
+    °C RMSE.
     """
-    err_c = (pred_z - truth_z) * zscore_stats["std"][None]
-    rmse_c = np.sqrt((err_c ** 2).mean(axis=0))
+    err = pred - truth
+    rmse_c = np.sqrt((err ** 2).mean(axis=0))
     return np.where(mask[None], rmse_c, np.nan)
 
 
@@ -210,7 +187,7 @@ def plot_per_cell_rmse(
 # POD baseline + latent-dim sweep.
 # ---------------------------------------------------------------------------
 def pod_fit(
-    cube_z: np.ndarray,
+    cube_anom: np.ndarray,
     fit_indices: np.ndarray,
     mask: np.ndarray,
     max_k: int,
@@ -229,8 +206,8 @@ def pod_fit(
 
     Parameters
     ----------
-    cube_z : (N_ages, 2, H, W) float
-        Z-scored cube (output of :func:`paleoreco.data.apply_zscore`).
+    cube_anom : (N_ages, 2, H, W) float
+        Anomaly cube (output of :func:`paleoreco.data.apply_anomaly`).
     fit_indices : int array
         Indices into the ``N_ages`` axis used for the SVD.
     mask : (H, W) bool
@@ -255,9 +232,9 @@ def pod_fit(
     """
     from sklearn.decomposition import TruncatedSVD
 
-    n_channels, H, W = cube_z.shape[1:]
+    n_channels, H, W = cube_anom.shape[1:]
     keep = _valid_column_mask(mask, n_channels=n_channels)
-    X_all = cube_z.reshape(cube_z.shape[0], -1)[:, keep]
+    X_all = cube_anom.reshape(cube_anom.shape[0], -1)[:, keep]
     X_fit = X_all[fit_indices]
 
     mu = X_fit.mean(axis=0, keepdims=True)  # (1, D_valid)
@@ -280,24 +257,24 @@ def pod_fit(
 
 
 def pod_predict(
-    cube_z: np.ndarray,
+    cube_anom: np.ndarray,
     eval_indices: np.ndarray,
     pod_basis: dict,
     k: int,
 ) -> np.ndarray:
-    """Reconstruct ``cube_z[eval_indices]`` from a fitted POD basis at rank ``k``.
+    """Reconstruct ``cube_anom[eval_indices]`` from a fitted POD basis at rank ``k``.
 
     The recipe: extract valid columns, centre on the fit-set mean,
     project onto the top ``k`` POD modes, back-project, add the mean
     back, and scatter into a full ``(N, 2, H, W)`` array with zero
     outside the mask. Outputs match the convention of an AE
-    reconstruction (z-score units, zero on masked cells), so the same
+    reconstruction (°C anomaly, zero on masked cells), so the same
     downstream metric / plot functions consume both.
 
     Parameters
     ----------
-    cube_z : (N_ages, 2, H, W) float
-        Z-scored cube. Only ``cube_z[eval_indices]`` is touched.
+    cube_anom : (N_ages, 2, H, W) float
+        Anomaly cube. Only ``cube_anom[eval_indices]`` is touched.
     eval_indices : int array
         Indices into the ``N_ages`` axis to reconstruct.
     pod_basis : dict
@@ -309,7 +286,7 @@ def pod_predict(
     Returns
     -------
     np.ndarray of shape ``(len(eval_indices), 2, H, W)``.
-        Reconstruction in z-score units, zero outside the mask.
+        Reconstruction in °C anomaly, zero outside the mask.
     """
     V_max = pod_basis["V_max"]
     mu = pod_basis["mu"]
@@ -320,7 +297,7 @@ def pod_predict(
         raise ValueError(f"k={k} out of range (basis fit at max_k={max_k}).")
 
     Vk = V_max[:k]                                # (k, D_valid)
-    X = cube_z.reshape(cube_z.shape[0], -1)[:, keep]
+    X = cube_anom.reshape(cube_anom.shape[0], -1)[:, keep]
     X_eval = X[eval_indices]
     X_c = X_eval - mu
     X_hat_c = X_c @ Vk.T @ Vk                     # (N_eval, D_valid)
@@ -329,20 +306,20 @@ def pod_predict(
     # Scatter into full (N_eval, 2*H*W) with zero on masked cells, then
     # reshape to (N_eval, 2, H, W). Matches the AE output convention.
     n_eval = X_hat.shape[0]
-    full = np.zeros((n_eval, n_channels * H * W), dtype=cube_z.dtype)
-    full[:, keep] = X_hat.astype(cube_z.dtype, copy=False)
+    full = np.zeros((n_eval, n_channels * H * W), dtype=cube_anom.dtype)
+    full[:, keep] = X_hat.astype(cube_anom.dtype, copy=False)
     return full.reshape(n_eval, n_channels, H, W)
 
 
 def pod_test_rmse(
-    cube_z: np.ndarray,
+    cube_anom: np.ndarray,
     fit_indices: np.ndarray,
     test_indices: np.ndarray,
     mask: np.ndarray,
     ks: Sequence[int],
     random_state: int = 0,
 ) -> np.ndarray:
-    """Per-``k`` test RMSE in z-score units; convenience wrapper.
+    """Per-``k`` test RMSE in °C anomaly; convenience wrapper.
 
     Thin wrapper around :func:`pod_fit` + :func:`pod_predict`. The
     headline AE-vs-POD comparison uses :func:`compute_E_d`.
@@ -350,15 +327,15 @@ def pod_test_rmse(
     Returns
     -------
     np.ndarray of shape ``(len(ks),)``
-        Per-``k`` masked-RMSE in z-score units over ``test_indices``.
+        Per-``k`` masked-RMSE in °C anomaly over ``test_indices``.
     """
     max_k = int(max(ks))
-    basis = pod_fit(cube_z, fit_indices, mask, max_k, random_state=random_state)
-    truth = cube_z[test_indices]
+    basis = pod_fit(cube_anom, fit_indices, mask, max_k, random_state=random_state)
+    truth = cube_anom[test_indices]
     mask_3d = mask[None, None]                    # broadcast over (N, C, H, W)
     rmses = []
     for k in ks:
-        pred = pod_predict(cube_z, test_indices, basis, k)
+        pred = pod_predict(cube_anom, test_indices, basis, k)
         sq = (pred - truth) ** 2 * mask_3d
         rmses.append(float(np.sqrt(sq.sum() / (truth.shape[0] * 2 * mask.sum()))))
     return np.array(rmses, dtype=np.float64)
@@ -368,8 +345,8 @@ def pod_test_rmse(
 # Bousquet's E_d compression-quality metric.
 # ---------------------------------------------------------------------------
 def compute_E_d(
-    truth_z: np.ndarray,
-    pred_z: np.ndarray,
+    truth: np.ndarray,
+    pred: np.ndarray,
     mask: np.ndarray,
     eps: float = 1e-12,
 ) -> float:
@@ -382,8 +359,8 @@ def compute_E_d(
     ``eps`` guards against a snapshot with vanishing ``||u||^2``.
     """
     mask_b = mask[None, None].astype(bool)        # (1, 1, H, W)
-    sq_err = ((pred_z - truth_z) ** 2) * mask_b   # zeros outside mask
-    sq_truth = (truth_z ** 2) * mask_b
+    sq_err = ((pred - truth) ** 2) * mask_b       # zeros outside mask
+    sq_truth = (truth ** 2) * mask_b
 
     # Per-snapshot spatial sums over (channel, valid-cell). Shape: (N,).
     num = sq_err.reshape(sq_err.shape[0], -1).sum(axis=1)
@@ -398,49 +375,49 @@ def compute_E_d(
 # Split-level metric bundle.
 # ---------------------------------------------------------------------------
 def compute_split_metrics(
-    truth_z: np.ndarray,
-    pred_z: np.ndarray,
+    truth: np.ndarray,
+    pred: np.ndarray,
     mask: np.ndarray,
 ) -> dict[str, float]:
-    """Bundle of five reconstruction metrics computed on z-scored truth/pred.
+    """Bundle of five reconstruction metrics computed on °C anomaly truth/pred.
 
     All metrics use valid cells only (``mask`` broadcast to ``(N, C, H, W)``).
-    Feeding z-scored inputs (rather than °C) weights every cell equally in
-    the pooled sums regardless of its natural std; with °C anomaly inputs
-    the high-variance cells would dominate.
+    In °C anomaly units the pooled sums weight each cell by its natural
+    variance, so high-variance cells (high latitude, strong D-O swings)
+    dominate. This matches the assimilation's anomaly-covariance background.
 
     Returns
     -------
     dict with keys:
-        ``"mse_z"``     : per-cell mean squared error (z-score units squared).
-        ``"rmse_z"``    : ``sqrt(mse_z)`` (z-score units).
+        ``"mse"``       : per-cell mean squared error (°C anomaly squared).
+        ``"rmse"``      : ``sqrt(mse)`` (°C anomaly).
         ``"rrmse"``     : ``sqrt(sum(err^2 * m) / sum(truth^2 * m))``;
                           dimensionless.
-        ``"r_squared"`` : ``1 - rrmse**2``. R² > 0 means reconstruct better 
+        ``"r_squared"`` : ``1 - rrmse**2``. R² > 0 means reconstruct better
                             than just predicting the per-cell long-term mean.
         ``"E_d"``       : Bousquet 2025 Eq. 14, per-snapshot variance
                           captured; dimensionless. Delegates to
                           :func:`compute_E_d`.
     """
     mask_b = mask[None, None].astype(bool)
-    err2 = ((pred_z - truth_z) ** 2) * mask_b
-    truth2 = (truth_z ** 2) * mask_b
+    err2 = ((pred - truth) ** 2) * mask_b
+    truth2 = (truth ** 2) * mask_b
 
-    n_valid = truth_z.shape[0] * truth_z.shape[1] * int(mask.sum())
+    n_valid = truth.shape[0] * truth.shape[1] * int(mask.sum())
     sum_err2 = float(err2.sum())
     sum_truth2 = float(truth2.sum())
 
-    mse_z = sum_err2 / n_valid
-    rmse_z = float(np.sqrt(mse_z))
+    mse = sum_err2 / n_valid
+    rmse = float(np.sqrt(mse))
     rrmse = float(np.sqrt(sum_err2 / max(sum_truth2, 1e-12)))
     r_squared = 1.0 - rrmse ** 2
 
     return {
-        "mse_z":     float(mse_z),
-        "rmse_z":    rmse_z,
+        "mse":       float(mse),
+        "rmse":      rmse,
         "rrmse":     rrmse,
         "r_squared": float(r_squared),
-        "E_d":       compute_E_d(truth_z, pred_z, mask),
+        "E_d":       compute_E_d(truth, pred, mask),
     }
 
 
@@ -507,7 +484,7 @@ def plot_latent_sweep(
 # code can drive any model with a 2D latent space.
 # ---------------------------------------------------------------------------
 def compute_pod_time_coefficients(
-    cube_z: np.ndarray,
+    cube_anom: np.ndarray,
     mask: np.ndarray,
     pod_basis: dict,
 ) -> np.ndarray:
@@ -520,8 +497,8 @@ def compute_pod_time_coefficients(
 
     Parameters
     ----------
-    cube_z : (N_ages, 2, H, W) float
-        Z-scored cube; every age is projected (no slicing) so the full
+    cube_anom : (N_ages, 2, H, W) float
+        Anomaly cube; every age is projected (no slicing) so the full
         ``a_k(t)`` time series is available.
     mask : (H, W) bool
         ``safe_valid`` mask. Only valid cells participate, matching the
@@ -539,7 +516,7 @@ def compute_pod_time_coefficients(
     mu = pod_basis["mu"]                          # (1, D_valid)
     keep = pod_basis["keep_mask"]
 
-    X = cube_z.reshape(cube_z.shape[0], -1)[:, keep]
+    X = cube_anom.reshape(cube_anom.shape[0], -1)[:, keep]
     X_c = X - mu
     # (N_ages, D_valid) @ (D_valid, max_k) = (N_ages, max_k).
     return X_c @ V_max.T
@@ -797,8 +774,8 @@ def plot_per_cluster_reconstructions(
     stadial composite".
 
     ``cube`` is plotted as-is: the caller decides which units. Typical
-    inputs are ``cube_z * std`` (°C anomaly) or ``cube_z * std + mean``
-    (absolute °C). Cells outside ``mask`` are rendered NaN.
+    inputs are the anomaly cube (°C anomaly) or the anomaly plus the
+    climatology (absolute °C). Cells outside ``mask`` are rendered NaN.
 
     Layout: one row per cluster, one column per channel.
     """
@@ -933,7 +910,6 @@ def plot_latent_traversal(
     decoded: np.ndarray,
     z_values: np.ndarray,
     dim_labels: Sequence[int | str],
-    zscore_stats: dict,
     lats: np.ndarray,
     lons: np.ndarray,
     var_names: Sequence[str] = ("mtco", "mtwa"),
@@ -962,7 +938,7 @@ def plot_latent_traversal(
             f"decoded has {n_channels} channels but var_names has {len(var_names)}"
         )
 
-    anomaly = decoded * zscore_stats["std"][None, None]
+    anomaly = decoded
     vmax_c = [
         float(np.nanpercentile(np.abs(anomaly[..., c, :, :]), 99))
         for c in range(n_channels)
@@ -998,7 +974,6 @@ def plot_latent_traversal(
 
 def plot_decoded_samples(
     decoded: np.ndarray,
-    zscore_stats: dict,
     lats: np.ndarray,
     lons: np.ndarray,
     var_names: Sequence[str] = ("mtco", "mtwa"),
@@ -1015,7 +990,7 @@ def plot_decoded_samples(
         raise ValueError(
             f"decoded has {n_channels} channels but var_names has {len(var_names)}"
         )
-    anomaly = decoded * zscore_stats["std"][None]
+    anomaly = decoded
     vmax_c = [
         float(np.nanpercentile(np.abs(anomaly[:, c]), 99))
         for c in range(n_channels)
@@ -1054,9 +1029,8 @@ def plot_decoded_samples(
 # Reconstruction distribution.
 # ---------------------------------------------------------------------------
 def plot_recon_distribution(
-    truth_z: np.ndarray,
-    pred_z: np.ndarray,
-    zscore_stats: dict,
+    truth: np.ndarray,
+    pred: np.ndarray,
     mask: np.ndarray,
     save_path: str | None = None,
 ) -> plt.Figure:
@@ -1067,13 +1041,10 @@ def plot_recon_distribution(
     encode the variance shows up as a noticeably narrower reconstruction
     histogram than the truth histogram.
     """
-    truth_a = _zscore_to_anomaly(truth_z, zscore_stats)
-    pred_a = _zscore_to_anomaly(pred_z, zscore_stats)
-
     fig, axes = plt.subplots(1, 2, figsize=(11, 3.5), constrained_layout=True)
     for c, name in enumerate(("mtco", "mtwa")):
-        t_flat = truth_a[:, c][:, mask].ravel()
-        p_flat = pred_a[:, c][:, mask].ravel()
+        t_flat = truth[:, c][:, mask].ravel()
+        p_flat = pred[:, c][:, mask].ravel()
         lo = float(min(t_flat.min(), p_flat.min()))
         hi = float(max(t_flat.max(), p_flat.max()))
         bins = np.linspace(lo, hi, 60)
