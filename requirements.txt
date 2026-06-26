@@ -10,20 +10,20 @@ matplotlib
 scikit-image          # SSIM for field reconstructions (paleoreco.eval.da)
 
 # ---- Machine learning -------------------------------------------------------
-torch                 
-scikit-learn          
+torch
+scikit-learn          # PCA, TruncatedSVD, KMeans in eval/ and assim/experiments
 
 # ---- Domain-specific --------------------------------------------------------
-adao
 xarray                # labelled grids for the CCSM4 -> LOVECLIM regrid
 xarray-regrid         # conservative rectilinear regridding, pure-Python (no ESMF)
+
+# ---- Data acquisition -------------------------------------------------------
+# Used only by paleoreco/data/download_ccsm4.py to pull the CCSM4 truth run from
+# ERDA; not imported by the rest of the package.
+fsspec[http]          # HTTP range reads of the remote run (pulls aiohttp)
+h5netcdf              # NetCDF engine for xarray.open_dataset (pulls h5py)
 
 # ---- Notebook + dev experience ---------------------------------------------
 ipykernel
 tqdm
 pytest                # unit + integration test suite (tests/)
-
-# ---- Legacy ----------------------------------------------------------------
-# Imported by the reference notebook (notebooks/read_data.ipynb)
-# but not used by paleoreco/ source code. Keep until that notebook is retired.
-opencv-python
