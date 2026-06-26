@@ -628,6 +628,37 @@ def plot_per_mode_learning_curves(
     return fig
 
 
+def _scatter_latent_colored(ax, xs, ys, color_values, color_label, discrete, *, alpha):
+    """Scatter ``(xs, ys)`` coloured by ``color_values`` with a matched colour bar.
+
+    ``discrete`` (auto-detected when ``None``: integer-typed with <= 16 levels)
+    selects a per-level ``tab10`` bar; otherwise a continuous ``viridis`` bar.
+    Shared by :func:`plot_latent_2d` and :func:`plot_latent_2d_with_sigma`, which
+    differ only in the point arrays and the scatter ``alpha``.
+    """
+    if discrete is None:
+        is_int = np.issubdtype(np.asarray(color_values).dtype, np.integer)
+        discrete = bool(is_int and len(np.unique(color_values)) <= 16)
+    if discrete:
+        levels = np.unique(color_values)
+        n_levels = len(levels)
+        cmap = plt.get_cmap("tab10", n_levels)
+        mapped_colors = np.zeros_like(color_values)
+        for i, val in enumerate(levels):
+            mapped_colors[color_values == val] = i
+        sc = ax.scatter(xs, ys, c=mapped_colors, cmap=cmap, s=14, alpha=alpha,
+                        edgecolor="none", vmin=-0.5, vmax=n_levels - 0.5)
+        cbar = plt.colorbar(sc, ax=ax, ticks=np.arange(n_levels))
+        cbar.ax.set_yticklabels(levels)
+        cbar.set_label(color_label)
+    else:
+        sc = ax.scatter(xs, ys, c=color_values, cmap="viridis", s=14, alpha=alpha,
+                        edgecolor="none")
+        cbar = plt.colorbar(sc, ax=ax)
+        cbar.set_label(color_label)
+    return sc
+
+
 def plot_latent_2d(
     latents: np.ndarray,
     color_values: np.ndarray,
@@ -639,7 +670,7 @@ def plot_latent_2d(
     """Bousquet Fig 9 / 10: 2D scatter of the AE's ``(Z_1, Z_2)`` latent.
 
     ``color_values`` is typically the integer D-O event label (output
-    of :func:`paleoreco.splits.assign_event_label`) or the age in yr
+    of :func:`paleoreco.data.splits.assign_event_label`) or the age in yr
     BP. ``discrete`` controls colour-bar style; default auto-detects
     based on whether ``color_values`` is integer-typed with a small
     cardinality.
@@ -649,38 +680,9 @@ def plot_latent_2d(
             f"plot_latent_2d expects (N, 2) latents, got {latents.shape}"
         )
 
-    if discrete is None:
-        is_int = np.issubdtype(np.asarray(color_values).dtype, np.integer)
-        discrete = bool(is_int and len(np.unique(color_values)) <= 16)
-
     fig, ax = plt.subplots(figsize=(6.0, 5.0), constrained_layout=True)
-
-    if discrete:
-        levels = np.unique(color_values)
-        n_levels = len(levels)
-        
-        cmap = plt.get_cmap("tab10", n_levels)
-        
-        mapped_colors = np.zeros_like(color_values)
-        for i, val in enumerate(levels):
-            mapped_colors[color_values == val] = i
-
-        sc = ax.scatter(
-            latents[:, 0], latents[:, 1],
-            c=mapped_colors, cmap=cmap, s=14, alpha=0.85, edgecolor="none",
-            vmin=-0.5, vmax=n_levels - 0.5
-        )
-        
-        cbar = plt.colorbar(sc, ax=ax, ticks=np.arange(n_levels))
-        cbar.ax.set_yticklabels(levels) 
-        cbar.set_label(color_label)
-    else:
-        sc = ax.scatter(
-            latents[:, 0], latents[:, 1],
-            c=color_values, cmap="viridis", s=14, alpha=0.85, edgecolor="none",
-        )
-        cbar = plt.colorbar(sc, ax=ax)
-        cbar.set_label(color_label)
+    _scatter_latent_colored(ax, latents[:, 0], latents[:, 1], color_values,
+                            color_label, discrete, alpha=0.85)
     ax.set_xlabel(r"$Z_1$")
     ax.set_ylabel(r"$Z_2$")
     ax.set_title(title)
@@ -911,33 +913,8 @@ def plot_latent_2d_with_sigma(
         LineCollection(v_segs, colors="tab:blue", alpha=band_alpha, lw=2)
     )
 
-    # Discrete / continuous colour handling, same as plot_latent_2d. Inlined
-    # here to keep this commit purely additive; a refactor can extract.
-    if discrete is None:
-        is_int = np.issubdtype(np.asarray(color_values).dtype, np.integer)
-        discrete = bool(is_int and len(np.unique(color_values)) <= 16)
-    if discrete:
-        levels = np.unique(color_values)
-        n_levels = len(levels)
-        cmap = plt.get_cmap("tab10", n_levels)
-        mapped_colors = np.zeros_like(color_values)
-        for i, val in enumerate(levels):
-            mapped_colors[color_values == val] = i
-        sc = ax.scatter(
-            mu[:, 0], mu[:, 1],
-            c=mapped_colors, cmap=cmap, s=14, alpha=0.95, edgecolor="none",
-            vmin=-0.5, vmax=n_levels - 0.5,
-        )
-        cbar = plt.colorbar(sc, ax=ax, ticks=np.arange(n_levels))
-        cbar.ax.set_yticklabels(levels)
-        cbar.set_label(color_label)
-    else:
-        sc = ax.scatter(
-            mu[:, 0], mu[:, 1],
-            c=color_values, cmap="viridis", s=14, alpha=0.95, edgecolor="none",
-        )
-        cbar = plt.colorbar(sc, ax=ax)
-        cbar.set_label(color_label)
+    _scatter_latent_colored(ax, mu[:, 0], mu[:, 1], color_values, color_label,
+                            discrete, alpha=0.95)
 
     ax.set_xlabel(r"$\mu_1$")
     ax.set_ylabel(r"$\mu_2$")

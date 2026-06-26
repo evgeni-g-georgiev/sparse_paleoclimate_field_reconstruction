@@ -12,12 +12,12 @@ generic primitives without depending on AE-specific contracts:
 * :mod:`paleoreco.eval.ae`
     Autoencoder specific helpers that depend on either the model's
     forward contract (``model(x) -> (x_hat, z)``) or the ``history``
-    dict produced by :mod:`paleoreco.train_ae`.
+    dict produced by :mod:`paleoreco.training.trainer_ae`.
 
 * :mod:`paleoreco.eval.vae`
     Beta-VAE specific helpers that depend on the VAE forward contract
     (``model(x) -> (x_hat, mu, logvar, z)``) or the ``history`` dict
-    produced by :mod:`paleoreco.train_vae`.
+    produced by :mod:`paleoreco.training.trainer_vae`.
 
 * :mod:`paleoreco.eval.gaussianity`
     Pooled-innovation Gaussianity plots (histogram and normal QQ) for
@@ -71,6 +71,7 @@ from paleoreco.eval.shared import (
     plot_per_mode_learning_curves,
     plot_recon_distribution,
     plot_reconstructions,
+    latent_tidiness,
     pod_fit,
     pod_predict,
     pod_test_rmse,
@@ -99,6 +100,7 @@ __all__ = [
     "plot_decoded_samples",
     "plot_latent_2d_with_sigma",
     "plot_latent_traversal",
+    "latent_tidiness",
     # ae
     "plot_loss_curves",
     "reconstruct_split",
