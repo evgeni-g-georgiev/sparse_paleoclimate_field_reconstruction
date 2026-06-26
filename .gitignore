@@ -24,11 +24,12 @@ __pycache__/
 # --- Project data ------------------------------------------------------------
 # Raw CSVs and derived caches (e.g. data/cache/prior_cube.npz). Large, regenerable,
 # and the raw files are licensed via the upstream sources (Liu26, LOVECLIM run).
-data/
+# Anchored to the repo root so it does not also catch paleoreco/data/ or tests/data/.
+/data/
 
 # --- Model outputs -----------------------------------------------------------
 # Trained checkpoints, generated figures, sweep logs. Re-derivable from code + data.
-outputs/
+/outputs/
 
 # --- Personal notes and supervisor-provided PDFs -----------------------------
 # Kept locally; not committed (notes may contain in-progress thinking; PDFs are
