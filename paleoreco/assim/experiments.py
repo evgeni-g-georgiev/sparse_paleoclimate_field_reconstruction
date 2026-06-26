@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 from paleoreco.data import VARS
-from paleoreco.splits import assign_event_label
+from paleoreco.data.splits import assign_event_label
 from paleoreco.assim.observations import observations_at_age
 from paleoreco.assim.innovation import obs_cell_index, r_diagonal
 from paleoreco.assim.montecarlo import (

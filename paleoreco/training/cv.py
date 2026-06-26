@@ -16,7 +16,7 @@ from typing import Callable
 import numpy as np
 from torch.utils.data import DataLoader
 
-from .data import PaleoFieldDataset, apply_zscore, compute_zscore_stats
+from ..data import PaleoFieldDataset, apply_zscore, compute_zscore_stats
 
 
 def cross_validate(
@@ -29,7 +29,7 @@ def cross_validate(
 ) -> dict:
     """Run ``fit_eval_fn`` on every fold and aggregate its scalar outputs.
 
-    ``folds`` is the ``"folds"`` list from :func:`paleoreco.splits.make_blocked_cv`.
+    ``folds`` is the ``"folds"`` list from :func:`paleoreco.data.splits.make_blocked_cv`.
     Each fold gets its own z-score stats fit on ``fold["train"]`` only, so the
     validation ages stay out of the normalisation. ``fit_eval_fn`` receives
     ``(train_loader, val_loader, mask, stats, val_ds)``, builds and trains a
@@ -102,7 +102,7 @@ def pool_indices(folds: list[dict[str, np.ndarray]]) -> np.ndarray:
     """The non-test pool: every age that serves as validation in some fold.
 
     Each pool age is validated exactly once under
-    :func:`paleoreco.splits.make_blocked_cv`, so the union of fold validations is
+    :func:`paleoreco.data.splits.make_blocked_cv`, so the union of fold validations is
     the full train/val pool the winner is refit on.
     """
     return np.unique(np.concatenate([f["val"] for f in folds]))

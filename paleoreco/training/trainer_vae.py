@@ -31,8 +31,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from paleoreco.losses import vae_elbo_loss
-from paleoreco.train_ae import _snapshot_state_dict, set_seed
+from ._common import _snapshot_state_dict, set_seed
+from .losses import vae_elbo_loss
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +257,7 @@ def train(
     """Train a beta-VAE with AdamW + cosine LR + KL warmup; early-stops on
     ``val_total_loss``.
 
-    Parameters mostly mirror :func:`paleoreco.train_ae.train`. New / changed:
+    Parameters mostly mirror :func:`paleoreco.training.trainer_ae.train`. New / changed:
 
     beta : float
         Target KL coefficient. ``beta`` is ramped linearly 0 -> ``beta``

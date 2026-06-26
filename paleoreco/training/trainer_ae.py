@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import math
 import os
-import random
 import time
 from typing import Any, Callable
 
@@ -27,24 +26,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from paleoreco.losses import masked_mse
-
-
-# ---------------------------------------------------------------------------
-# Reproducibility.
-# ---------------------------------------------------------------------------
-def set_seed(seed: int) -> None:
-    """Seed Python, NumPy, and PyTorch (CPU + CUDA) for reproducibility.
-
-    Skips ``torch.use_deterministic_algorithms(True)`` because seeding
-    alone is enough for run-to-run reproducibility on a fixed machine,
-    and the deterministic flag forces slower kernels.
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+from ._common import _snapshot_state_dict, set_seed
+from .losses import masked_mse
 
 
 # ---------------------------------------------------------------------------
@@ -180,11 +163,6 @@ def evaluate(
 # ---------------------------------------------------------------------------
 # Checkpoint helpers.
 # ---------------------------------------------------------------------------
-def _snapshot_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
-    """Detached CPU clone of ``model.state_dict()``; survives further training."""
-    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
-
 def _save_checkpoint(
     path: str,
     epoch: int,

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from paleoreco.regrid import conservative_regrid
+from .regrid import conservative_regrid
 
 _KELVIN = 273.15
 
