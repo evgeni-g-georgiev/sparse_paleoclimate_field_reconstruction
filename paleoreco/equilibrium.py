@@ -1,4 +1,5 @@
-"""Constant-CO2 CCSM4 glacial run: load it and reduce to per-decade temperature fields.
+"""Constant-CO2 CCSM4 glacial run: load it, reduce to per-decade temperature fields,
+and build a truth cube on a target grid.
 
 The run (Vettoretti et al. 2022) holds external forcing fixed and oscillates
 spontaneously between stadial and interstadial states, so its equilibrated
@@ -15,6 +16,8 @@ decade-to-decade variability the analysis is about.
 from __future__ import annotations
 
 import numpy as np
+
+from paleoreco.regrid import conservative_regrid
 
 _KELVIN = 273.15
 
@@ -44,3 +47,22 @@ def state_fields(run: dict, var: str = "TREFHT", reduce: str = "annual_mean") ->
         raise ValueError(f"unknown reduce {reduce!r}; expected one of {tuple(_REDUCERS)}")
     monthly = np.asarray(run[var], dtype=np.float64)  # (12, n_dec, n_lat, n_lon)
     return (_REDUCERS[reduce](monthly) - _KELVIN).astype(np.float32)
+
+
+def truth_cube_on_grid(
+    run: dict, tgt_lat: np.ndarray, tgt_lon: np.ndarray, *,
+    var: str = "TREFHT", trim_decades: int = 100, stride: int = 25,
+) -> np.ndarray:
+    """MTCO/MTWA truth cube ``(n, 2, n_lat, n_lon)`` in degC on the target grid.
+
+    Regrids the 12 monthly fields per decade before the min/max reduction, so the
+    coldest/warmest-month channels are formed on the target grid the way a coarse
+    model's own MTCO/MTWA would be. ``trim_decades`` drops the spin-up head and
+    ``stride`` thins to near-independent decades; channel order is
+    :data:`paleoreco.data.VARS`.
+    """
+    monthly = np.asarray(run[var], dtype=np.float64) - _KELVIN     # (12, n_dec, n_lat, n_lon)
+    monthly = monthly[:, trim_decades::stride]                     # (12, n, n_lat, n_lon)
+    regridded = conservative_regrid(monthly, run["lat"], run["lon"], tgt_lat, tgt_lon)
+    mtco, mtwa = regridded.min(axis=0), regridded.max(axis=0)      # (n, n_lat, n_lon) each
+    return np.stack([mtco, mtwa], axis=1).astype(np.float32)
