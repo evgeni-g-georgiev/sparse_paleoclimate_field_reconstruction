@@ -311,36 +311,6 @@ def pod_predict(
     return full.reshape(n_eval, n_channels, H, W)
 
 
-def pod_test_rmse(
-    cube_anom: np.ndarray,
-    fit_indices: np.ndarray,
-    test_indices: np.ndarray,
-    mask: np.ndarray,
-    ks: Sequence[int],
-    random_state: int = 0,
-) -> np.ndarray:
-    """Per-``k`` test RMSE in °C anomaly; convenience wrapper.
-
-    Thin wrapper around :func:`pod_fit` + :func:`pod_predict`. The
-    headline AE-vs-POD comparison uses :func:`compute_E_d`.
-
-    Returns
-    -------
-    np.ndarray of shape ``(len(ks),)``
-        Per-``k`` masked-RMSE in °C anomaly over ``test_indices``.
-    """
-    max_k = int(max(ks))
-    basis = pod_fit(cube_anom, fit_indices, mask, max_k, random_state=random_state)
-    truth = cube_anom[test_indices]
-    mask_3d = mask[None, None]                    # broadcast over (N, C, H, W)
-    rmses = []
-    for k in ks:
-        pred = pod_predict(cube_anom, test_indices, basis, k)
-        sq = (pred - truth) ** 2 * mask_3d
-        rmses.append(float(np.sqrt(sq.sum() / (truth.shape[0] * 2 * mask.sum()))))
-    return np.array(rmses, dtype=np.float64)
-
-
 # ---------------------------------------------------------------------------
 # Bousquet's E_d compression-quality metric.
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 """Evaluation utilities for paleoreco models.
 
-The package is split into two submodules so downstream work can reuse the
+The package is split by model family so downstream work can reuse the
 generic primitives without depending on AE-specific contracts:
 
 * :mod:`paleoreco.eval.shared`
@@ -29,12 +29,20 @@ generic primitives without depending on AE-specific contracts:
     projections used to inspect a sample of fields for departures from
     Gaussianity.
 
-For convenience the public API of both submodules is re-exported here,
-so callers can simply do::
+* :mod:`paleoreco.eval.da`
+    Reconstruction skill: pooled scalars, per-cell maps, skill against
+    distance to the nearest observation, and their plotters.
+
+* :mod:`paleoreco.eval.calibration`
+    Whether a posterior's stated uncertainty matches its errors: CRPS,
+    CRPSS, RCRV, coverage.
+
+The figure and metric primitives are re-exported here, so callers can do::
 
     from paleoreco.eval import plot_per_cell_rmse, plot_loss_curves
 
-without reaching into the submodules.
+``da`` and ``calibration`` are used as modules (``from paleoreco.eval import da``)
+rather than re-exported, since their names are generic.
 """
 
 from paleoreco.eval.ae import (
@@ -74,7 +82,6 @@ from paleoreco.eval.shared import (
     latent_tidiness,
     pod_fit,
     pod_predict,
-    pod_test_rmse,
 )
 
 __all__ = [
@@ -87,7 +94,6 @@ __all__ = [
     "plot_reconstructions",
     "pod_fit",
     "pod_predict",
-    "pod_test_rmse",
     # shared - layer 2 (Bousquet latent-space deep dive)
     "compute_pod_time_coefficients",
     "partition_latent_2d",
