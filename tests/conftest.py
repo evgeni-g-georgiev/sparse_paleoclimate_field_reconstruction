@@ -64,9 +64,9 @@ def obs_long(ages, lats, lons) -> pd.DataFrame:
     """Long pseudo-proxy table for the DA pipeline: one row per (site, channel, age).
 
     Six sites placed on real grid coordinates, both temperature channels, present
-    at every age so every held-out age has a usable network. Columns match what
-    ``observations_at_age`` / ``experiments.run_ppe`` read: age, lat, lon, channel,
-    sse, plus site/sample/my for the withholding lane.
+    at every age so every drawn age has a usable network. Columns match what
+    ``observations_at_age`` / ``experiments.run_ppe`` read: age, lat, lon,
+    channel, sse, plus site/sample/my for the withholding lane.
     """
     site_lat = [lats[1], lats[3], lats[5], lats[6], lats[2], lats[4]]
     site_lon = [lons[1], lons[2], lons[6], lons[4], lons[5], lons[0]]
