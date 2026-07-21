@@ -7,15 +7,15 @@
 numpy
 pandas
 matplotlib
+scipy                 # Cholesky solve in assim/threedvar, normal CDF in eval/calibration
 scikit-image          # SSIM for field reconstructions (paleoreco.eval.da)
 
 # ---- Machine learning -------------------------------------------------------
 torch
-scikit-learn          # PCA, TruncatedSVD, KMeans in eval/ and assim/experiments
+scikit-learn          # PCA, TruncatedSVD, KMeans in eval/
 
 # ---- Domain-specific --------------------------------------------------------
-xarray                # labelled grids for the CCSM4 -> LOVECLIM regrid
-xarray-regrid         # conservative rectilinear regridding, pure-Python (no ESMF)
+xarray                # labelled grids for the downloaded CCSM4 run
 
 # ---- Data acquisition -------------------------------------------------------
 # Used only by paleoreco/data/download_ccsm4.py to pull the CCSM4 truth run from
