@@ -1,10 +1,8 @@
 """Common contract every reconstruction method implements.
 
 A method consumes a background and a set of observations for one assimilation and
-returns an :class:`AnalysisResult`. The container carries the posterior mean
-(always) plus optional posterior variance and posterior samples, so a variational
-method (mean + variance) and an ensemble/generative method (samples) expose one
-shape to the evaluation harness.
+returns an :class:`AnalysisResult`, which carries the posterior mean and, where the
+method can produce one, the posterior variance.
 
 All fields are in anomaly space (state minus per-cell climatology, observations
 minus their per-cell climatology); :meth:`AnalysisResult.to_celsius` maps back.
@@ -37,14 +35,12 @@ class Observations:
 class AnalysisResult:
     """Posterior of one assimilation, in anomaly space.
 
-    ``mean_anom`` is ``(2, n_lat, n_lon)``. ``posterior_var`` (same shape) and
-    ``samples`` ``(n, 2, n_lat, n_lon)`` are filled by whichever method can
-    produce them.
+    ``mean_anom`` is ``(2, n_lat, n_lon)``; ``posterior_var`` (same shape) is filled
+    by whichever method can produce it.
     """
 
     mean_anom: np.ndarray
     posterior_var: np.ndarray | None = None
-    samples: np.ndarray | None = None
 
     def to_celsius(self, clim_mean: np.ndarray) -> np.ndarray:
         """Posterior mean in degC: anomaly plus the per-cell climatology."""
@@ -53,6 +49,16 @@ class AnalysisResult:
     def predict_obs(self, gather: np.ndarray) -> np.ndarray:
         """Posterior-mean anomaly at the given flat cell indices (H applied)."""
         return self.mean_anom.ravel()[gather]
+
+    def predict_obs_var(self, gather: np.ndarray) -> np.ndarray | None:
+        """Posterior variance at those cells, or ``None`` if the method reports no spread.
+
+        Scoring calibration in observation space needs the spread where the observations
+        are, not the whole map.
+        """
+        if self.posterior_var is None:
+            return None
+        return self.posterior_var.ravel()[gather]
 
 
 class Method(ABC):

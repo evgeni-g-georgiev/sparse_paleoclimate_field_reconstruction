@@ -1,4 +1,4 @@
-"""Tests for DA skill and calibration metrics (paleoreco.eval.da)."""
+"""Tests for DA skill metrics (paleoreco.eval.da)."""
 
 from __future__ import annotations
 
@@ -24,24 +24,11 @@ def test_pearson_rmse_rrmse():
     assert da.relative_rmse(a, b) == pytest.approx(1.0 / np.std(a))
 
 
-def test_rcrv_calibrated_when_spread_matches_error():
-    # z = (truth - mean)/sqrt(var); with unit error and mean 0, std(z) ~ 1, bias ~ 0.
-    rng = np.random.default_rng(0)
-    n = 20000
-    truth = rng.normal(0.0, 1.0, n)
-    mean = np.zeros(n)
-    var = np.ones(n)
-    bias, disp = da.rcrv(truth, mean, var)
-    assert bias == pytest.approx(0.0, abs=0.05)
-    assert disp == pytest.approx(1.0, abs=0.05)
-
-
-def test_crps_gaussian_at_zero_z():
-    # For truth == mean, z = 0, CRPS = sd * (2*phi(0) - 1/sqrt(pi)).
-    mean = np.array([0.0])
-    var = np.array([4.0])               # sd = 2
-    expected = 2.0 * (2.0 / np.sqrt(2 * np.pi) - 1.0 / np.sqrt(np.pi))
-    assert da.crps_gaussian(mean, mean, var)[0] == pytest.approx(expected)
+def test_amplitude_ratio():
+    truth = np.array([1.0, -1.0, 2.0, -2.0])
+    assert da.amplitude_ratio(truth, truth) == pytest.approx(1.0)
+    assert da.amplitude_ratio(truth, 0.5 * truth) == pytest.approx(0.5)   # too flat
+    assert da.amplitude_ratio(truth, np.zeros_like(truth)) == pytest.approx(0.0)
 
 
 def test_uncertainty_reduction():

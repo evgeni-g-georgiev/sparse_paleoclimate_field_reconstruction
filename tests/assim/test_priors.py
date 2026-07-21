@@ -1,4 +1,4 @@
-"""Tests for B regularizers and geometry helpers (paleoreco.assim.priors)."""
+"""Tests for B regularizer tapers and geometry helpers (paleoreco.assim.priors)."""
 
 from __future__ import annotations
 
@@ -6,12 +6,13 @@ import numpy as np
 import pytest
 
 from paleoreco.assim.priors import (
-    channel_taper,
-    eof_truncate,
+    build_prior,
+    coupling_taper,
     gaspari_cohn,
     great_circle_km,
-    per_age_neighbour,
-    shrink_to_diagonal,
+    localization_taper,
+    regularization_mask,
+    shrinkage_taper,
 )
 
 _R = 6371.0
@@ -37,33 +38,11 @@ def test_great_circle_quarter_circumference():
     assert d[0, 1] == pytest.approx(_R * np.pi / 2, rel=1e-6)
 
 
-def test_eof_truncate_is_low_rank_psd_symmetric():
-    rng = np.random.default_rng(3)
-    M = rng.normal(size=(10, 10))
-    B = M @ M.T
-    Bk = eof_truncate(B, rank=3)
-    assert np.allclose(Bk, Bk.T)
-    assert np.linalg.matrix_rank(Bk, tol=1e-8) <= 3
-    w = np.linalg.eigvalsh(Bk)
-    assert w.min() > -1e-8                   # PSD
-
-
-def test_shrink_to_diagonal_preserves_variance_scales_offdiag():
-    rng = np.random.default_rng(5)
-    X = rng.normal(size=(20, 4))
-    Xc = X - X.mean(axis=0, keepdims=True)
-    s = (Xc.T @ Xc) / (X.shape[0] - 1)       # sample covariance
-    B = shrink_to_diagonal(X, lam=0.5)
-    assert np.allclose(np.diag(B), np.diag(s))           # variances exact
-    off = ~np.eye(4, dtype=bool)
-    assert np.allclose(B[off], 0.5 * s[off])             # off-diag scaled by 1 - lam
-
-
-def test_channel_taper_block_structure():
+def test_localization_taper_block_structure():
     lats = np.array([-30.0, 0.0, 30.0])
     lons = np.array([0.0, 120.0, 240.0])
     n = lats.size * lons.size
-    T = channel_taper(lats, lons, length_km=5000.0)
+    T = localization_taper(lats, lons, length_km=5000.0)
     assert T.shape == (2 * n, 2 * n)
     spatial = T[:n, :n]
     # All four channel blocks share the one spatial taper.
@@ -73,10 +52,75 @@ def test_channel_taper_block_structure():
     assert np.allclose(np.diag(spatial), 1.0)            # self-correlation
 
 
-def test_per_age_neighbour_respects_offset():
-    prior_ages = np.array([1000, 2000, 3000, 5000])
-    n = per_age_neighbour(3000, prior_ages, offset_yr=2000)
-    assert abs(n - 3000) >= 2000
-    # Fallback: when nothing satisfies the offset, take the farthest available.
-    n2 = per_age_neighbour(3000, prior_ages, offset_yr=10_000)
-    assert n2 in (1000, 5000)
+def test_coupling_taper_scales_cross_channel_blocks():
+    n_lat, n_lon = 3, 3
+    n = n_lat * n_lon
+    C = coupling_taper(n_lat, n_lon, alpha=0.4)
+    assert C.shape == (2 * n, 2 * n)
+    assert np.allclose(np.diag(C), 1.0)                  # variances untouched
+    assert np.allclose(C[:n, :n], 1.0)                   # within-channel blocks intact
+    assert np.allclose(C[n:, n:], 1.0)
+    assert np.allclose(C[:n, n:], 0.4)                   # cross-channel scaled by alpha
+    assert np.allclose(C[n:, :n], 0.4)
+    # Endpoints: alpha=1 is a no-op, alpha=0 is block-diagonal.
+    assert np.allclose(coupling_taper(n_lat, n_lon, 1.0), 1.0)
+    block = coupling_taper(n_lat, n_lon, 0.0)
+    assert np.allclose(block[:n, n:], 0.0) and np.allclose(block[:n, :n], 1.0)
+    assert np.linalg.eigvalsh(C).min() > -1e-8           # PSD for alpha in [0, 1]
+
+
+def test_shrinkage_taper_scales_offdiag_keeps_diag():
+    n_lat, n_lon = 2, 3
+    d = 2 * n_lat * n_lon
+    S = shrinkage_taper(n_lat, n_lon, lam=0.25)
+    assert S.shape == (d, d)
+    assert np.allclose(np.diag(S), 1.0)                  # variances exact
+    off = ~np.eye(d, dtype=bool)
+    assert np.allclose(S[off], 0.75)                     # off-diag scaled by 1 - lam
+    assert np.linalg.eigvalsh(S).min() > -1e-8           # PSD for lam in [0, 1]
+
+
+def test_regularization_mask_none_when_off_and_composes_when_on():
+    lats = np.array([-30.0, 0.0, 30.0])
+    lons = np.array([0.0, 120.0, 240.0])
+    assert regularization_mask(lats, lons, localization_km=None,
+                               shrinkage_lambda=0.0, alpha=1.0) is None
+    m = regularization_mask(lats, lons, localization_km=12500.0,
+                            shrinkage_lambda=0.25, alpha=0.5)
+    n = lats.size * lons.size
+    assert m.shape == (2 * n, 2 * n)
+    assert np.allclose(np.diag(m), 1.0)                  # diagonal preserved
+    assert np.allclose(m, m.T)
+
+
+def _sample_cube(n_ages=8, n_lat=4, n_lon=5, seed=0):
+    rng = np.random.default_rng(seed)
+    return rng.normal(size=(n_ages, 2, n_lat, n_lon)).astype(np.float32)
+
+
+def test_build_prior_defaults_are_raw_sample_covariance():
+    cube = _sample_cube()
+    lats = np.linspace(-60, 60, 4).astype(np.float32)
+    lons = np.linspace(-180, 120, 5).astype(np.float32)
+    ages = np.arange(8, dtype=np.int64)
+    valid = np.ones((4, 5), bool)
+    idx = np.arange(8)
+    from paleoreco.assim.background import background_covariance
+    prior = build_prior(cube, ages, lats, lons, idx, valid)
+    assert np.allclose(prior.B, background_covariance(cube, idx))
+    assert prior.meta == {"localization_km": None, "shrinkage_lambda": 0.0,
+                          "alpha": 1.0, "n_prior_ages": 8}
+
+
+def test_build_prior_alpha_zero_decouples_channels():
+    cube = _sample_cube()
+    lats = np.linspace(-60, 60, 4).astype(np.float32)
+    lons = np.linspace(-180, 120, 5).astype(np.float32)
+    ages = np.arange(8, dtype=np.int64)
+    valid = np.ones((4, 5), bool)
+    prior = build_prior(cube, ages, lats, lons, np.arange(8), valid, alpha=0.0)
+    n = 4 * 5
+    assert np.allclose(prior.B[:n, n:], 0.0)             # cross-channel blocks zeroed
+    assert np.allclose(prior.B[n:, :n], 0.0)
+    assert np.allclose(prior.B, prior.B.T)               # stays symmetric
+    assert np.linalg.eigvalsh(prior.B).min() > -1e-6     # stays PSD

@@ -72,21 +72,6 @@ def obs_cell_index(
 # ---------------------------------------------------------------------------
 # Innovation and standardisation.
 # ---------------------------------------------------------------------------
-def r_diagonal(
-    gather: np.ndarray,
-    sse: np.ndarray,
-    rep_flat: np.ndarray,
-    c: np.ndarray,
-    n_cells: int,
-) -> np.ndarray:
-    """Observation-error variance per obs: ``sse + c_channel * rep_var`` at its cell.
-
-    ``rep_flat`` is the per-cell representativeness variance flattened over
-    ``(channel, lat, lon)``; ``c`` is the per-channel coefficient (length VARS);
-    the channel is recovered from the flat gather index by ``gather // n_cells``.
-    """
-    chan = np.asarray(gather) // n_cells
-    return np.asarray(sse, dtype=np.float64) + np.asarray(c)[chan] * rep_flat[gather]
 
 
 def obs_operator_scale(prior_var_at_obs: np.ndarray, sy: np.ndarray, mode: str) -> np.ndarray:

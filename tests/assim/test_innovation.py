@@ -12,7 +12,6 @@ from paleoreco.assim.innovation import (
     obs_cell_index,
     obs_operator_scale,
     predicted_sd,
-    r_diagonal,
     standardise,
 )
 from paleoreco.assim.scoring import ANOMALY, NORMALISED
@@ -43,17 +42,6 @@ def test_obs_cell_index_flat_layout():
                        np.array(["mtwa"]), lats, lons)
     # mtwa -> channel 1; lat 0.0 -> ilat 1; lon 90 -> ilon 1.
     assert g[0] == 1 * n_cells + 1 * 2 + 1
-
-
-def test_r_diagonal_adds_representativeness():
-    n_cells = 4
-    gather = np.array([0, 5])                # channels 0 and 1
-    sse = np.array([1.0, 2.0])
-    rep_flat = np.arange(8, dtype=float)     # rep at cell index = the index
-    c = np.array([0.5, 0.25])
-    r = r_diagonal(gather, sse, rep_flat, c, n_cells)
-    assert r[0] == pytest.approx(1.0 + 0.5 * 0.0)
-    assert r[1] == pytest.approx(2.0 + 0.25 * 5.0)
 
 
 def test_predicted_sd_and_standardise():

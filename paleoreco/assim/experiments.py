@@ -2,60 +2,80 @@
 
 Two evaluation lanes, both method-agnostic through the :class:`Method` contract:
 
-* :func:`run_ppe` - pseudo-proxy experiments. Hold out every Nth age as truth,
-  build the prior from the rest, sample noisy pseudo-observations from each truth
-  at the real network's locations, reconstruct, and score against the held-out
-  truth field. The held-out truths are the only states never seen by the prior.
-* :func:`run_withholding` - withhold whole proxy sites, assimilate the rest, and
-  score the predicted observations at the withheld sites against the real values.
+* :func:`run_ppe` - same-model pseudo-proxy experiments: the prior cube is split
+  chronologically, B and the climatology come from one half, and truths are drawn from
+  the other. Each truth borrows several real-proxy network shapes; ``b_scale`` is
+  selected on held-out shapes and scored on a disjoint one.
+* :func:`run_withholding` - nested cross-validation over proxy sites: select
+  ``b_scale`` on a held-out fold, report on a fresh fold.
 
-Both write a tidy long-format metrics CSV (one row per method/background/B_reg/
-lane/fold/rep_K/b_scale/do_event/channel/metric), the analysis fields as npz, and
-a config.json. ``rep_K`` is the PPE observation-noise multiplier (0 elsewhere);
-``b_scale`` is the background-covariance amplitude the analysis used. R is the
-augmented ``diag(sse) + diag(c*rep_var)``. Old metrics CSVs predate the
-``b_scale`` column and must be regenerated, not merged. Scoring is in anomaly
-space; CE, RMSE, and correlation are shift-invariant so the anomaly-space values
-equal their degC counterparts.
+:func:`run_ppe_pixel_grid` and :func:`run_withholding_pixel_grid` wrap these over a
+coarse localization/shrinkage/coupling grid, jointly selecting the operating point with
+``b_scale`` on the held-out selection split and persisting only the winning config's
+fields.
+
+Each writes a tidy long-format metrics CSV (one row per method/space/localization_km/
+shrinkage_lambda/alpha/lane/fold/b_scale/background/split/do_event/channel/metric), the
+analysis fields as npz, and a config.json. ``b_scale`` is the background-covariance
+amplitude the analysis used; ``split`` is ``selection`` (used to pick the operating
+point) or ``test`` (reported). R is ``diag(sse)``. Scoring is in anomaly space; CE,
+RMSE, and correlation are shift-invariant so the anomaly-space values equal their degC
+counterparts.
+
+Every lane emits skill metrics (``ce``, ``corr``, ``rmse``, ``rrmse``, ``amplitude``,
+plus field-only ``ssim``) and calibration metrics (``crps``, ``crpss``, ``rcrv_bias``,
+``rcrv_dispersion``, ``coverage90``), scored against the prior ``N(0, b_scale diag B)``
+as the CRPSS reference so it matches CE's climatology baseline. Both lanes also carry
+prior-free ``nearest``/``idw`` reference rows, tagged ``background="none"``, which is the
+context a bare CE cannot supply.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
+import time
+from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 import pandas as pd
 
 from paleoreco.data import VARS
-from paleoreco.data.splits import assign_event_label
+from paleoreco.data.splits import chronological_half_split
+from paleoreco.assim.method import Method
 from paleoreco.assim.observations import observations_at_age
-from paleoreco.assim.innovation import obs_cell_index, r_diagonal
-from paleoreco.assim.montecarlo import (
-    FieldEnsembleAccumulator,
-    assimilate_withheld_sweep,
-    random_site_partitions,
-)
-from paleoreco.assim.priors import build_prior, per_age_neighbour
+from paleoreco.assim.innovation import obs_cell_index
+from paleoreco.assim.priors import Prior, build_prior, great_circle_km_between
 from paleoreco.assim.threedvar import ThreeDVar
-from paleoreco.eval import da
+from paleoreco.eval import calibration, da
 
-BACKGROUNDS = ("climatological", "per_age")
-C_REP = (0.06, 0.18)                            # per-channel representativeness scale, VARS order
-B_SCALES = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
-LANE_IMPERFECT = "ppe_imperfect"
+# A method factory turns a built prior and the field shape into an estimator, so a
+# lane can run pixel 3DVar or a latent method behind one call. The estimator must
+# expose the sweep surface (prepare_sweep / apply_sweep / post_var_sweep) and return
+# pixel-space AnalysisResult, like ThreeDVar.
+MethodFactory = Callable[[Prior, "tuple[int, int, int]"], Method]
+
+B_SCALES = (0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
+# Coarse tuning grid for the pixel regularizer (localization / shrinkage / channel
+# coupling); ``None`` localization is "off", the raw sample covariance.
+LOCALIZATION_KM_GRID = (None, 7500.0, 12500.0)
+SHRINKAGE_GRID = (0.0, 0.25, 0.5)
+ALPHA_GRID = (0.0, 0.5, 1.0)
+SEL_TOL = 0.0   # 0 = pure argmin of selection RRMSE; >0 prefers the simpler config within this relative band
+LANE_PPE = "ppe"
+# Metrics the RRMSE selection never reads, so a grid scan computes them for the winner only.
+_FULL_METRICS = frozenset({"ssim", "crps", "crpss", "rcrv_bias", "rcrv_dispersion",
+                           "coverage90"})
+
+# Taper columns for prior-free (naive) rows, which carry no regularizer.
+_NAN_REG = {"localization_km": np.nan, "shrinkage_lambda": np.nan, "alpha": np.nan}
 
 
 # ---------------------------------------------------------------------------
-# Hold-out and observation geometry.
+# Observation geometry.
 # ---------------------------------------------------------------------------
-def every_nth_holdout(n_ages: int, stride: int = 10) -> tuple[np.ndarray, np.ndarray]:
-    """Held-out (truth) and prior age indices: every ``stride``-th age is held out."""
-    held = np.arange(stride - 1, n_ages, stride, dtype=np.int64)
-    prior = np.setdiff1d(np.arange(n_ages, dtype=np.int64), held)
-    return held, prior
-
-
 def _obs_geometry(o: dict, lats: np.ndarray, lons: np.ndarray, safe_flat: np.ndarray) -> dict:
     """Gather indices, error variance, and site coords for usable observations."""
     gather = obs_cell_index(o["lat"], o["lon"], o["channel"], lats, lons)
@@ -68,45 +88,47 @@ def _obs_geometry(o: dict, lats: np.ndarray, lons: np.ndarray, safe_flat: np.nda
     }
 
 
-def _draw_usable_age(long: pd.DataFrame, rng: np.random.Generator,
-                     lats: np.ndarray, lons: np.ndarray, safe_flat: np.ndarray) -> int:
-    """A real proxy age whose borrowed network has at least one usable cell.
+def _draw_usable_ages(long: pd.DataFrame, rng: np.random.Generator,
+                      lats: np.ndarray, lons: np.ndarray, safe_flat: np.ndarray,
+                      n: int) -> list[int]:
+    """``n`` distinct real proxy ages, each borrowing a usable network on the grid.
 
-    Drawn from the shared ``rng`` so an external-truth run is reproducible from its
-    seed; the age contributes only the network geometry, not any climate time.
+    Drawn from the shared ``rng`` so a run is reproducible from its seed; an age
+    contributes only network geometry, not any climate time. The distinct shapes give
+    one truth several sparsity patterns, so ``b_scale`` can be selected on some shapes
+    and scored on a held-out other.
     """
-    ages_avail = long["age"].unique()
-    for _ in range(len(ages_avail)):
-        a = int(rng.choice(ages_avail))
+    picked = []
+    for a in rng.permutation(long["age"].unique()):
+        a = int(a)
         o = observations_at_age(long, a)
         if len(o.get("age", [])) and len(_obs_geometry(o, lats, lons, safe_flat)["gather"]):
-            return a
-    raise ValueError("no proxy age has a usable network on this grid")
+            picked.append(a)
+            if len(picked) == n:
+                return picked
+    raise ValueError(f"fewer than {n} proxy ages have a usable network on this grid")
 
 
-def representativeness_variance(clim_mean: np.ndarray, safe_valid: np.ndarray) -> np.ndarray:
-    """Per-cell subgrid variance: the spread of the climatology over its 3x3 block.
+def _pad_obs(test_obs: list[dict], T: int) -> tuple[np.ndarray, ...]:
+    """Ragged per-truth test-shape obs to padded ``(T, max_obs)`` arrays for npz.
 
-    Stands in for the point-vs-cell mismatch a proxy carries (large over steep
-    gradients, small over homogeneous regions). Longitude wraps, latitude clamps,
-    masked neighbours are excluded; cells with fewer than two valid neighbours get
-    zero. Built from the prior climatology so it holds no truth-specific signal.
+    ``obs_n`` gives the real count per truth so the field gallery can drop the padding
+    when overlaying the assimilated sites.
     """
-    n_lat, n_lon = clim_mean.shape[1:]
-    li, lj = np.arange(n_lat), np.arange(n_lon)
-    vals, valids = [], []
-    for di in (-1, 0, 1):
-        for dj in (-1, 0, 1):
-            ii = np.clip(li + di, 0, n_lat - 1)
-            jj = (lj + dj) % n_lon
-            vals.append(clim_mean[:, ii][:, :, jj].astype(np.float64))
-            valids.append(safe_valid[ii][:, jj])
-    vals = np.stack(vals, axis=0)                      # (9, n_chan, n_lat, n_lon)
-    m = np.stack(valids, axis=0)[:, None]              # (9, 1, n_lat, n_lon)
-    cnt = m.sum(axis=0)
-    mean = np.where(m, vals, 0.0).sum(axis=0) / np.clip(cnt, 1, None)
-    var = np.where(m, (vals - mean) ** 2, 0.0).sum(axis=0) / np.clip(cnt, 1, None)
-    return np.where((cnt >= 2) & safe_valid[None], var, 0.0)
+    max_obs = max((len(o["val"]) for o in test_obs), default=0)
+    obs_lat = np.full((T, max_obs), np.nan)
+    obs_lon = np.full((T, max_obs), np.nan)
+    obs_val = np.full((T, max_obs), np.nan)
+    obs_chan = np.full((T, max_obs), -1, dtype=np.int64)
+    obs_n = np.zeros(T, dtype=np.int64)
+    for ti, o in enumerate(test_obs):
+        m = len(o["val"])
+        obs_n[ti] = m
+        obs_lat[ti, :m] = o["lat"]
+        obs_lon[ti, :m] = o["lon"]
+        obs_val[ti, :m] = o["val"]
+        obs_chan[ti, :m] = o["chan"]
+    return obs_lat, obs_lon, obs_val, obs_chan, obs_n
 
 
 # ---------------------------------------------------------------------------
@@ -129,10 +151,7 @@ def _naive_geometry(lats: np.ndarray, lons: np.ndarray, geom: dict, n_chan: int)
         if not sel.any():
             out.append(None)
             continue
-        d = da.great_circle_km(
-            np.concatenate([lat_cell, geom["lat"][sel]]),
-            np.concatenate([lon_cell, geom["lon"][sel]]),
-        )[: len(lat_cell), len(lat_cell):]
+        d = great_circle_km_between(lat_cell, lon_cell, geom["lat"][sel], geom["lon"][sel])
         w = 1.0 / np.clip(d, 1.0, None) ** 2
         out.append({"sel": sel, "nearest": np.argmin(d, axis=1),
                     "weights": w / w.sum(axis=1, keepdims=True)})
@@ -156,6 +175,34 @@ def _naive_apply(kind: str, naive_geom: list, y_anom: np.ndarray,
     return field
 
 
+def _naive_obs_predictions(assim: dict, target: dict, n_chan: int) -> tuple[dict, np.ndarray]:
+    """Prior-free predictions at withheld sites, and each one's distance to the nearest
+    assimilated site.
+
+    No field is built, unlike :func:`_naive_geometry`: withholding only ever reads the
+    reconstruction at the withheld sites, so one per-channel great-circle block between
+    target and assimilated sites yields both baselines and the void distance. A channel
+    with no assimilated observation keeps the climatological zero.
+    """
+    n_t = len(target["lat"])
+    out = {"nearest": np.zeros(n_t), "idw": np.zeros(n_t)}
+    dist = np.full(n_t, np.nan)
+    for c in range(n_chan):
+        tsel, asel = target["chan"] == c, assim["chan"] == c
+        if not tsel.any() or not asel.any():
+            continue
+        n_ts = int(tsel.sum())
+        d = great_circle_km_between(target["lat"][tsel], target["lon"][tsel],
+                                    assim["lat"][asel], assim["lon"][asel])
+        y = assim["y"][asel]
+        nearest = np.argmin(d, axis=1)
+        dist[tsel] = d[np.arange(n_ts), nearest]
+        out["nearest"][tsel] = y[nearest]
+        w = 1.0 / np.clip(d, 1.0, None) ** 2
+        out["idw"][tsel] = (w / w.sum(axis=1, keepdims=True)) @ y
+    return out, dist
+
+
 # ---------------------------------------------------------------------------
 # Metric assembly.
 # ---------------------------------------------------------------------------
@@ -174,13 +221,19 @@ def _flatten(truth_anom: np.ndarray, recon_anom: np.ndarray, safe_valid: np.ndar
     return t.ravel(), r.ravel()
 
 
+def _event_groups(events: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    """``(label, truth mask)`` for all truths and then each D-O event present."""
+    groups = [("all", np.ones(len(events), dtype=bool))]
+    for ev in sorted(set(events[events > 0])):
+        groups.append((str(int(ev)), events == ev))
+    return groups
+
+
 def _skill_rows(truth_anom: np.ndarray, recon_anom: np.ndarray, safe_valid: np.ndarray,
                 events: np.ndarray, base: dict) -> list[dict]:
     """CE / correlation / RMSE rows, pooled and per channel, for all and per event."""
     rows = []
-    groups = [("all", np.ones(len(events), dtype=bool))]
-    for ev in sorted(set(events[events > 0])):
-        groups.append((str(int(ev)), events == ev))
+    groups = _event_groups(events)
     channels = [("pooled", None)] + [(name, c) for c, name in enumerate(VARS)]
 
     for do_event, tsel in groups:
@@ -192,10 +245,65 @@ def _skill_rows(truth_anom: np.ndarray, recon_anom: np.ndarray, safe_valid: np.n
                 ("corr", da.pearson_r(t, r)),
                 ("rmse", da.rmse(t, r)),
                 ("rrmse", da.relative_rmse(t, r)),
+                ("amplitude", da.amplitude_ratio(t, r)),
             ):
                 rows.append({**base, "do_event": do_event, "channel": chan_name,
                              "metric": metric, "value": value})
     return rows
+
+
+def _calibration_rows(truth: np.ndarray, mean: np.ndarray, var: np.ndarray,
+                      ref_var: np.ndarray, groups: list, base: dict) -> list[dict]:
+    """CRPS / CRPSS / RCRV / coverage rows over flat, aligned arrays.
+
+    ``groups`` is ``(do_event, channel_name, mask)`` triples, so a field lane can group by
+    event and channel while an observation lane groups by channel alone. ``var`` is the
+    predictive variance the residual is scored against: the posterior variance for a
+    noise-free truth, plus the observation error when the truth is itself a measurement.
+    The CRPSS reference is the prior ``N(0, ref_var)``, the same do-nothing forecast CE
+    scores against.
+    """
+    crps_model = calibration.crps_gaussian(truth, mean, var)
+    crps_ref = calibration.crps_gaussian(truth, np.zeros_like(truth), ref_var)
+    rows = []
+    for do_event, chan_name, sel in groups:
+        if sel.sum() < 2:
+            continue
+        bias, dispersion = calibration.rcrv(truth[sel], mean[sel], var[sel])
+        for metric, value in (
+            ("crps", float(np.mean(crps_model[sel]))),
+            ("crpss", calibration.crpss(crps_model[sel], crps_ref[sel])),
+            ("rcrv_bias", bias),
+            ("rcrv_dispersion", dispersion),
+            ("coverage90", calibration.coverage(truth[sel], mean[sel], var[sel], 0.9)),
+        ):
+            rows.append({**base, "do_event": do_event, "channel": chan_name,
+                         "metric": metric, "value": value})
+    return rows
+
+
+def _field_calibration_rows(truth_anom: np.ndarray, recon_anom: np.ndarray,
+                            post_var: np.ndarray, prior_var: np.ndarray,
+                            safe_valid: np.ndarray, events: np.ndarray,
+                            base: dict) -> list[dict]:
+    """Calibration rows in field space, for one ``b_scale`` of a PPE lane.
+
+    Flattens over (truth, channel, valid cell) once and masks per group so the event and
+    channel breakdowns share one CRPS evaluation. The truth is a model state carrying no
+    observation error, so the predictive variance is the posterior variance alone.
+    """
+    t = truth_anom[:, :, safe_valid]
+    r = recon_anom[:, :, safe_valid]
+    v = post_var[:, :, safe_valid]
+    ref = np.broadcast_to(prior_var[:, safe_valid][None], t.shape)
+    chan = np.broadcast_to(np.arange(len(VARS))[None, :, None], t.shape).ravel()
+
+    groups = []
+    for do_event, esel in _event_groups(events):
+        emask = np.broadcast_to(esel[:, None, None], t.shape).ravel()
+        groups.append((do_event, "pooled", emask))
+        groups += [(do_event, name, emask & (chan == c)) for c, name in enumerate(VARS)]
+    return _calibration_rows(t.ravel(), r.ravel(), v.ravel(), ref.ravel(), groups, base)
 
 
 def _ssim_rows(truth_anom: np.ndarray, recon_anom: np.ndarray, safe_valid: np.ndarray,
@@ -209,9 +317,7 @@ def _ssim_rows(truth_anom: np.ndarray, recon_anom: np.ndarray, safe_valid: np.nd
     not the concatenation pooling used for CE/RMSE.
     """
     rows = []
-    groups = [("all", np.ones(len(events), dtype=bool))]
-    for ev in sorted(set(events[events > 0])):
-        groups.append((str(int(ev)), events == ev))
+    groups = _event_groups(events)
 
     dr = [float(truth_anom[:, c, safe_valid].max() - truth_anom[:, c, safe_valid].min())
           for c in range(len(VARS))]
@@ -236,330 +342,241 @@ def _append_csv(path: str, rows: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# PPE.
+# Pseudo-proxy PPE lane: same-model chronological split.
 # ---------------------------------------------------------------------------
+def _report_progress(label: str, done: int, total: int, t0: float) -> None:
+    """One-line progress update with a linear-rate ETA over the loop so far."""
+    elapsed = time.time() - t0
+    eta = elapsed / done * (total - done) if done else 0.0
+    print(f"  {label} {done}/{total} ({100 * done / total:.0f}%, "
+          f"elapsed {elapsed:.0f}s, eta {eta:.0f}s)", flush=True)
+
+
+def _score_ppe_lane(
+    truth_anoms: np.ndarray, prior: Prior, long: pd.DataFrame,
+    lats: np.ndarray, lons: np.ndarray, *,
+    lane: str, make_method: MethodFactory | None, space: str, reg_cols: dict,
+    b_scales: tuple[float, ...], n_shapes: int, n_select: int, n_noise: int,
+    dist_edges_km: np.ndarray | None, seed: int, full_metrics: bool = True,
+    npz_extra: dict | None = None, progress_every: int | None = None,
+) -> tuple[list[dict], dict, dict]:
+    """Score a built prior against a stack of truth anomalies (no file writes).
+
+    Returns ``(rows, npz_arrays, skill)``: the tidy metric rows, the analysis-npz dict,
+    and the skill-vs-distance dict; :func:`_write_ppe_artifacts` persists them.
+
+    Held-out selection: each truth draws ``n_shapes`` distinct real-proxy network shapes;
+    the first ``n_select`` form the ``selection`` split, the last the ``test`` split.
+    Metric rows for both splits span the whole ``b_scales`` sweep (``split`` column), so
+    the operating point is chosen on the selection shapes and reported on the disjoint
+    test shape. R is ``diag(sse)``; each pseudo-obs is the truth at its nearest cell plus
+    ``N(0, sse)`` noise, averaged over ``n_noise`` draws. Single climatological
+    background. ``make_method`` selects the estimator (default pixel :class:`ThreeDVar`);
+    ``space``/``reg_cols`` tag the rows. ``full_metrics=False`` skips the field SSIM and
+    calibration rows (neither feeds the RRMSE selection), the free saving the grid scan takes.
+
+    Calibration is scored on the test shape only, where the posterior variance is kept,
+    and against the noise-free truth so the predictive variance is the posterior alone.
+    Averaging the analysis over ``n_noise`` draws makes it mildly conservative relative to
+    a single realization; ``n_noise=1`` recovers the single-realization calibration.
+    """
+    rng = np.random.default_rng(seed)
+    shape = (len(VARS), len(lats), len(lons))
+    n_cells = len(lats) * len(lons)
+    b_scales = tuple(float(b) for b in b_scales)
+    n_b = len(b_scales)
+    npz_extra = npz_extra or {}
+
+    clim_mean = prior.clim_mean.astype(np.float64)
+    safe_valid = prior.safe_valid
+    safe_flat = np.broadcast_to(safe_valid, shape).ravel()
+    tv = ThreeDVar(prior.B, shape) if make_method is None else make_method(prior, shape)
+
+    zero_bg = np.zeros(int(np.prod(shape)))
+    T = len(truth_anoms)
+
+    # Selection shapes are pooled over shape x truth; the test shape is kept per truth
+    # for scoring and the field gallery.
+    recon_sel = np.zeros((n_select, n_b, T, *shape))
+    recon_test = np.zeros((n_b, T, *shape))
+    post_test = np.zeros((n_b, T, *shape))
+    naive_test = {"nearest": np.zeros((T, *shape)), "idw": np.zeros((T, *shape))}
+    dist_test, test_obs = [], []
+    drawn_ages = np.zeros((T, n_shapes), dtype=np.int64)
+
+    t0 = time.time()
+    for ti, truth_anom in enumerate(truth_anoms):
+        shape_ages = _draw_usable_ages(long, rng, lats, lons, safe_flat, n_shapes)
+        drawn_ages[ti] = shape_ages
+        for si, k_age in enumerate(shape_ages):
+            o = observations_at_age(long, int(k_age))
+            geom = _obs_geometry(o, lats, lons, safe_flat)
+            g = geom["gather"]
+            truth_at_obs = truth_anom.ravel()[g]         # obs values from the truth, H = nearest cell
+            gain = tv.prepare_sweep(g, geom["sse"], b_scales)   # R = diag(sse)
+            naive_geom = _naive_geometry(lats, lons, geom, len(VARS))
+
+            sum_recon = np.zeros((n_b, *shape))
+            sum_naive = {kind: np.zeros(shape) for kind in naive_test}
+            for _ in range(n_noise):
+                y = truth_at_obs + rng.normal(0.0, np.sqrt(geom["sse"]))
+                res = tv.apply_sweep(gain, y, zero_bg)
+                for bj in range(n_b):
+                    sum_recon[bj] += res[bj].mean_anom
+                for kind in sum_naive:
+                    sum_naive[kind] += _naive_apply(kind, naive_geom, y, shape)
+            sum_recon /= n_noise
+
+            if si < n_select:
+                recon_sel[si, :, ti] = sum_recon
+            else:
+                recon_test[:, ti] = sum_recon
+                post_test[:, ti] = tv.post_var_sweep(gain).reshape(n_b, *shape)  # value-free
+                for kind in naive_test:
+                    naive_test[kind][ti] = sum_naive[kind] / n_noise
+                dist_test.append(da.nearest_obs_distance(lats, lons, geom["lat"], geom["lon"]))
+                test_obs.append({"lat": geom["lat"], "lon": geom["lon"],
+                                 "val": truth_at_obs, "chan": g // n_cells})
+        if progress_every and (ti + 1) % progress_every == 0:
+            _report_progress("truth", ti + 1, T, t0)
+
+    events = np.zeros(T, dtype=np.int64)                 # PPE truths carry no DO-event labels
+    truth_sel = np.tile(truth_anoms, (n_select, 1, 1, 1))
+    events_sel = np.zeros(n_select * T, dtype=np.int64)
+
+    rows = []
+    for bj, kb in enumerate(b_scales):
+        base = {"method": "3dvar", "space": space, **reg_cols,
+                "lane": lane, "fold": -1, "b_scale": kb,
+                "background": "climatological", "split": "test"}
+        rows += _skill_rows(truth_anoms, recon_test[bj], safe_valid, events, base)
+        base_sel = {**base, "split": "selection"}
+        recon_pool = recon_sel[:, bj].reshape(n_select * T, *shape)
+        rows += _skill_rows(truth_sel, recon_pool, safe_valid, events_sel, base_sel)
+        if full_metrics:
+            rows += _ssim_rows(truth_anoms, recon_test[bj], safe_valid, events, base)
+            rows += _ssim_rows(truth_sel, recon_pool, safe_valid, events_sel, base_sel)
+            rows += _field_calibration_rows(truth_anoms, recon_test[bj], post_test[bj],
+                                            kb * tv.diagB.reshape(shape), safe_valid,
+                                            events, base)
+    for kind in naive_test:
+        base = {"method": kind, "space": space, **_NAN_REG,
+                "lane": lane, "fold": -1, "b_scale": 1.0,
+                "background": "none", "split": "test"}
+        rows += _skill_rows(truth_anoms, naive_test[kind], safe_valid, events, base)
+        if full_metrics:
+            rows += _ssim_rows(truth_anoms, naive_test[kind], safe_valid, events, base)
+
+    if dist_edges_km is None:
+        dist_edges_km = np.array([0, 500, 1000, 2000, 3000, 5000, 8000, 20000], dtype=float)
+    dist = np.stack(dist_test)
+    cell_mask = safe_valid.ravel()
+    dist_pool = np.tile(dist[:, cell_mask], (1, len(VARS))).ravel()
+    tv_safe = truth_anoms[:, :, safe_valid]
+    t_pool = tv_safe.reshape(T, -1).ravel()
+    curve = np.array([da.skill_vs_distance(
+        t_pool, recon_test[bj][:, :, safe_valid].reshape(T, -1).ravel(),
+        np.zeros_like(t_pool), dist_pool, dist_edges_km)["ce"]
+        for bj in range(n_b)])                           # (n_b, n_bins)
+
+    obs_lat, obs_lon, obs_val, obs_chan, obs_n = _pad_obs(test_obs, T)
+    npz_arrays = {
+        "truth_anom": truth_anoms, "clim_mean": clim_mean,
+        "safe_valid": safe_valid, "post_var": post_test, "prior_var": tv.diagB.reshape(shape),
+        "lats": np.asarray(lats), "lons": np.asarray(lons),
+        "drawn_ages": drawn_ages, "b_scales": np.asarray(b_scales),
+        "recon_climatological": recon_test,              # (n_b, T, 2, n_lat, n_lon)
+        "naive_nearest": naive_test["nearest"], "naive_idw": naive_test["idw"],
+        "obs_lat": obs_lat, "obs_lon": obs_lon, "obs_val": obs_val,
+        "obs_chan": obs_chan, "obs_n": obs_n,
+        **npz_extra,
+    }
+    skill = {"edges": dist_edges_km, "b_scales": np.asarray(b_scales), "climatological": curve}
+    return rows, npz_arrays, skill
+
+
+def _write_ppe_artifacts(out_dir: str, lane: str, rows: list[dict],
+                         npz_arrays: dict, skill: dict, config: dict) -> None:
+    """Persist a scored PPE lane: metrics CSV (appended), analysis npz, skill npz, config."""
+    os.makedirs(out_dir, exist_ok=True)
+    _append_csv(os.path.join(out_dir, "metrics.csv"), rows)
+    np.savez_compressed(os.path.join(out_dir, f"{lane}_analysis.npz"), **npz_arrays)
+    np.savez_compressed(os.path.join(out_dir, f"{lane}_skill_vs_distance.npz"), **skill)
+    with open(os.path.join(out_dir, f"{lane}_config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+
+
 def run_ppe(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
-    b_reg: str = "raw", eof_rank: int | None = None, localization_km: float | None = None,
-    shrinkage_lambda: float | None = None,
-    stride: int = 10, offset_yr: int = 2000, n_noise: int = 20,
-    rep_levels: tuple[float, ...] = (0.0,), c_rep: tuple[float, ...] = C_REP,
+    localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
+    make_method: MethodFactory | None = None, space: str = "pixel",
     b_scales: tuple[float, ...] = B_SCALES,
+    n_shapes: int = 5, n_select: int = 4, n_noise: int = 20, truth_stride: int = 10,
     dist_edges_km: np.ndarray | None = None, seed: int = 0,
+    progress_every: int | None = None,
 ) -> pd.DataFrame:
-    """Run the pseudo-proxy experiment for one B variant; persist artifacts.
+    """Same-model PPE for one taper config: truths are a held-out chronological chunk.
 
-    ``rep_levels`` sweeps the observation-noise multiplier k: the pseudo-obs is
-    ``H(x_true) + k*(e + w)`` with ``e ~ N(0, sse)`` and ``w ~ N(0, c*rep_var)``.
-    R is held at the augmented ``diag(sse) + diag(c*rep_var)``, so k=1 matches the
-    generating error (well-specified) and k>1 stresses it. ``b_scales`` scales B by
-    each value at assimilation time, shared through one eig factorization per
-    network. Returns the metrics rows and writes analysis fields, skill-vs-distance
-    curves, and config under ``out_dir``.
+    The ascending age axis splits at its midpoint; the older half builds B and the
+    climatology, the younger half (subsampled every ``truth_stride`` states) supplies
+    truths, each anomalised by the subsampled set's own mean so the inter-chunk offset
+    cancels. Scoring and held-out selection follow :func:`_score_ppe_lane`; rows and
+    files are tagged ``ppe``. :func:`run_ppe_pixel_grid` wraps this over the taper grid.
     """
-    os.makedirs(out_dir, exist_ok=True)
-    rng = np.random.default_rng(seed)
-    shape = (len(VARS), len(lats), len(lons))
-    n_cells = len(lats) * len(lons)
-    rep_levels = tuple(float(k) for k in rep_levels)
-    b_scales = tuple(float(b) for b in b_scales)
-    c = np.asarray(c_rep, dtype=np.float64)
-    n_k, n_b = len(rep_levels), len(b_scales)
-
-    held, prior_idx = every_nth_holdout(len(ages), stride)
+    ages_i = np.asarray(ages, dtype=np.int64)
+    prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
     prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
-                        b_reg=b_reg, eof_rank=eof_rank, localization_km=localization_km,
-                        shrinkage_lambda=shrinkage_lambda)
-    clim_mean = prior.clim_mean.astype(np.float64)
-    clim_flat = clim_mean.ravel()
-    safe_valid = prior.safe_valid
-    safe_flat = np.broadcast_to(safe_valid, shape).ravel()
-    s_flat = representativeness_variance(clim_mean, safe_valid).ravel()
-    tv = ThreeDVar(prior.B, shape)
-
-    truth_anoms, post_var = [], []
-    recon = {bg: [] for bg in BACKGROUNDS}              # each item (n_k, n_b, 2, n_lat, n_lon)
-    naive = {"nearest": [], "idw": []}                 # each item (n_k, 2, n_lat, n_lon)
-    truth_ages, dist_per_truth = [], []
-    bg_per_age = []                                     # the per-age first guess per truth
-
-    for ti in held:
-        truth_age = int(ages[ti])
-        o = observations_at_age(long, truth_age)
-        if len(o.get("age", [])) == 0:
-            continue
-        geom = _obs_geometry(o, lats, lons, safe_flat)
-        g = geom["gather"]
-        if len(g) == 0:
-            continue
-
-        truth = cube[ti].astype(np.float64)
-        truth_anom = truth - clim_mean
-        truth_at_obs = truth.ravel()[g] - clim_flat[g]
-        rep_obs = c[g // n_cells] * s_flat[g]            # w variance, c*rep_var per obs
-
-        backgrounds = {
-            "climatological": np.zeros(int(np.prod(shape))),
-            "per_age": cube[int(np.searchsorted(ages, per_age_neighbour(truth_age, prior.ages, offset_yr)))].ravel() - clim_flat,
-        }
-        r_diag = r_diagonal(g, geom["sse"], s_flat, c, n_cells)
-        gain = tv.prepare_sweep(g, r_diag, b_scales)
-        naive_geom = _naive_geometry(lats, lons, geom, len(VARS))
-
-        sum_recon = {bg: np.zeros((n_k, n_b, *shape)) for bg in BACKGROUNDS}
-        sum_naive = {kind: np.zeros((n_k, *shape)) for kind in naive}
-        for _ in range(n_noise):
-            e = rng.normal(0.0, np.sqrt(geom["sse"]))
-            w = rng.normal(0.0, np.sqrt(rep_obs))
-            for ki, k in enumerate(rep_levels):
-                y_k = truth_at_obs + k * (e + w)
-                for bg, bg_anom in backgrounds.items():
-                    res = tv.apply_sweep(gain, y_k, bg_anom)
-                    for bj in range(n_b):
-                        sum_recon[bg][ki, bj] += res[bj].mean_anom
-                for kind in naive:
-                    sum_naive[kind][ki] += _naive_apply(kind, naive_geom, y_k, shape)
-
-        truth_anoms.append(truth_anom)
-        post_var.append(tv.post_var_sweep(gain).reshape(n_b, *shape))   # (n_b, ...), rep-level free
-        truth_ages.append(truth_age)
-        bg_per_age.append(backgrounds["per_age"].reshape(shape))
-        for bg in BACKGROUNDS:
-            recon[bg].append(sum_recon[bg] / n_noise)
-        for kind in naive:
-            naive[kind].append(sum_naive[kind] / n_noise)
-        dist_per_truth.append(da.nearest_obs_distance(lats, lons, geom["lat"], geom["lon"]))
-
-    truth_anoms = np.stack(truth_anoms)                # (T, 2, n_lat, n_lon)
-    post_var = np.stack(post_var)                      # (T, n_b, 2, n_lat, n_lon)
-    truth_ages = np.asarray(truth_ages)
-    events = assign_event_label(truth_ages)
-    recon = {bg: np.stack(v) for bg, v in recon.items()}   # (T, n_k, n_b, 2, n_lat, n_lon)
-    naive = {kind: np.stack(v) for kind, v in naive.items()}  # (T, n_k, 2, n_lat, n_lon)
-    bg_per_age = np.stack(bg_per_age)                       # (T, 2, n_lat, n_lon)
-
-    # Metric rows: 3DVar over (rep_level, b_scale); naive baselines are B-free.
-    rows = []
-    tv_safe = truth_anoms[:, :, safe_valid]
-    for ki, k in enumerate(rep_levels):
-        for bj, kb in enumerate(b_scales):
-            meta = {"method": "3dvar", "B_reg": b_reg, "lane": "ppe", "fold": -1,
-                    "rep_K": k, "b_scale": kb}
-            pv_safe = np.broadcast_to(post_var[:, bj][:, :, safe_valid].clip(1e-12, None),
-                                      tv_safe.shape)
-            for bg in BACKGROUNDS:
-                base = {**meta, "background": bg}
-                rows += _skill_rows(truth_anoms, recon[bg][:, ki, bj], safe_valid, events, base)
-                rows += _ssim_rows(truth_anoms, recon[bg][:, ki, bj], safe_valid, events, base)
-                bias, disp = da.rcrv(tv_safe, recon[bg][:, ki, bj][:, :, safe_valid], pv_safe)
-                rows.append({**base, "do_event": "all", "channel": "pooled",
-                             "metric": "rcrv_bias", "value": bias})
-                rows.append({**base, "do_event": "all", "channel": "pooled",
-                             "metric": "rcrv_disp", "value": disp})
-        for kind in naive:
-            base = {"method": kind, "B_reg": "none", "lane": "ppe", "fold": -1,
-                    "rep_K": k, "b_scale": 1.0, "background": "none"}
-            rows += _skill_rows(truth_anoms, naive[kind][:, ki], safe_valid, events, base)
-            rows += _ssim_rows(truth_anoms, naive[kind][:, ki], safe_valid, events, base)
-
-    # Skill vs distance to nearest observation, per background, rep_level, and b_scale.
-    if dist_edges_km is None:
-        dist_edges_km = np.array([0, 500, 1000, 2000, 3000, 5000, 8000, 20000], dtype=float)
-    dist = np.stack(dist_per_truth)                          # (T, n_lat*n_lon)
-    cell_mask = safe_valid.ravel()
-    dist_pool = np.tile(dist[:, cell_mask], (1, len(VARS))).ravel()
-    t_pool = tv_safe.reshape(len(truth_ages), -1).ravel()
-    curves = {}
-    for bg in BACKGROUNDS:
-        ce = np.array([[da.skill_vs_distance(
-            t_pool, recon[bg][:, ki, bj][:, :, safe_valid].reshape(len(truth_ages), -1).ravel(),
-            np.zeros_like(t_pool), dist_pool, dist_edges_km)["ce"]
-            for bj in range(n_b)] for ki in range(n_k)])
-        curves[bg] = ce                                      # (n_k, n_b, n_bins)
-
-    _append_csv(os.path.join(out_dir, "metrics.csv"), rows)
-    np.savez_compressed(
-        os.path.join(out_dir, "ppe_analysis.npz"),
-        truth_anom=truth_anoms, clim_mean=clim_mean, safe_valid=safe_valid,
-        post_var=np.moveaxis(post_var, 0, 1), prior_var=tv.diagB.reshape(shape),  # (n_b, T, ...)
-        background_per_age=bg_per_age, truth_ages=truth_ages, events=events,
-        rep_levels=np.asarray(rep_levels), b_scales=np.asarray(b_scales),
-        **{f"recon_{bg}": np.moveaxis(recon[bg], 0, 2) for bg in BACKGROUNDS},  # (n_k, n_b, T, ...)
-        **{f"naive_{k}": np.moveaxis(naive[k], 1, 0) for k in naive},           # (n_k, T, ...)
-    )
-    np.savez_compressed(os.path.join(out_dir, "ppe_skill_vs_distance.npz"),
-                        edges=dist_edges_km, rep_levels=np.asarray(rep_levels),
-                        b_scales=np.asarray(b_scales),
-                        **{bg: curves[bg] for bg in BACKGROUNDS})
-    with open(os.path.join(out_dir, "config.json"), "w") as f:
-        json.dump({"lane": "ppe", "b_reg": b_reg, "eof_rank": eof_rank,
-                   "localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
-                   "stride": stride, "offset_yr": offset_yr, "n_noise": n_noise,
-                   "rep_levels": list(rep_levels), "c_rep": list(c_rep),
-                   "b_scales": list(b_scales), "seed": seed,
-                   "prior_meta": prior.meta}, f, indent=2)
+                        localization_km=localization_km, shrinkage_lambda=shrinkage_lambda,
+                        alpha=alpha)
+    truth_cube = cube[truth_idx].astype(np.float64)
+    truth_clim = truth_cube.mean(axis=0)
+    truth_anoms = truth_cube - truth_clim
+    reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
+                "alpha": alpha}
+    rows, npz_arrays, skill = _score_ppe_lane(
+        truth_anoms, prior, long, lats, lons,
+        lane=LANE_PPE, make_method=make_method, space=space, reg_cols=reg_cols,
+        b_scales=b_scales, n_shapes=n_shapes, n_select=n_select, n_noise=n_noise,
+        dist_edges_km=dist_edges_km, seed=seed, npz_extra={"truth_clim": truth_clim},
+        progress_every=progress_every)
+    config = _ppe_config(LANE_PPE, space, prior, len(truth_anoms), n_shapes, n_select,
+                         n_noise, b_scales, seed, reg_cols,
+                         _chronological_split_meta(ages_i, prior_idx, truth_idx, truth_stride))
+    _write_ppe_artifacts(out_dir, LANE_PPE, rows, npz_arrays, skill, config)
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------------------
-# Imperfect-model PPE: out-of-distribution truths from another model.
-# ---------------------------------------------------------------------------
-def run_ppe_imperfect(
-    truth_cube: np.ndarray, cube: np.ndarray, ages: np.ndarray,
-    lats: np.ndarray, lons: np.ndarray, valid: np.ndarray,
-    long: pd.DataFrame, out_dir: str, *,
-    b_reg: str = "raw", eof_rank: int | None = None, localization_km: float | None = None,
-    shrinkage_lambda: float | None = None,
-    rep_levels: tuple[float, ...] = (1.0, 1.5, 2.0, 2.5, 3.0),
-    c_rep: tuple[float, ...] = C_REP, b_scales: tuple[float, ...] = B_SCALES,
-    dist_edges_km: np.ndarray | None = None, seed: int = 0,
-) -> pd.DataFrame:
-    """PPE scoring a LOVECLIM prior against out-of-distribution truths from another model.
+def _chronological_split_meta(ages_i, prior_idx, truth_idx, truth_stride):
+    """Split-provenance keys for a same-model PPE config.json."""
+    return {"split": "chronological_midpoint", "prior_half": "older",
+            "split_index": int(prior_idx[0]), "truth_stride": int(truth_stride),
+            "chunk_a_ages": [int(ages_i[prior_idx].min()), int(ages_i[prior_idx].max())],
+            "chunk_b_ages": [int(ages_i[truth_idx].min()), int(ages_i[truth_idx].max())]}
 
-    ``truth_cube`` is an external ``(n, 2, n_lat, n_lon)`` degC stack on the prior
-    grid. B and the climatology come from the full ``cube`` with no holdout (the
-    truths are not LOVECLIM states); each truth is anomalised by its OWN mean so the
-    cross-model offset cancels and the test is whether the prior covariance
-    reconstructs the truth's variability. Each truth borrows a randomly drawn real
-    proxy age's network geometry (cells and sse); the obs values come from the truth.
-    Single climatological background. Persists the same artifacts as :func:`run_ppe`.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    rng = np.random.default_rng(seed)
-    shape = (len(VARS), len(lats), len(lons))
-    n_cells = len(lats) * len(lons)
-    rep_levels = tuple(float(k) for k in rep_levels)
-    b_scales = tuple(float(b) for b in b_scales)
-    c = np.asarray(c_rep, dtype=np.float64)
-    n_k, n_b = len(rep_levels), len(b_scales)
 
-    prior = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid,
-                        b_reg=b_reg, eof_rank=eof_rank, localization_km=localization_km,
-                        shrinkage_lambda=shrinkage_lambda)
-    clim_mean = prior.clim_mean.astype(np.float64)
-    safe_valid = prior.safe_valid
-    safe_flat = np.broadcast_to(safe_valid, shape).ravel()
-    s_flat = representativeness_variance(clim_mean, safe_valid).ravel()
-    tv = ThreeDVar(prior.B, shape)
-
-    truth_cube = np.asarray(truth_cube, dtype=np.float64)
-    ccsm4_clim = truth_cube.mean(axis=0)                 # own-mean frame, cross-model bias removed
-    truth_anom_cube = truth_cube - ccsm4_clim
-    zero_bg = np.zeros(int(np.prod(shape)))
-
-    truth_anoms, post_var = [], []
-    recon = []                                           # each item (n_k, n_b, 2, n_lat, n_lon)
-    naive = {"nearest": [], "idw": []}
-    dist_per_truth, drawn_ages = [], []
-
-    for truth_anom in truth_anom_cube:
-        k_age = _draw_usable_age(long, rng, lats, lons, safe_flat)
-        o = observations_at_age(long, k_age)
-        geom = _obs_geometry(o, lats, lons, safe_flat)
-        g = geom["gather"]
-        truth_at_obs = truth_anom.ravel()[g]             # obs values from the truth, H = nearest cell
-        rep_obs = c[g // n_cells] * s_flat[g]
-        r_diag = r_diagonal(g, geom["sse"], s_flat, c, n_cells)
-        gain = tv.prepare_sweep(g, r_diag, b_scales)
-        naive_geom = _naive_geometry(lats, lons, geom, len(VARS))
-
-        e = rng.normal(0.0, np.sqrt(geom["sse"]))
-        w = rng.normal(0.0, np.sqrt(rep_obs))
-        sum_recon = np.zeros((n_k, n_b, *shape))
-        sum_naive = {kind: np.zeros((n_k, *shape)) for kind in naive}
-        for ki, k in enumerate(rep_levels):
-            y_k = truth_at_obs + k * (e + w)
-            res = tv.apply_sweep(gain, y_k, zero_bg)
-            for bj in range(n_b):
-                sum_recon[ki, bj] = res[bj].mean_anom
-            for kind in naive:
-                sum_naive[kind][ki] = _naive_apply(kind, naive_geom, y_k, shape)
-
-        truth_anoms.append(truth_anom)
-        post_var.append(tv.post_var_sweep(gain).reshape(n_b, *shape))
-        recon.append(sum_recon)
-        for kind in naive:
-            naive[kind].append(sum_naive[kind])
-        dist_per_truth.append(da.nearest_obs_distance(lats, lons, geom["lat"], geom["lon"]))
-        drawn_ages.append(k_age)
-
-    truth_anoms = np.stack(truth_anoms)                  # (T, 2, n_lat, n_lon)
-    post_var = np.stack(post_var)                        # (T, n_b, 2, n_lat, n_lon)
-    recon = np.stack(recon)                              # (T, n_k, n_b, 2, n_lat, n_lon)
-    naive = {kind: np.stack(v) for kind, v in naive.items()}
-    events = np.zeros(len(truth_anoms), dtype=np.int64)  # no DO-event labels for external truths
-
-    rows = []
-    tv_safe = truth_anoms[:, :, safe_valid]
-    for ki, k in enumerate(rep_levels):
-        for bj, kb in enumerate(b_scales):
-            base = {"method": "3dvar", "B_reg": b_reg, "lane": LANE_IMPERFECT, "fold": -1,
-                    "rep_K": k, "b_scale": kb, "background": "climatological"}
-            pv_safe = np.broadcast_to(post_var[:, bj][:, :, safe_valid].clip(1e-12, None),
-                                      tv_safe.shape)
-            rows += _skill_rows(truth_anoms, recon[:, ki, bj], safe_valid, events, base)
-            rows += _ssim_rows(truth_anoms, recon[:, ki, bj], safe_valid, events, base)
-            bias, disp = da.rcrv(tv_safe, recon[:, ki, bj][:, :, safe_valid], pv_safe)
-            rows.append({**base, "do_event": "all", "channel": "pooled",
-                         "metric": "rcrv_bias", "value": bias})
-            rows.append({**base, "do_event": "all", "channel": "pooled",
-                         "metric": "rcrv_disp", "value": disp})
-        for kind in naive:
-            base = {"method": kind, "B_reg": "none", "lane": LANE_IMPERFECT, "fold": -1,
-                    "rep_K": k, "b_scale": 1.0, "background": "none"}
-            rows += _skill_rows(truth_anoms, naive[kind][:, ki], safe_valid, events, base)
-            rows += _ssim_rows(truth_anoms, naive[kind][:, ki], safe_valid, events, base)
-
-    if dist_edges_km is None:
-        dist_edges_km = np.array([0, 500, 1000, 2000, 3000, 5000, 8000, 20000], dtype=float)
-    dist = np.stack(dist_per_truth)
-    cell_mask = safe_valid.ravel()
-    dist_pool = np.tile(dist[:, cell_mask], (1, len(VARS))).ravel()
-    t_pool = tv_safe.reshape(len(truth_anoms), -1).ravel()
-    curve = np.array([[da.skill_vs_distance(
-        t_pool, recon[:, ki, bj][:, :, safe_valid].reshape(len(truth_anoms), -1).ravel(),
-        np.zeros_like(t_pool), dist_pool, dist_edges_km)["ce"]
-        for bj in range(n_b)] for ki in range(n_k)])     # (n_k, n_b, n_bins)
-
-    _append_csv(os.path.join(out_dir, "metrics.csv"), rows)
-    np.savez_compressed(
-        os.path.join(out_dir, "ppe_imperfect_analysis.npz"),
-        truth_anom=truth_anoms, clim_mean=clim_mean, ccsm4_clim=ccsm4_clim,
-        safe_valid=safe_valid, post_var=np.moveaxis(post_var, 0, 1),       # (n_b, T, ...)
-        prior_var=tv.diagB.reshape(shape), drawn_ages=np.asarray(drawn_ages),
-        rep_levels=np.asarray(rep_levels), b_scales=np.asarray(b_scales),
-        recon_climatological=np.moveaxis(recon, 0, 2),                     # (n_k, n_b, T, ...)
-        **{f"naive_{k}": np.moveaxis(naive[k], 1, 0) for k in naive},      # (n_k, T, ...)
-    )
-    np.savez_compressed(os.path.join(out_dir, "ppe_imperfect_skill_vs_distance.npz"),
-                        edges=dist_edges_km, rep_levels=np.asarray(rep_levels),
-                        b_scales=np.asarray(b_scales), climatological=curve)
-    with open(os.path.join(out_dir, "ppe_imperfect_config.json"), "w") as f:
-        json.dump({"lane": LANE_IMPERFECT, "b_reg": b_reg, "eof_rank": eof_rank,
-                   "localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
-                   "n_truths": int(len(truth_anoms)), "rep_levels": list(rep_levels),
-                   "c_rep": list(c_rep), "b_scales": list(b_scales), "seed": seed,
-                   "prior_meta": prior.meta}, f, indent=2)
-    return pd.DataFrame(rows)
+def _ppe_config(lane, space, prior, n_truths, n_shapes, n_select, n_noise,
+                b_scales, seed, reg_cols, split_meta, extra=None):
+    """Assemble a PPE lane config.json dict (single-config or grid winner)."""
+    cfg = {"lane": lane, "space": space, **reg_cols,
+           "n_truths": int(n_truths), "n_shapes": n_shapes, "n_select": n_select,
+           "n_noise": n_noise, "b_scales": [float(b) for b in b_scales], "seed": seed,
+           "prior_meta": prior.meta, **split_meta}
+    if extra:
+        cfg.update(extra)
+    return cfg
 
 
 # ---------------------------------------------------------------------------
 # Real-proxy withholding.
 # ---------------------------------------------------------------------------
 def _site_folds(long: pd.DataFrame, k: int, kind: str, seed: int) -> list[np.ndarray]:
-    """Partition sites into ``k`` folds, randomly or by spatial cluster."""
+    """Partition sites into ``k`` folds."""
     sites = long.groupby("site").agg(lat=("lat", "first"), lon=("lon", "first")).reset_index()
     ids = sites["site"].to_numpy()
     if kind == "random":
         rng = np.random.default_rng(seed)
         return [f for f in np.array_split(rng.permutation(ids), k)]
-    if kind == "spatial":
-        from sklearn.cluster import KMeans
-        labels = KMeans(n_clusters=k, random_state=seed, n_init=10).fit_predict(
-            sites[["lat", "lon"]].to_numpy()
-        )
-        return [ids[labels == c] for c in range(k)]
     raise ValueError(f"unknown fold kind {kind!r}")
 
 
@@ -578,255 +595,430 @@ def _withholding_rows(actual: np.ndarray, pred: np.ndarray, channel: np.ndarray,
             ("corr", da.pearson_r(a, p)),
             ("rmse", da.rmse(a, p)),
             ("rrmse", da.relative_rmse(a, p)),
+            ("amplitude", da.amplitude_ratio(a, p)),
         ):
             rows.append({**base, "do_event": "all", "channel": chan_name,
                          "metric": metric, "value": value})
     return rows
 
 
-def run_withholding(
-    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
-    valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
-    b_reg: str = "raw", eof_rank: int | None = None, localization_km: float | None = None,
-    shrinkage_lambda: float | None = None,
-    k_folds: int = 5, fold_kind: str = "random", c_rep: tuple[float, ...] = C_REP,
-    b_scales: tuple[float, ...] = B_SCALES, seed: int = 0,
-) -> pd.DataFrame:
-    """Withhold whole sites, assimilate the rest, score predictions at withheld sites.
+def _obs_channel_groups(channel: np.ndarray) -> list:
+    """``(do_event, channel_name, mask)`` triples for observation-space calibration.
 
-    ``long`` must carry per-site climatology ``my`` (real observations enter in
-    anomaly space ``y - my`` so the proxy-vs-model offset cancels). The prior uses
-    all ages: the held-out quantity is real proxies, not model states. R is the
-    augmented ``diag(sse) + diag(c*rep_var)``; ``b_scales`` scales B per value.
+    Real proxies carry no D-O event label, so the event axis stays ``all`` and only the
+    channel breakdown varies.
     """
-    os.makedirs(out_dir, exist_ok=True)
-    shape = (len(VARS), len(lats), len(lons))
-    n_cells = len(lats) * len(lons)
-    b_scales = tuple(float(b) for b in b_scales)
-    c = np.asarray(c_rep, dtype=np.float64)
-    n_b = len(b_scales)
-    prior = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid,
-                        b_reg=b_reg, eof_rank=eof_rank, localization_km=localization_km,
-                        shrinkage_lambda=shrinkage_lambda)
-    clim_flat = prior.clim_mean.astype(np.float64).ravel()
-    safe_flat = np.broadcast_to(prior.safe_valid, shape).ravel()
-    rep_flat = representativeness_variance(prior.clim_mean.astype(np.float64), prior.safe_valid).ravel()
-    tv = ThreeDVar(prior.B, shape)
-
-    obs_ages = np.intersect1d(long["age"].unique(), ages)
-    folds = _site_folds(long, k_folds, fold_kind, seed)
-    lane = f"withholding_{fold_kind}"
-
-    rows = []
-    pooled = {"actual": [], "channel": [], "pred": {bg: [] for bg in BACKGROUNDS}}
-    for f, withheld in enumerate(folds):
-        wset = set(withheld.tolist())
-        per_fold = {"actual": [], "channel": [], "pred": {bg: [] for bg in BACKGROUNDS}}
-        for age in obs_ages:
-            o = observations_at_age(long, int(age))
-            gather = obs_cell_index(o["lat"], o["lon"], o["channel"], lats, lons)
-            keep = safe_flat[gather] & (o["sse"] > 0) & np.isfinite(o["my"])
-            is_w = np.array([s in wset for s in o["site"]])
-            kept = keep & ~is_w
-            wkeep = keep & is_w
-            if kept.sum() == 0 or wkeep.sum() == 0:
-                continue
-
-            y_anom = (o["y"][kept] - o["my"][kept]).astype(np.float64)
-            r_diag = r_diagonal(gather[kept], o["sse"][kept].astype(np.float64),
-                                rep_flat, c, n_cells)
-            gain = tv.prepare_sweep(gather[kept], r_diag, b_scales)
-            ai = int(np.searchsorted(ages, age))
-            backgrounds = {
-                "climatological": np.zeros(int(np.prod(shape))),
-                "per_age": cube[ai].ravel() - clim_flat,
-            }
-            gw = gather[wkeep]
-            per_fold["actual"].append((o["y"][wkeep] - o["my"][wkeep]).astype(np.float64))
-            per_fold["channel"].append(gw // n_cells)
-            for bg, bg_anom in backgrounds.items():
-                res = tv.apply_sweep(gain, y_anom, bg_anom)
-                per_fold["pred"][bg].append(np.stack([res[bj].predict_obs(gw) for bj in range(n_b)]))
-
-        a = np.concatenate(per_fold["actual"])
-        ch = np.concatenate(per_fold["channel"])
-        for bg in BACKGROUNDS:
-            p = np.concatenate(per_fold["pred"][bg], axis=1)          # (n_b, n_w)
-            for bj, kb in enumerate(b_scales):
-                rows += _withholding_rows(a, p[bj], ch, {"method": "3dvar", "B_reg": b_reg,
-                                                         "lane": lane, "fold": f, "rep_K": 0.0,
-                                                         "b_scale": kb, "background": bg})
-            pooled["pred"][bg].append(p)
-        pooled["actual"].append(a)
-        pooled["channel"].append(ch)
-
-    a = np.concatenate(pooled["actual"])
-    ch = np.concatenate(pooled["channel"])
-    dumps = {"actual": a, "channel": ch, "b_scales": np.asarray(b_scales)}
-    for bg in BACKGROUNDS:
-        p = np.concatenate(pooled["pred"][bg], axis=1)                # (n_b, n_w)
-        for bj, kb in enumerate(b_scales):
-            rows += _withholding_rows(a, p[bj], ch, {"method": "3dvar", "B_reg": b_reg,
-                                                     "lane": lane, "fold": -1, "rep_K": 0.0,
-                                                     "b_scale": kb, "background": bg})
-        dumps[f"{bg}_pred"] = p
-
-    _append_csv(os.path.join(out_dir, "metrics.csv"), rows)
-    np.savez_compressed(os.path.join(out_dir, f"{lane}_predictions.npz"), **dumps)
-    with open(os.path.join(out_dir, f"{lane}_config.json"), "w") as fh:
-        json.dump({"lane": lane, "b_reg": b_reg, "eof_rank": eof_rank,
-                   "localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
-                   "k_folds": k_folds, "fold_kind": fold_kind, "c_rep": list(c_rep),
-                   "b_scales": list(b_scales), "seed": seed,
-                   "prior_meta": prior.meta}, fh, indent=2)
-    return pd.DataFrame(rows)
+    groups = [("all", "pooled", np.ones(len(channel), dtype=bool))]
+    return groups + [("all", name, channel == c) for c, name in enumerate(VARS)]
 
 
-# ---------------------------------------------------------------------------
-# LMR-style Monte Carlo proxy-resampling ensemble.
-# ---------------------------------------------------------------------------
-def _mean_posterior_var_field(
-    tv: ThreeDVar, long: pd.DataFrame, obs_ages: np.ndarray,
-    lats: np.ndarray, lons: np.ndarray, safe_flat: np.ndarray, shape: tuple[int, int, int],
-    rep_flat: np.ndarray, c: np.ndarray, b_scales: tuple[float, ...],
-) -> np.ndarray:
-    """Full-network posterior variance per b_scale, averaged over the observed ages.
+@dataclass(frozen=True)
+class _TargetPredictions:
+    """Withheld-site predictions for one assim/target split, pooled over ages.
 
-    The analysis variance depends only on the network, B, and R, not on the values
-    assimilated, so this is the analysis uncertainty a single realization sees
-    before any sites are withheld. Returns ``(n_b_scale, *shape)``.
+    ``pred`` and ``post_var`` are ``(n_b, N)``, one row per ``b_scale``; the rest are
+    ``(N,)``. ``prior_var`` is the background variance at each target cell, which is the
+    CRPSS reference; ``distance_km`` is how far the site sits from the nearest
+    assimilated one, the axis that separates interpolation from extrapolation.
     """
-    n_cells = shape[1] * shape[2]
-    acc = np.zeros((len(b_scales), *shape))
-    n = 0
+
+    actual: np.ndarray
+    channel: np.ndarray
+    sse: np.ndarray
+    pred: np.ndarray
+    post_var: np.ndarray
+    prior_var: np.ndarray
+    naive: dict
+    distance_km: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.actual)
+
+
+def _predict_targets(
+    tv: Method, long: pd.DataFrame, obs_ages: np.ndarray,
+    lats: np.ndarray, lons: np.ndarray, safe_flat: np.ndarray, clim_flat: np.ndarray,
+    assim_sites: set, target_sites: set, b_scales: tuple[float, ...],
+    n_b: int, n_cells: int,
+) -> _TargetPredictions:
+    """Assimilate the assim-set sites age by age, predict the target-set sites.
+
+    Climatological background (zero anomaly), R = ``diag(sse)``. Observations enter in
+    anomaly space ``y - my`` so the proxy-vs-model offset cancels. A withheld observation
+    is scored only when its own age also carries an assimilated one, so an age holding
+    just one side of the split contributes nothing.
+    """
+    bg_zero = np.zeros(len(clim_flat))
+    actual, channel, sse, pred, post_var, prior_var, dist = [], [], [], [], [], [], []
+    naive = {"nearest": [], "idw": []}
     for age in obs_ages:
         o = observations_at_age(long, int(age))
         gather = obs_cell_index(o["lat"], o["lon"], o["channel"], lats, lons)
         keep = safe_flat[gather] & (o["sse"] > 0) & np.isfinite(o["my"])
-        if keep.sum() == 0:
+        kept = keep & np.array([s in assim_sites for s in o["site"]])
+        wkeep = keep & np.array([s in target_sites for s in o["site"]])
+        if kept.sum() == 0 or wkeep.sum() == 0:
             continue
-        r_diag = r_diagonal(gather[keep], o["sse"][keep].astype(np.float64), rep_flat, c, n_cells)
-        gain = tv.prepare_sweep(gather[keep], r_diag, b_scales)
-        acc += tv.post_var_sweep(gain).reshape(len(b_scales), *shape)
-        n += 1
-    return acc / max(n, 1)
+        y_anom = (o["y"][kept] - o["my"][kept]).astype(np.float64)
+        gk, gw = gather[kept], gather[wkeep]
+        gain = tv.prepare_sweep(gk, o["sse"][kept].astype(np.float64), b_scales)
+        res = tv.apply_sweep(gain, y_anom, bg_zero)
+
+        actual.append((o["y"][wkeep] - o["my"][wkeep]).astype(np.float64))
+        channel.append(gw // n_cells)
+        sse.append(o["sse"][wkeep].astype(np.float64))
+        pred.append(np.stack([res[bj].predict_obs(gw) for bj in range(n_b)]))
+        post_var.append(np.stack([res[bj].predict_obs_var(gw) for bj in range(n_b)]))
+        prior_var.append(tv.diagB[gw])
+        nv, d = _naive_obs_predictions(
+            {"lat": o["lat"][kept], "lon": o["lon"][kept], "y": y_anom,
+             "chan": gk // n_cells},
+            {"lat": o["lat"][wkeep], "lon": o["lon"][wkeep], "chan": gw // n_cells},
+            len(VARS))
+        for kind in naive:
+            naive[kind].append(nv[kind])
+        dist.append(d)
+
+    if not actual:
+        empty = np.array([])
+        return _TargetPredictions(empty, empty, empty, np.zeros((n_b, 0)),
+                                  np.zeros((n_b, 0)), empty,
+                                  {k: empty for k in naive}, empty)
+    return _TargetPredictions(
+        actual=np.concatenate(actual), channel=np.concatenate(channel),
+        sse=np.concatenate(sse), pred=np.concatenate(pred, axis=1),
+        post_var=np.concatenate(post_var, axis=1),
+        prior_var=np.concatenate(prior_var),
+        naive={k: np.concatenate(v) for k, v in naive.items()},
+        distance_km=np.concatenate(dist))
 
 
-def run_montecarlo_withholding(
+def _concat_targets(parts: list[_TargetPredictions]) -> _TargetPredictions:
+    """Pool several folds' predictions, keeping the ``(n_b, N)`` sweep axis leading."""
+    return _TargetPredictions(
+        actual=np.concatenate([p.actual for p in parts]),
+        channel=np.concatenate([p.channel for p in parts]),
+        sse=np.concatenate([p.sse for p in parts]),
+        pred=np.concatenate([p.pred for p in parts], axis=1),
+        post_var=np.concatenate([p.post_var for p in parts], axis=1),
+        prior_var=np.concatenate([p.prior_var for p in parts]),
+        naive={k: np.concatenate([p.naive[k] for p in parts]) for k in parts[0].naive},
+        distance_km=np.concatenate([p.distance_km for p in parts]))
+
+
+def _score_withholding_lane(
+    prior: Prior, long: pd.DataFrame, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+    *, make_method: MethodFactory | None, space: str, reg_cols: dict,
+    k_folds: int, fold_kind: str, b_scales: tuple[float, ...], seed: int,
+    progress_every: int | None = None,
+) -> tuple[str, list[dict], dict]:
+    """Nested-CV site withholding for one built prior (no file writes).
+
+    Returns ``(lane, rows, predictions)``. Two passes over the same ``k_folds`` site
+    partition, tagged with a ``split`` column so the operating point is chosen on held-out
+    predictions and reported on a disjoint fold. The selection pass (``split='selection'``)
+    assimilates 3 folds and predicts a 4th (the val fold, rotated so every fold is val
+    once), pooling those predictions across the rotation. The reporting pass
+    (``split='test'``) assimilates 4 folds and predicts the 5th, per fold and pooled. A
+    fold serves as a val target in one rotation and a test target in another, so for a
+    single global operating point a mild dependence remains; the reported test predictions
+    are never scored during selection. Observations enter in anomaly space ``y - my``;
+    R is ``diag(sse)``; the background is climatological. ``space``/``reg_cols`` tag the
+    rows.
+
+    Alongside the skill rows each ``b_scale`` carries calibration scored against the
+    proxy, whose own error joins the posterior spread since the residual holds both. The
+    pooled test set also yields prior-free ``nearest``/``idw`` rows, emitted once because
+    they depend on neither the taper nor ``b_scale``, and the predictions dict keeps the
+    posterior and prior variance, the proxy error, and the distance to the nearest
+    assimilated site so calibration and skill-vs-void can be rebuilt without a re-run.
+    """
+    shape = (len(VARS), len(lats), len(lons))
+    n_cells = len(lats) * len(lons)
+    b_scales = tuple(float(b) for b in b_scales)
+    n_b = len(b_scales)
+    clim_flat = prior.clim_mean.astype(np.float64).ravel()
+    safe_flat = np.broadcast_to(prior.safe_valid, shape).ravel()
+    tv = ThreeDVar(prior.B, shape) if make_method is None else make_method(prior, shape)
+
+    obs_ages = np.intersect1d(long["age"].unique(), ages)
+    fold_sets = [set(f.tolist()) for f in _site_folds(long, k_folds, fold_kind, seed)]
+    all_sites = set(long["site"].unique().tolist())
+    lane = f"withholding_{fold_kind}"
+
+    def _rows(tp: _TargetPredictions, fold: int, split: str) -> list[dict]:
+        """Skill and calibration rows over the b_scale sweep for one prediction set."""
+        out = []
+        groups = _obs_channel_groups(tp.channel)
+        for bj, kb in enumerate(b_scales):
+            base = {"method": "3dvar", "space": space, **reg_cols, "lane": lane,
+                    "fold": fold, "b_scale": kb, "background": "climatological",
+                    "split": split}
+            out += _withholding_rows(tp.actual, tp.pred[bj], tp.channel, base)
+            # The truth is itself a measurement, so its error joins the posterior spread;
+            # the prior reference carries the same term to stay comparable.
+            out += _calibration_rows(tp.actual, tp.pred[bj], tp.post_var[bj] + tp.sse,
+                                     kb * tp.prior_var + tp.sse, groups, base)
+        return out
+
+    def _naive_rows(tp: _TargetPredictions) -> list[dict]:
+        """Prior-free reference rows, emitted once: they carry no b_scale and no spread."""
+        out = []
+        for kind, pred in tp.naive.items():
+            out += _withholding_rows(tp.actual, pred, tp.channel, {
+                "method": kind, "space": space, **_NAN_REG, "lane": lane, "fold": -1,
+                "b_scale": 1.0, "background": "none", "split": "test"})
+        return out
+
+    rows = []
+
+    # Selection: assimilate 3 folds, predict the val fold; pool across the rotation.
+    sel = []
+    t0 = time.time()
+    for i in range(k_folds):
+        assim = all_sites - fold_sets[(i + 1) % k_folds] - fold_sets[i]
+        tp = _predict_targets(tv, long, obs_ages, lats, lons, safe_flat,
+                              clim_flat, assim, fold_sets[(i + 1) % k_folds],
+                              b_scales, n_b, n_cells)
+        if len(tp):
+            sel.append(tp)
+        if progress_every and (i + 1) % progress_every == 0:
+            _report_progress("sel-fold", i + 1, k_folds, t0)
+    if sel:
+        rows += _rows(_concat_targets(sel), -1, "selection")
+
+    # Reporting: assimilate 4 folds, predict the test fold; per fold and pooled.
+    pooled = []
+    t0 = time.time()
+    for i in range(k_folds):
+        tp = _predict_targets(tv, long, obs_ages, lats, lons, safe_flat,
+                              clim_flat, all_sites - fold_sets[i], fold_sets[i],
+                              b_scales, n_b, n_cells)
+        if not len(tp):
+            continue
+        rows += _rows(tp, i, "test")
+        pooled.append(tp)
+        if progress_every and (i + 1) % progress_every == 0:
+            _report_progress("test-fold", i + 1, k_folds, t0)
+
+    predictions = {"b_scales": np.asarray(b_scales)}
+    if pooled:
+        tp = _concat_targets(pooled)
+        rows += _rows(tp, -1, "test")
+        rows += _naive_rows(tp)
+        predictions.update({
+            "actual": tp.actual, "channel": tp.channel, "climatological_pred": tp.pred,
+            "post_var_pred": tp.post_var, "prior_var_pred": tp.prior_var,
+            "sse": tp.sse, "distance_km": tp.distance_km,
+            "naive_nearest": tp.naive["nearest"], "naive_idw": tp.naive["idw"]})
+    return lane, rows, predictions
+
+
+def _write_withholding_artifacts(out_dir: str, lane: str, rows: list[dict],
+                                 predictions: dict, config: dict) -> None:
+    """Persist a scored withholding lane: metrics CSV (appended), predictions npz, config."""
+    os.makedirs(out_dir, exist_ok=True)
+    _append_csv(os.path.join(out_dir, "metrics.csv"), rows)
+    np.savez_compressed(os.path.join(out_dir, f"{lane}_predictions.npz"), **predictions)
+    with open(os.path.join(out_dir, f"{lane}_config.json"), "w") as fh:
+        json.dump(config, fh, indent=2)
+
+
+def _withholding_config(lane, space, prior, k_folds, fold_kind, b_scales, seed, reg_cols,
+                        extra=None):
+    """Assemble a withholding lane config.json dict (single-config or grid winner)."""
+    cfg = {"lane": lane, "space": space, **reg_cols, "k_folds": k_folds,
+           "fold_kind": fold_kind, "b_scales": [float(b) for b in b_scales],
+           "background": "climatological", "seed": seed, "prior_meta": prior.meta}
+    if extra:
+        cfg.update(extra)
+    return cfg
+
+
+def run_withholding(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
-    b_reg: str = "raw", eof_rank: int | None = None, localization_km: float | None = None,
-    shrinkage_lambda: float | None = None,
-    n_realizations: int = 100, assim_frac: float = 0.75, c_rep: tuple[float, ...] = C_REP,
+    localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
+    make_method: MethodFactory | None = None, space: str = "pixel",
+    k_folds: int = 5, fold_kind: str = "random",
     b_scales: tuple[float, ...] = B_SCALES, seed: int = 0,
     progress_every: int | None = None,
 ) -> pd.DataFrame:
-    """Resample the proxy network many times, assimilate each draw, verify withheld.
+    """Nested-CV site withholding for one taper config.
 
-    Each realization assimilates a random ``assim_frac`` of sites and predicts the
-    rest, all sharing one B (Hakim et al. 2016). The metrics rows carry the
-    per-realization skill (``fold`` 0..n-1) and the skill and calibration of the
-    ensemble-mean prediction (``fold`` -1); the npz artifacts carry the
-    ensemble-mean reconstruction with its across-realization spread and the pooled
-    per-observation ensemble. R is the augmented ``diag(sse) + diag(c*rep_var)``;
-    every product carries a leading b_scale axis. ``long`` must carry ``my``.
+    ``long`` must carry per-site climatology ``my``; the prior uses all ages, as the
+    held-out quantity is real proxies not model states. Scoring follows
+    :func:`_score_withholding_lane`; :func:`run_withholding_pixel_grid` wraps this over
+    the taper grid.
     """
-    os.makedirs(out_dir, exist_ok=True)
-    shape = (len(VARS), len(lats), len(lons))
-    b_scales = tuple(float(b) for b in b_scales)
-    c = np.asarray(c_rep, dtype=np.float64)
-    n_b = len(b_scales)
     prior = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid,
-                        b_reg=b_reg, eof_rank=eof_rank, localization_km=localization_km,
-                        shrinkage_lambda=shrinkage_lambda)
-    clim_mean = prior.clim_mean.astype(np.float64)
-    clim_flat = clim_mean.ravel()
-    safe_flat = np.broadcast_to(prior.safe_valid, shape).ravel()
-    rep_flat = representativeness_variance(clim_mean, prior.safe_valid).ravel()
-    tv = ThreeDVar(prior.B, shape)
-
-    obs_ages = np.intersect1d(long["age"].unique(), ages)
-    partitions = random_site_partitions(long["site"].unique(), n_realizations, assim_frac, seed)
-    lane = "withholding_montecarlo"
-
-    rows, pooled = [], []
-    accum = {(bg, bj): FieldEnsembleAccumulator() for bg in BACKGROUNDS for bj in range(n_b)}
-    for r, withheld in enumerate(partitions):
-        if progress_every and (r + 1) % progress_every == 0:
-            print(f"  realization {r + 1}/{n_realizations}", flush=True)
-        sweep = assimilate_withheld_sweep(tv, long, obs_ages, ages, lats, lons,
-                                          safe_flat, clim_flat, cube, clim_mean, withheld,
-                                          rep_flat, c, b_scales,
-                                          backgrounds=BACKGROUNDS, want_field=True)
-        for bg in BACKGROUNDS:
-            for bj, kb in enumerate(b_scales):
-                accum[(bg, bj)].update(sweep.field[bg][bj])
-                base = {"method": "3dvar", "B_reg": b_reg, "lane": lane, "fold": r,
-                        "rep_K": 0.0, "b_scale": kb, "background": bg}
-                rows += _withholding_rows(sweep.actual, sweep.pred[bg][bj], sweep.channel, base)
-        df = pd.DataFrame({"site": sweep.site, "channel": sweep.channel, "age": sweep.age,
-                           "actual": sweep.actual, "sse": sweep.sse, "rep": sweep.rep})
-        for bj in range(n_b):
-            df[f"post_var_b{bj}"] = sweep.post_var[bj]
-        for bg in BACKGROUNDS:
-            df[f"prior_pred_{bg}"] = sweep.prior_pred[bg]
-            for bj in range(n_b):
-                df[f"pred_{bg}_b{bj}"] = sweep.pred[bg][bj]
-        pooled.append(df)
-
-    # Per-observation ensemble: pool the draws that withheld each (site, channel, age).
-    pooled = pd.concat(pooled, ignore_index=True)
-    grp = pooled.groupby(["site", "channel", "age"])
-    agg = grp.agg(actual=("actual", "first"), sse=("sse", "first"), rep=("rep", "first"),
-                  n=("actual", "size")).reset_index()
-    for bj in range(n_b):
-        agg[f"post_var_b{bj}"] = grp[f"post_var_b{bj}"].mean().to_numpy()
-    for bg in BACKGROUNDS:
-        # The background first guess at a withheld cell does not vary across draws.
-        agg[f"prior_pred_{bg}"] = grp[f"prior_pred_{bg}"].first().to_numpy()
-        for bj in range(n_b):
-            agg[f"ens_mean_{bg}_b{bj}"] = grp[f"pred_{bg}_b{bj}"].mean().to_numpy()
-            agg[f"ens_std_{bg}_b{bj}"] = grp[f"pred_{bg}_b{bj}"].std(ddof=0).to_numpy()
-
-    actual = agg["actual"].to_numpy()
-    channel = agg["channel"].to_numpy()
-    obs_err = (agg["sse"] + agg["rep"]).to_numpy()                    # sse + c*rep_var at withheld cell
-    post_v = np.stack([agg[f"post_var_b{bj}"].to_numpy() for bj in range(n_b)])
-    dumps = {"n_withheld_per_obs": agg["n"].to_numpy(), "actual": actual,
-             "channel": channel, "b_scales": np.asarray(b_scales)}
-    for bg in BACKGROUNDS:
-        ens_mean = np.stack([agg[f"ens_mean_{bg}_b{bj}"].to_numpy() for bj in range(n_b)])
-        ens_std = np.stack([agg[f"ens_std_{bg}_b{bj}"].to_numpy() for bj in range(n_b)])
-        total_var = (ens_std ** 2 + post_v + obs_err[None, :]).clip(1e-12, None)
-        for bj, kb in enumerate(b_scales):
-            base = {"method": "3dvar", "B_reg": b_reg, "lane": lane, "fold": -1,
-                    "rep_K": 0.0, "b_scale": kb, "background": bg}
-            rows += _withholding_rows(actual, ens_mean[bj], channel, base)
-            bias, disp = da.rcrv(actual, ens_mean[bj], total_var[bj])
-            rows.append({**base, "do_event": "all", "channel": "pooled", "metric": "rcrv_bias", "value": bias})
-            rows.append({**base, "do_event": "all", "channel": "pooled", "metric": "rcrv_disp", "value": disp})
-        dumps.update({f"{bg}_ens_mean_pred": ens_mean, f"{bg}_ens_std_pred": ens_std,
-                      f"{bg}_prior_pred": agg[f"prior_pred_{bg}"].to_numpy(),
-                      f"{bg}_total_var": total_var})
-
-    ens = {}
-    for bg in BACKGROUNDS:
-        fin = [accum[(bg, bj)].finalize() for bj in range(n_b)]
-        ens[f"recon_mean_{bg}"] = np.stack([f[0] for f in fin])      # (n_b, *shape)
-        ens[f"recon_std_{bg}"] = np.stack([f[1] for f in fin])
-    post_var_field = _mean_posterior_var_field(tv, long, obs_ages, lats, lons, safe_flat,
-                                               shape, rep_flat, c, b_scales)
-
-    _append_csv(os.path.join(out_dir, "metrics.csv"), rows)
-    np.savez_compressed(os.path.join(out_dir, "montecarlo_ensemble.npz"),
-                        obs_ages=obs_ages, clim_mean=clim_mean, safe_valid=prior.safe_valid,
-                        post_var=post_var_field, prior_var=tv.diagB.reshape(shape),
-                        b_scales=np.asarray(b_scales), **ens)
-    np.savez_compressed(os.path.join(out_dir, "montecarlo_predictions.npz"), **dumps)
-    with open(os.path.join(out_dir, "montecarlo_config.json"), "w") as fh:
-        json.dump({"lane": lane, "b_reg": b_reg, "eof_rank": eof_rank,
-                   "localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
-                   "n_realizations": n_realizations, "assim_frac": assim_frac,
-                   "c_rep": list(c_rep), "b_scales": list(b_scales), "seed": seed,
-                   "prior_meta": prior.meta}, fh, indent=2)
+                        localization_km=localization_km, shrinkage_lambda=shrinkage_lambda,
+                        alpha=alpha)
+    reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
+                "alpha": alpha}
+    lane, rows, predictions = _score_withholding_lane(
+        prior, long, ages, lats, lons, make_method=make_method, space=space,
+        reg_cols=reg_cols, k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales,
+        seed=seed, progress_every=progress_every)
+    config = _withholding_config(lane, space, prior, k_folds, fold_kind, b_scales, seed,
+                                 reg_cols)
+    _write_withholding_artifacts(out_dir, lane, rows, predictions, config)
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Pixel regularizer tuning: joint (localization, shrinkage, alpha, b_scale) selection.
+# ---------------------------------------------------------------------------
+def select_best_config(sel_rows: pd.DataFrame, *, sel_tol: float = SEL_TOL) -> dict:
+    """Winner ``{localization_km, shrinkage_lambda, alpha, b_scale}`` on the selection split.
+
+    ``sel_rows`` is pre-filtered to one (model, lane, split=selection, channel=pooled,
+    do_event=all, metric=rrmse) and carries the four config columns plus ``value``. Among
+    rows within ``sel_tol`` (relative) of the minimum RRMSE, picks the most raw-like by
+    ``(n_active_knobs, |log10(b_scale)|, rrmse)`` where a knob is active when localization
+    is set, shrinkage > 0, or alpha < 1. This banks the coarse grid's noise headroom
+    rather than chasing a spuriously-complex argmin.
+    """
+    df = sel_rows.dropna(subset=["value"])
+    if df.empty:
+        raise ValueError("no finite selection-split RRMSE to select from")
+    best = float(df["value"].min())
+    band = df[df["value"] <= best * (1.0 + sel_tol)]
+
+    def key(r):
+        loc_active = 0 if pd.isna(r["localization_km"]) else 1
+        n_active = loc_active + int(float(r["shrinkage_lambda"]) > 0) + int(float(r["alpha"]) < 1.0)
+        return (n_active, abs(np.log10(float(r["b_scale"]))), float(r["value"]))
+
+    winner = min((r for _, r in band.iterrows()), key=key)
+    return {
+        "localization_km": None if pd.isna(winner["localization_km"]) else float(winner["localization_km"]),
+        "shrinkage_lambda": float(winner["shrinkage_lambda"]),
+        "alpha": float(winner["alpha"]),
+        "b_scale": float(winner["b_scale"]),
+    }
+
+
+def _pixel_grid_configs(localization_grid, shrinkage_grid, alpha_grid):
+    """The (localization_km, shrinkage_lambda, alpha) grid points, and a JSON-safe record."""
+    configs = list(itertools.product(localization_grid, shrinkage_grid, alpha_grid))
+    record = {"localization_grid": [None if g is None else float(g) for g in localization_grid],
+              "shrinkage_grid": [float(g) for g in shrinkage_grid],
+              "alpha_grid": [float(g) for g in alpha_grid]}
+    return configs, record
+
+
+def _selection_rrmse(rows: list[dict], lane: str) -> pd.DataFrame:
+    """Pooled selection-split RRMSE rows for the 3dvar method, the surface tuned over."""
+    M = pd.DataFrame(rows)
+    return M[(M.method == "3dvar") & (M.lane == lane) & (M.split == "selection")
+             & (M.channel == "pooled") & (M.do_event == "all") & (M.metric == "rrmse")]
+
+
+def run_ppe_pixel_grid(
+    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+    valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
+    localization_grid=LOCALIZATION_KM_GRID, shrinkage_grid=SHRINKAGE_GRID,
+    alpha_grid=ALPHA_GRID, b_scales: tuple[float, ...] = B_SCALES, sel_tol: float = SEL_TOL,
+    n_shapes: int = 5, n_select: int = 4, n_noise: int = 20, truth_stride: int = 10,
+    dist_edges_km: np.ndarray | None = None, seed: int = 0,
+    progress_every: int | None = None,
+) -> pd.DataFrame:
+    """Same-model PPE tuned over the taper grid: full-grid metrics, winner-only fields.
+
+    Scores every ``(localization, shrinkage, alpha)`` config (SSIM and calibration skipped,
+    the RRMSE selection needs neither), jointly selects the operating point with ``b_scale``
+    on the selection split via :func:`select_best_config`, then re-runs the winner with the
+    full metric set to persist its analysis fields. metrics.csv holds the full grid's skill
+    rows plus the winner's SSIM and calibration; the npz holds only the winner.
+    """
+    ages_i = np.asarray(ages, dtype=np.int64)
+    prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
+    truth_cube = cube[truth_idx].astype(np.float64)
+    truth_clim = truth_cube.mean(axis=0)
+    truth_anoms = truth_cube - truth_clim
+    configs, grid_record = _pixel_grid_configs(localization_grid, shrinkage_grid, alpha_grid)
+
+    all_rows: list[dict] = []
+    t0 = time.time()
+    for ci, (loc, lam, a) in enumerate(configs):
+        prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
+                            localization_km=loc, shrinkage_lambda=lam, alpha=a)
+        reg_cols = {"localization_km": loc, "shrinkage_lambda": lam, "alpha": a}
+        rows, _, _ = _score_ppe_lane(
+            truth_anoms, prior, long, lats, lons,
+            lane=LANE_PPE, make_method=None, space="pixel", reg_cols=reg_cols,
+            b_scales=b_scales, n_shapes=n_shapes, n_select=n_select, n_noise=n_noise,
+            dist_edges_km=dist_edges_km, seed=seed, full_metrics=False,
+            npz_extra={"truth_clim": truth_clim})
+        all_rows += [r for r in rows if r["method"] == "3dvar"]   # naive added once, from winner
+        _report_progress("pixel-grid config", ci + 1, len(configs), t0)
+
+    win = select_best_config(_selection_rrmse(all_rows, LANE_PPE), sel_tol=sel_tol)
+    reg_w = {"localization_km": win["localization_km"], "shrinkage_lambda": win["shrinkage_lambda"],
+             "alpha": win["alpha"]}
+    prior_w = build_prior(cube, ages, lats, lons, prior_idx, valid, **reg_w)
+    win_rows, npz_arrays, skill = _score_ppe_lane(
+        truth_anoms, prior_w, long, lats, lons,
+        lane=LANE_PPE, make_method=None, space="pixel", reg_cols=reg_w,
+        b_scales=b_scales, n_shapes=n_shapes, n_select=n_select, n_noise=n_noise,
+        dist_edges_km=dist_edges_km, seed=seed, full_metrics=True,
+        npz_extra={"truth_clim": truth_clim}, progress_every=progress_every)
+    all_rows += [r for r in win_rows
+                 if r["method"] == "3dvar" and r["metric"] in _FULL_METRICS]
+    all_rows += [r for r in win_rows if r["method"] != "3dvar"]
+
+    extra = {"selected": win, "sel_tol": sel_tol, **grid_record}
+    config = _ppe_config(LANE_PPE, "pixel", prior_w, len(truth_anoms), n_shapes, n_select,
+                         n_noise, b_scales, seed, reg_w,
+                         _chronological_split_meta(ages_i, prior_idx, truth_idx, truth_stride),
+                         extra=extra)
+    _write_ppe_artifacts(out_dir, LANE_PPE, all_rows, npz_arrays, skill, config)
+    return pd.DataFrame(all_rows)
+
+
+def run_withholding_pixel_grid(
+    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+    valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
+    localization_grid=LOCALIZATION_KM_GRID, shrinkage_grid=SHRINKAGE_GRID,
+    alpha_grid=ALPHA_GRID, k_folds: int = 5, fold_kind: str = "random",
+    b_scales: tuple[float, ...] = B_SCALES, sel_tol: float = SEL_TOL, seed: int = 0,
+    progress_every: int | None = None,
+) -> pd.DataFrame:
+    """Withholding lane tuned over the taper grid: full-grid metrics, winner-only predictions.
+
+    Scores every config's nested-CV, jointly selects the operating point with ``b_scale``
+    on the selection split, then re-runs the winner to persist its predictions npz. The
+    prior-free reference rows do not depend on the taper, so they are kept from the winner
+    pass alone rather than replicated once per config.
+    """
+    configs, grid_record = _pixel_grid_configs(localization_grid, shrinkage_grid, alpha_grid)
+    lane = f"withholding_{fold_kind}"
+
+    all_rows: list[dict] = []
+    t0 = time.time()
+    for ci, (loc, lam, a) in enumerate(configs):
+        prior = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid,
+                            localization_km=loc, shrinkage_lambda=lam, alpha=a)
+        reg_cols = {"localization_km": loc, "shrinkage_lambda": lam, "alpha": a}
+        _, rows, _ = _score_withholding_lane(
+            prior, long, ages, lats, lons, make_method=None, space="pixel",
+            reg_cols=reg_cols, k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales,
+            seed=seed)
+        all_rows += [r for r in rows if r["method"] == "3dvar"]   # naive added once, from winner
+        _report_progress(f"pixel-grid config ({lane})", ci + 1, len(configs), t0)
+
+    win = select_best_config(_selection_rrmse(all_rows, lane), sel_tol=sel_tol)
+    reg_w = {"localization_km": win["localization_km"], "shrinkage_lambda": win["shrinkage_lambda"],
+             "alpha": win["alpha"]}
+    prior_w = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid, **reg_w)
+    _, win_rows, predictions = _score_withholding_lane(
+        prior_w, long, ages, lats, lons, make_method=None, space="pixel", reg_cols=reg_w,
+        k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales, seed=seed,
+        progress_every=progress_every)
+    all_rows += [r for r in win_rows if r["method"] != "3dvar"]
+
+    config = _withholding_config(lane, "pixel", prior_w, k_folds, fold_kind, b_scales, seed,
+                                 reg_w, extra={"selected": win, "sel_tol": sel_tol, **grid_record})
+    _write_withholding_artifacts(out_dir, lane, all_rows, predictions, config)
+    return pd.DataFrame(all_rows)

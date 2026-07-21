@@ -1,17 +1,19 @@
-"""Skill and calibration metrics for data-assimilation reconstructions.
+"""Skill metrics for data-assimilation reconstructions.
 
 Metrics are method-agnostic: they take numpy arrays of truth, reconstruction, and
-(for calibration) posterior variance, so 3DVar, EnKF, and a generative posterior
-score identically. Reconstructions are scored over the valid field, unweighted by
-cell area, so the high-latitude variance carrying the D-O signal keeps its weight.
+(for the uncertainty maps) posterior variance, so 3DVar, EnKF, and a generative
+posterior score identically. Reconstructions are scored over the valid field,
+unweighted by cell area, so the high-latitude variance carrying the D-O signal keeps
+its weight.
 
-* Skill: coefficient of efficiency (CE, the headline, with a built-in climatology
-  baseline), Pearson correlation, degC RMSE, and RMSE normalised by the truth std
-  (RRMSE), as pooled scalars, per-cell maps over a stack of truths, and as a
-  function of distance to the nearest observation. Field reconstructions also carry
-  a masked structural similarity (SSIM) over the valid grid.
-* Calibration: the reduced centred random variable (RCRV; mean 0 / std 1 when the
-  posterior spread matches the error) and CRPS.
+Skill: coefficient of efficiency (CE, the headline, with a built-in climatology
+baseline), Pearson correlation, degC RMSE, RMSE normalised by the truth std (RRMSE),
+and the amplitude ratio, as pooled scalars, per-cell maps over a stack of truths, and
+as a function of distance to the nearest observation. Field reconstructions also carry
+a masked structural similarity (SSIM) over the valid grid, and a prior-to-posterior
+uncertainty reduction from the variance diagonals.
+
+Whether the stated uncertainty matches these errors is :mod:`paleoreco.eval.calibration`.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from __future__ import annotations
 import matplotlib.pyplot as plt
 import numpy as np
 
-from paleoreco.assim.priors import great_circle_km
+from paleoreco.assim.priors import great_circle_km_between
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +57,21 @@ def relative_rmse(truth: np.ndarray, recon: np.ndarray) -> float:
     return rmse(truth, recon) / sd
 
 
+def amplitude_ratio(truth: np.ndarray, recon: np.ndarray) -> float:
+    """``std(recon) / std(truth)``: is the reconstruction as variable as the truth?
+
+    Separates the two ways a low CE arises. Below 1 the analysis is shrunk toward the
+    background and errs by being too flat; near 1 the amplitude is right and the error is
+    in the direction, which only the correlation can improve. Under a Gaussian update the
+    CE-optimal ratio is the correlation itself, so a ratio far above it means the
+    observations are being trusted past their skill.
+    """
+    sd = float(np.std(truth))
+    if sd == 0.0:
+        return float("nan")
+    return float(np.std(recon)) / sd
+
+
 # ---------------------------------------------------------------------------
 # Per-cell skill maps over a stack of truths.
 # ---------------------------------------------------------------------------
@@ -64,16 +81,6 @@ def ce_map(truth_stack: np.ndarray, recon_stack: np.ndarray, ref: np.ndarray) ->
     ss_ref = np.sum((truth_stack - ref) ** 2, axis=0)
     with np.errstate(invalid="ignore", divide="ignore"):
         return 1.0 - sse / ss_ref
-
-
-def corr_map(truth_stack: np.ndarray, recon_stack: np.ndarray) -> np.ndarray:
-    """Per-cell Pearson correlation across the leading (truth) axis."""
-    a = truth_stack - truth_stack.mean(axis=0)
-    b = recon_stack - recon_stack.mean(axis=0)
-    num = np.sum(a * b, axis=0)
-    den = np.sqrt(np.sum(a ** 2, axis=0) * np.sum(b ** 2, axis=0))
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return num / den
 
 
 def rmse_map(truth_stack: np.ndarray, recon_stack: np.ndarray) -> np.ndarray:
@@ -141,12 +148,8 @@ def nearest_obs_distance(
     """
     lat_cell = np.repeat(lats, len(lons))
     lon_cell = np.tile(lons, len(lats))
-    cell = np.column_stack([lat_cell, lon_cell])
-    site = np.column_stack([np.asarray(obs_lat), np.asarray(obs_lon)])
-    both = great_circle_km(np.concatenate([cell[:, 0], site[:, 0]]),
-                           np.concatenate([cell[:, 1], site[:, 1]]))
-    n_cell = len(cell)
-    return both[:n_cell, n_cell:].min(axis=1)
+    return great_circle_km_between(lat_cell, lon_cell,
+                                   np.asarray(obs_lat), np.asarray(obs_lon)).min(axis=1)
 
 
 def skill_vs_distance(
@@ -170,42 +173,6 @@ def skill_vs_distance(
             ce[b] = coefficient_of_efficiency(truth[sel], recon[sel], ref[sel])
             rms[b] = rmse(truth[sel], recon[sel])
     return {"distance_km": centres, "ce": ce, "rmse": rms, "count": counts}
-
-
-# ---------------------------------------------------------------------------
-# Calibration.
-# ---------------------------------------------------------------------------
-def rcrv(truth: np.ndarray, mean: np.ndarray, total_var: np.ndarray) -> tuple[float, float]:
-    """Reduced centred random variable z = (truth - mean) / sqrt(total_var).
-
-    ``total_var`` is the posterior variance plus the observation error where the
-    comparison is in observation space. Returns (bias, dispersion) = (mean z,
-    std z); calibrated when they are ~ (0, 1).
-    """
-    z = (truth - mean) / np.sqrt(total_var)
-    return float(np.mean(z)), float(np.std(z))
-
-
-def crps_gaussian(truth: np.ndarray, mean: np.ndarray, var: np.ndarray) -> np.ndarray:
-    """Closed-form CRPS of a Gaussian posterior per element (lower is better)."""
-    from scipy import stats
-
-    sd = np.sqrt(var)
-    z = (truth - mean) / sd
-    return sd * (z * (2 * stats.norm.cdf(z) - 1) + 2 * stats.norm.pdf(z) - 1.0 / np.sqrt(np.pi))
-
-
-def crps_ensemble(truth: np.ndarray, samples: np.ndarray) -> np.ndarray:
-    """Empirical CRPS from posterior samples. ``samples`` is ``(n, ...)``."""
-    n = samples.shape[0]
-    term1 = np.mean(np.abs(samples - truth[None]), axis=0)
-    term2 = np.mean(np.abs(samples[:, None] - samples[None, :]), axis=(0, 1))
-    return term1 - 0.5 * term2
-
-
-def rank_histogram(truth: np.ndarray, samples: np.ndarray) -> np.ndarray:
-    """Rank of each truth among its posterior samples, for a calibration histogram."""
-    return (samples < truth[None]).sum(axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -264,32 +231,6 @@ def plot_prior_posterior_uncertainty(
             fig.colorbar(im, ax=ax, fraction=0.046)
     if title:
         fig.suptitle(title, fontsize=11)
-    fig.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=110, bbox_inches="tight")
-    return fig
-
-
-def plot_skill_vs_distance(
-    curves: dict[str, dict], metric: str = "ce", title: str | None = None,
-    save_path: str | None = None,
-) -> plt.Figure:
-    """Skill (``ce`` or ``rmse``) against distance-to-obs for one or more methods.
-
-    ``curves`` maps a label to the dict returned by :func:`skill_vs_distance`.
-    """
-    fig, ax = plt.subplots(figsize=(6, 4))
-    for label, c in curves.items():
-        ax.plot(c["distance_km"], c[metric], marker="o", ms=3, label=label)
-    if metric == "ce":
-        ax.axhline(0, color="grey", lw=0.7)
-        ax.set_ylabel("CE")
-    else:
-        ax.set_ylabel("RMSE (degC)")
-    ax.set_xlabel("distance to nearest observation (km)")
-    ax.legend(fontsize=8)
-    if title:
-        ax.set_title(title, fontsize=10)
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=110, bbox_inches="tight")
