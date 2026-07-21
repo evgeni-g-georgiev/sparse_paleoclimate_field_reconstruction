@@ -67,7 +67,11 @@ class ThreeDVar(Method):
     """Gain-form 3DVar over a fixed background covariance."""
 
     def __init__(self, B: np.ndarray, shape: tuple[int, int, int]):
-        self.B = np.asarray(B, dtype=np.float64)
+        # Column-major: every gain reads the obs columns ``B[:, gather]``, which is a
+        # strided walk over the whole D x D array in row-major order and dominates the
+        # per-network cost. Storing B column-major makes that gather contiguous for the
+        # same values.
+        self.B = np.asfortranarray(B, dtype=np.float64)
         self.diagB = np.diag(self.B).copy()
         self.shape = shape
 
