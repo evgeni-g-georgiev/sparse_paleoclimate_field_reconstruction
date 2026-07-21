@@ -1,4 +1,4 @@
-"""Tests for D-O event windows and CV split utilities (paleoreco.splits)."""
+"""Tests for D-O event windows and CV split utilities (paleoreco.data.splits)."""
 
 from __future__ import annotations
 
@@ -8,9 +8,8 @@ import pytest
 from paleoreco.data.splits import (
     DO_EVENT_WINDOWS,
     assign_event_label,
-    block_stride_split,
+    chronological_half_split,
     make_blocked_cv,
-    split_ages_by_do_event,
 )
 
 
@@ -31,39 +30,6 @@ def test_assign_event_label_inside_outside_and_boundary():
     assert labels[4] == 0          # just after window
 
 
-def test_split_ages_by_do_event_partitions_disjointly():
-    ages = np.arange(29_000, 49_000, 25)
-    split = split_ages_by_do_event(ages, test_event=8, val_event=7)
-    idx = np.concatenate([split["train"], split["val"], split["test"]])
-    # Every age assigned exactly once.
-    assert np.array_equal(np.sort(idx), np.arange(len(ages)))
-    assert (assign_event_label(ages[split["test"]]) == 8).all()
-    assert (assign_event_label(ages[split["val"]]) == 7).all()
-
-
-def test_split_ages_rejects_equal_events():
-    ages = np.arange(29_000, 49_000, 25)
-    with pytest.raises(ValueError):
-        split_ages_by_do_event(ages, test_event=8, val_event=8)
-
-
-def test_block_stride_split_detects_overlap():
-    with pytest.raises(ValueError, match="overlap"):
-        block_stride_split(400, block_size=40, test_stride=2, test_offset=0,
-                           val_stride=2, val_offset=0)
-
-
-def test_block_stride_split_disjoint_buckets():
-    n = 400
-    split = block_stride_split(n, block_size=40, test_stride=5, test_offset=0,
-                               val_stride=5, val_offset=2)
-    s = {k: set(v.tolist()) for k, v in split.items()}
-    assert not (s["train"] & s["val"])
-    assert not (s["train"] & s["test"])
-    assert not (s["val"] & s["test"])
-    assert len(s["train"]) + len(s["val"]) + len(s["test"]) == n
-
-
 def test_make_blocked_cv_holds_out_test_event():
     ages = np.arange(29_000, 49_000, 25)
     cv = make_blocked_cv(ages, fold_years=1000, embargo_years=1000,
@@ -76,3 +42,33 @@ def test_make_blocked_cv_holds_out_test_event():
     # Folds keep train and val disjoint.
     for fold in cv["folds"]:
         assert not (set(fold["train"]) & set(fold["val"]))
+
+
+def test_chronological_half_split_disjoint_and_complete():
+    ages = np.arange(29_000, 49_000, 25)
+    older, younger = chronological_half_split(ages)
+    assert not (set(older.tolist()) & set(younger.tolist()))
+    assert np.array_equal(np.sort(np.concatenate([older, younger])), np.arange(len(ages)))
+
+
+def test_chronological_half_split_older_half_is_later_indices():
+    ages = np.arange(29_000, 49_000, 25)          # ascending yr BP
+    older, younger = chronological_half_split(ages)
+    assert older[0] == len(ages) // 2
+    assert ages[older].min() > ages[younger].max()
+
+
+def test_chronological_half_split_stride_thins_younger_only():
+    ages = np.arange(29_000, 49_000, 25)
+    older, younger = chronological_half_split(ages, stride=10)
+    older_1, younger_1 = chronological_half_split(ages, stride=1)
+    assert np.array_equal(older, older_1)         # the prior half is never thinned
+    assert np.array_equal(younger, younger_1[::10])
+    assert set(younger.tolist()).issubset(set(younger_1.tolist()))
+
+
+@pytest.mark.parametrize("n", [12, 13])
+def test_chronological_half_split_sizes_even_and_odd(n):
+    older, younger = chronological_half_split(np.arange(n))
+    assert len(younger) == n // 2                 # the odd state goes to the prior half
+    assert len(older) == n - n // 2
