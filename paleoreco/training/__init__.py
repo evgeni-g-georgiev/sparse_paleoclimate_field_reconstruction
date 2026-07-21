@@ -11,6 +11,6 @@
 from __future__ import annotations
 
 from ._common import set_seed
-from .losses import masked_mse, masked_rmse, vae_elbo_loss
+from .losses import masked_mse, vae_elbo_loss
 
-__all__ = ["set_seed", "masked_mse", "masked_rmse", "vae_elbo_loss"]
+__all__ = ["set_seed", "masked_mse", "vae_elbo_loss"]

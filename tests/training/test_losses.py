@@ -1,11 +1,11 @@
-"""Tests for masked reconstruction losses (paleoreco.losses)."""
+"""Tests for masked reconstruction losses (paleoreco.training.losses)."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-from paleoreco.training.losses import masked_mse, masked_rmse, vae_elbo_loss
+from paleoreco.training.losses import masked_mse, vae_elbo_loss
 
 
 def test_masked_mse_mean_counts_only_valid_terms():
@@ -32,14 +32,6 @@ def test_masked_mse_shape_and_reduction_guards():
         masked_mse(pred, torch.zeros((1, 1, 1, 3)), torch.ones((1, 2)))
     with pytest.raises(ValueError):
         masked_mse(pred, torch.zeros_like(pred), torch.ones((1, 2)), reduction="bogus")
-
-
-def test_masked_rmse_is_sqrt_of_mse():
-    pred = torch.tensor([[[[3.0, 4.0]]]])
-    target = torch.zeros_like(pred)
-    mask = torch.ones((1, 2))
-    mse = masked_mse(pred, target, mask)
-    assert masked_rmse(pred, target, mask) == pytest.approx(float(mse.sqrt()))
 
 
 def test_vae_elbo_kl_is_zero_at_standard_normal_posterior():

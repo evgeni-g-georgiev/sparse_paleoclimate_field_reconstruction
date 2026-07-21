@@ -75,18 +75,6 @@ def masked_mse(
     )
 
 
-def masked_rmse(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    """Square root of :func:`masked_mse` with the default ``"mean"`` reduction.
-
-    Returned value is in field units (°C anomaly).
-    """
-    return masked_mse(pred, target, mask, reduction="mean").sqrt()
-
-
 def vae_elbo_loss(
     x_hat: torch.Tensor,
     target: torch.Tensor,
