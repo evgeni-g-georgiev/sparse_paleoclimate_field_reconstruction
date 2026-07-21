@@ -201,15 +201,6 @@ def apply_anomaly(cube: np.ndarray, stats: dict) -> np.ndarray:
     return (anom * mask).astype(np.float32)
 
 
-def invert_anomaly(cube_anom: np.ndarray, stats: dict) -> np.ndarray:
-    """Inverse of ``apply_anomaly``: add the climatology back for absolute °C.
-
-    Masked cells return ``mean[c, i, j]`` because they were zero-filled.
-    Always inspect outputs through the same mask.
-    """
-    return (cube_anom + stats["mean"]).astype(np.float32)
-
-
 # ----------------------------------------------------------------------------
 # PyTorch dataset.
 # ----------------------------------------------------------------------------

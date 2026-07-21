@@ -13,7 +13,6 @@ from paleoreco.data import (
     apply_anomaly,
     build_prior_cube,
     compute_zscore_stats,
-    invert_anomaly,
 )
 
 
@@ -60,7 +59,7 @@ def test_grid_and_vars_constants():
     assert VARS == ("mtco", "mtwa")
 
 
-def test_anomaly_roundtrip_and_degenerate_masking(cube, valid):
+def test_anomaly_centring_and_degenerate_masking(cube, valid):
     # Make one cell constant across ages on the mtco channel -> degenerate std.
     cube = cube.copy()
     cube[:, 0, 2, 3] = -4.0
@@ -73,9 +72,9 @@ def test_anomaly_roundtrip_and_degenerate_masking(cube, valid):
     a = apply_anomaly(cube, stats)
     # Masked cell is zeroed in anomaly space.
     assert np.allclose(a[:, 0, 2, 3], 0.0)
-    # Round-trip recovers the original on safe cells.
-    recovered = invert_anomaly(a, stats)
+    # Adding the climatology back recovers the original on safe cells.
     safe = stats["safe_valid"]
+    recovered = a + stats["mean"]
     assert np.allclose(recovered[:, 0, safe], cube[:, 0, safe], atol=1e-4)
 
 
