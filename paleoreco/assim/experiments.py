@@ -18,7 +18,10 @@ Each writes a tidy long-format metrics CSV (one row per method/space/localizatio
 shrinkage_lambda/alpha/lane/fold/b_scale/background/split/do_event/channel/metric), the
 analysis fields as npz, and a config.json. ``b_scale`` is the background-covariance
 amplitude the analysis used; ``split`` is ``selection`` (used to pick the operating
-point) or ``test`` (reported). R is ``diag(sse)``. Scoring is in anomaly space; CE,
+point) or ``test`` (reported). The withholding lane uses ``R = diag(sse + rep_var)``,
+adding the per-channel representativeness variance so a point proxy is not trusted to
+resolve its grid cell exactly; the pseudo-proxy lane keeps ``diag(sse)`` because its
+synthetic observations sample the exact grid cell. Scoring is in anomaly space; CE,
 RMSE, and correlation are shift-invariant so the anomaly-space values equal their degC
 counterparts.
 
@@ -45,7 +48,7 @@ import pandas as pd
 from paleoreco.data import VARS
 from paleoreco.data.splits import chronological_half_split
 from paleoreco.assim.method import Method
-from paleoreco.assim.observations import observations_at_age
+from paleoreco.assim.observations import observations_at_age, representativeness_variance
 from paleoreco.assim.innovation import obs_cell_index
 from paleoreco.assim.priors import Prior, build_prior, great_circle_km_between
 from paleoreco.assim.threedvar import ThreeDVar
@@ -619,7 +622,9 @@ class _TargetPredictions:
     ``pred`` and ``post_var`` are ``(n_b, N)``, one row per ``b_scale``; the rest are
     ``(N,)``. ``prior_var`` is the background variance at each target cell, which is the
     CRPSS reference; ``distance_km`` is how far the site sits from the nearest
-    assimilated one, the axis that separates interpolation from extrapolation.
+    assimilated one, the axis that separates interpolation from extrapolation. ``rep_var``
+    is the per-channel representativeness variance carried to the target sites so the
+    predictive spread can include the proxy's deviation from its cell mean.
     """
 
     actual: np.ndarray
@@ -630,6 +635,7 @@ class _TargetPredictions:
     prior_var: np.ndarray
     naive: dict
     distance_km: np.ndarray
+    rep_var: np.ndarray
 
     def __len__(self) -> int:
         return len(self.actual)
@@ -639,17 +645,18 @@ def _predict_targets(
     tv: Method, long: pd.DataFrame, obs_ages: np.ndarray,
     lats: np.ndarray, lons: np.ndarray, safe_flat: np.ndarray, clim_flat: np.ndarray,
     assim_sites: set, target_sites: set, b_scales: tuple[float, ...],
-    n_b: int, n_cells: int,
+    n_b: int, n_cells: int, rep_lookup: np.ndarray,
 ) -> _TargetPredictions:
     """Assimilate the assim-set sites age by age, predict the target-set sites.
 
-    Climatological background (zero anomaly), R = ``diag(sse)``. Observations enter in
-    anomaly space ``y - my`` so the proxy-vs-model offset cancels. A withheld observation
-    is scored only when its own age also carries an assimilated one, so an age holding
-    just one side of the split contributes nothing.
+    Climatological background (zero anomaly), ``R = diag(sse + rep_var)`` where
+    ``rep_lookup`` holds the per-channel representativeness variance. Observations enter
+    in anomaly space ``y - my`` so the proxy-vs-model offset cancels. A withheld
+    observation is scored only when its own age also carries an assimilated one, so an age
+    holding just one side of the split contributes nothing.
     """
     bg_zero = np.zeros(len(clim_flat))
-    actual, channel, sse, pred, post_var, prior_var, dist = [], [], [], [], [], [], []
+    actual, channel, sse, pred, post_var, prior_var, dist, rep = [], [], [], [], [], [], [], []
     naive = {"nearest": [], "idw": []}
     for age in obs_ages:
         o = observations_at_age(long, int(age))
@@ -661,12 +668,14 @@ def _predict_targets(
             continue
         y_anom = (o["y"][kept] - o["my"][kept]).astype(np.float64)
         gk, gw = gather[kept], gather[wkeep]
-        gain = tv.prepare_sweep(gk, o["sse"][kept].astype(np.float64), b_scales)
+        r_kept = o["sse"][kept].astype(np.float64) + rep_lookup[gk // n_cells]
+        gain = tv.prepare_sweep(gk, r_kept, b_scales)
         res = tv.apply_sweep(gain, y_anom, bg_zero)
 
         actual.append((o["y"][wkeep] - o["my"][wkeep]).astype(np.float64))
         channel.append(gw // n_cells)
         sse.append(o["sse"][wkeep].astype(np.float64))
+        rep.append(rep_lookup[gw // n_cells])
         pred.append(np.stack([res[bj].predict_obs(gw) for bj in range(n_b)]))
         post_var.append(np.stack([res[bj].predict_obs_var(gw) for bj in range(n_b)]))
         prior_var.append(tv.diagB[gw])
@@ -683,14 +692,14 @@ def _predict_targets(
         empty = np.array([])
         return _TargetPredictions(empty, empty, empty, np.zeros((n_b, 0)),
                                   np.zeros((n_b, 0)), empty,
-                                  {k: empty for k in naive}, empty)
+                                  {k: empty for k in naive}, empty, empty)
     return _TargetPredictions(
         actual=np.concatenate(actual), channel=np.concatenate(channel),
         sse=np.concatenate(sse), pred=np.concatenate(pred, axis=1),
         post_var=np.concatenate(post_var, axis=1),
         prior_var=np.concatenate(prior_var),
         naive={k: np.concatenate(v) for k, v in naive.items()},
-        distance_km=np.concatenate(dist))
+        distance_km=np.concatenate(dist), rep_var=np.concatenate(rep))
 
 
 def _concat_targets(parts: list[_TargetPredictions]) -> _TargetPredictions:
@@ -703,7 +712,8 @@ def _concat_targets(parts: list[_TargetPredictions]) -> _TargetPredictions:
         post_var=np.concatenate([p.post_var for p in parts], axis=1),
         prior_var=np.concatenate([p.prior_var for p in parts]),
         naive={k: np.concatenate([p.naive[k] for p in parts]) for k in parts[0].naive},
-        distance_km=np.concatenate([p.distance_km for p in parts]))
+        distance_km=np.concatenate([p.distance_km for p in parts]),
+        rep_var=np.concatenate([p.rep_var for p in parts]))
 
 
 def _score_withholding_lane(
@@ -723,15 +733,18 @@ def _score_withholding_lane(
     fold serves as a val target in one rotation and a test target in another, so for a
     single global operating point a mild dependence remains; the reported test predictions
     are never scored during selection. Observations enter in anomaly space ``y - my``;
-    R is ``diag(sse)``; the background is climatological. ``space``/``reg_cols`` tag the
+    ``R = diag(sse + rep_var)`` with the representativeness variance estimated per fold
+    from the assimilated sites alone, so a withheld site never informs the update or the
+    spread that scores it; the background is climatological. ``space``/``reg_cols`` tag the
     rows.
 
     Alongside the skill rows each ``b_scale`` carries calibration scored against the
-    proxy, whose own error joins the posterior spread since the residual holds both. The
-    pooled test set also yields prior-free ``nearest``/``idw`` rows, emitted once because
-    they depend on neither the taper nor ``b_scale``, and the predictions dict keeps the
-    posterior and prior variance, the proxy error, and the distance to the nearest
-    assimilated site so calibration and skill-vs-void can be rebuilt without a re-run.
+    proxy, whose own error and representativeness variance join the posterior spread since
+    the residual holds both. The pooled test set also yields prior-free ``nearest``/``idw``
+    rows, emitted once because they depend on neither the taper nor ``b_scale``, and the
+    predictions dict keeps the posterior and prior variance, the proxy error and
+    representativeness variance, and the distance to the nearest assimilated site so
+    calibration and skill-vs-void can be rebuilt without a re-run.
     """
     shape = (len(VARS), len(lats), len(lons))
     n_cells = len(lats) * len(lons)
@@ -746,6 +759,15 @@ def _score_withholding_lane(
     all_sites = set(long["site"].unique().tolist())
     lane = f"withholding_{fold_kind}"
 
+    # Estimate rep_var per fold from the assimilated sites only; the flattened cell index
+    # of every row is fixed, so build it once and slice it by site set per fold.
+    cell_all = obs_cell_index(long["lat"].to_numpy(), long["lon"].to_numpy(),
+                              long["channel"].to_numpy(), lats, lons)
+
+    def _rep_lookup(sites) -> np.ndarray:
+        rv = representativeness_variance(long, cell_all, sites=sites)
+        return np.array([rv.get(v, 0.0) for v in VARS])
+
     def _rows(tp: _TargetPredictions, fold: int, split: str) -> list[dict]:
         """Skill and calibration rows over the b_scale sweep for one prediction set."""
         out = []
@@ -755,10 +777,12 @@ def _score_withholding_lane(
                     "fold": fold, "b_scale": kb, "background": "climatological",
                     "split": split}
             out += _withholding_rows(tp.actual, tp.pred[bj], tp.channel, base)
-            # The truth is itself a measurement, so its error joins the posterior spread;
-            # the prior reference carries the same term to stay comparable.
-            out += _calibration_rows(tp.actual, tp.pred[bj], tp.post_var[bj] + tp.sse,
-                                     kb * tp.prior_var + tp.sse, groups, base)
+            # The truth is itself a measurement that also deviates from its grid cell, so
+            # its error and representativeness variance join the posterior spread; the
+            # prior reference carries the same terms to stay comparable.
+            out += _calibration_rows(tp.actual, tp.pred[bj],
+                                     tp.post_var[bj] + tp.sse + tp.rep_var,
+                                     kb * tp.prior_var + tp.sse + tp.rep_var, groups, base)
         return out
 
     def _naive_rows(tp: _TargetPredictions) -> list[dict]:
@@ -779,7 +803,7 @@ def _score_withholding_lane(
         assim = all_sites - fold_sets[(i + 1) % k_folds] - fold_sets[i]
         tp = _predict_targets(tv, long, obs_ages, lats, lons, safe_flat,
                               clim_flat, assim, fold_sets[(i + 1) % k_folds],
-                              b_scales, n_b, n_cells)
+                              b_scales, n_b, n_cells, _rep_lookup(assim))
         if len(tp):
             sel.append(tp)
         if progress_every and (i + 1) % progress_every == 0:
@@ -791,9 +815,10 @@ def _score_withholding_lane(
     pooled = []
     t0 = time.time()
     for i in range(k_folds):
+        assim = all_sites - fold_sets[i]
         tp = _predict_targets(tv, long, obs_ages, lats, lons, safe_flat,
-                              clim_flat, all_sites - fold_sets[i], fold_sets[i],
-                              b_scales, n_b, n_cells)
+                              clim_flat, assim, fold_sets[i],
+                              b_scales, n_b, n_cells, _rep_lookup(assim))
         if not len(tp):
             continue
         rows += _rows(tp, i, "test")
@@ -801,7 +826,7 @@ def _score_withholding_lane(
         if progress_every and (i + 1) % progress_every == 0:
             _report_progress("test-fold", i + 1, k_folds, t0)
 
-    predictions = {"b_scales": np.asarray(b_scales)}
+    predictions = {"b_scales": np.asarray(b_scales), "rep_var_full": _rep_lookup(all_sites)}
     if pooled:
         tp = _concat_targets(pooled)
         rows += _rows(tp, -1, "test")
@@ -809,7 +834,7 @@ def _score_withholding_lane(
         predictions.update({
             "actual": tp.actual, "channel": tp.channel, "climatological_pred": tp.pred,
             "post_var_pred": tp.post_var, "prior_var_pred": tp.prior_var,
-            "sse": tp.sse, "distance_km": tp.distance_km,
+            "sse": tp.sse, "distance_km": tp.distance_km, "rep_var": tp.rep_var,
             "naive_nearest": tp.naive["nearest"], "naive_idw": tp.naive["idw"]})
     return lane, rows, predictions
 
@@ -833,6 +858,11 @@ def _withholding_config(lane, space, prior, k_folds, fold_kind, b_scales, seed, 
     if extra:
         cfg.update(extra)
     return cfg
+
+
+def _rep_var_full(predictions: dict) -> dict:
+    """Full-network rep_var per channel, JSON-ready for the config record."""
+    return {VARS[i]: float(v) for i, v in enumerate(predictions["rep_var_full"])}
 
 
 def run_withholding(
@@ -861,7 +891,7 @@ def run_withholding(
         reg_cols=reg_cols, k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales,
         seed=seed, progress_every=progress_every)
     config = _withholding_config(lane, space, prior, k_folds, fold_kind, b_scales, seed,
-                                 reg_cols)
+                                 reg_cols, extra={"rep_var_full": _rep_var_full(predictions)})
     _write_withholding_artifacts(out_dir, lane, rows, predictions, config)
     return pd.DataFrame(rows)
 
@@ -1019,6 +1049,8 @@ def run_withholding_pixel_grid(
     all_rows += [r for r in win_rows if r["method"] != "3dvar"]
 
     config = _withholding_config(lane, "pixel", prior_w, k_folds, fold_kind, b_scales, seed,
-                                 reg_w, extra={"selected": win, "sel_tol": sel_tol, **grid_record})
+                                 reg_w, extra={"selected": win, "sel_tol": sel_tol,
+                                               "rep_var_full": _rep_var_full(predictions),
+                                               **grid_record})
     _write_withholding_artifacts(out_dir, lane, all_rows, predictions, config)
     return pd.DataFrame(all_rows)
