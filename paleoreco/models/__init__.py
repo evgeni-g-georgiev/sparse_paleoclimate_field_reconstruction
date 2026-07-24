@@ -1,1 +1,1 @@
-"""Model definitions (autoencoder, future diffusion, etc.)."""
+"""Model definitions: convolutional autoencoders and the score-based denoiser."""
