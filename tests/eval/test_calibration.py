@@ -74,3 +74,24 @@ def test_coverage_matches_nominal_level():
     assert cal.coverage(truth, mean, var, level=0.5) == pytest.approx(0.5, abs=0.02)
     # Too-narrow intervals capture fewer truths than advertised.
     assert cal.coverage(truth, mean, var / 4.0, level=0.9) < 0.75
+
+
+def test_ecr_honest_and_flags_underdispersion():
+    truth, mean, var = _calibrated()
+    assert cal.ecr(truth, mean, var) == pytest.approx(1.0, abs=0.05)
+    # Understating the variance makes the errors look larger than claimed.
+    assert cal.ecr(truth, mean, var / 4.0) > 3.0
+
+
+def test_sharpness_is_mean_std():
+    var = np.array([1.0, 4.0, 9.0])
+    assert cal.sharpness(var) == pytest.approx(np.mean([1.0, 2.0, 3.0]))
+
+
+def test_coverage_ensemble_matches_nominal_level():
+    rng = np.random.default_rng(0)
+    truth = rng.normal(size=5000)
+    samples = rng.normal(size=(200, 5000))            # same distribution as the truth
+    assert cal.coverage_ensemble(truth, samples, 0.9) == pytest.approx(0.9, abs=0.03)
+    # A too-tight ensemble captures fewer truths than advertised.
+    assert cal.coverage_ensemble(truth, samples * 0.25, 0.9) < 0.75

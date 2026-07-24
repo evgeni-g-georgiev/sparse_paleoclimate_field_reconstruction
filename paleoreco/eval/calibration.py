@@ -94,3 +94,40 @@ def coverage(truth: np.ndarray, mean: np.ndarray, var: np.ndarray,
     """
     z_crit = norm.ppf(0.5 * (1.0 + level))
     return float(np.mean(np.abs(_standardise(truth, mean, var)) <= z_crit))
+
+
+def coverage_ensemble(truth: np.ndarray, samples: np.ndarray, level: float = 0.9) -> float:
+    """Fraction of truths inside the empirical central ``level`` interval of an ensemble.
+
+    ``samples`` is ``(n_members, n_points)``. The interval comes from the sample
+    quantiles rather than a Gaussian, so a non-Gaussian spread is scored on its own
+    terms.
+    """
+    lo = np.quantile(samples, 0.5 * (1.0 - level), axis=0)
+    hi = np.quantile(samples, 0.5 * (1.0 + level), axis=0)
+    t = np.asarray(truth)
+    return float(np.mean((t >= lo) & (t <= hi)))
+
+
+# ---------------------------------------------------------------------------
+# Spread against error, and sharpness.
+# ---------------------------------------------------------------------------
+def ecr(truth: np.ndarray, mean: np.ndarray, var: np.ndarray) -> float:
+    """Ensemble calibration ratio: mean-square error of the mean over mean variance.
+
+    1 is honest, above 1 under-dispersed (errors larger than the stated spread),
+    below 1 over-cautious. Complements :func:`rcrv` with a single pooled number.
+    """
+    v = float(np.mean(np.asarray(var, dtype=np.float64)))
+    if v == 0.0:
+        return float("nan")
+    mse = float(np.mean((np.asarray(truth, dtype=np.float64)
+                         - np.asarray(mean, dtype=np.float64)) ** 2))
+    return mse / v
+
+
+def sharpness(var: np.ndarray) -> float:
+    """Mean predictive standard deviation. Read alongside coverage: honest and sharp
+    beats honest and wide.
+    """
+    return float(np.mean(np.sqrt(np.asarray(var, dtype=np.float64))))
