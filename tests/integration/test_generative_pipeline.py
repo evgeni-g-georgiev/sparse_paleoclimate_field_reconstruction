@@ -14,6 +14,7 @@ import os
 import numpy as np
 import pandas as pd
 
+from paleoreco.assim import experiments as ex
 from paleoreco.assim import experiments_generative as g
 from paleoreco.assim.generative import GuidedSampler, channel_scales
 from paleoreco.data.cube import apply_anomaly, compute_zscore_stats
@@ -64,6 +65,27 @@ def test_run_ppe_generative_schema_and_npz(tmp_path, cube, ages, lats, lons, val
         assert k in z.files, k
     assert z["recon_climatological"].shape[0] == 1
     assert np.isclose(z["b_scales"][0], cfg["selected"]["b_scale"])
+
+
+def test_ppe_lanes_draw_identical_networks(tmp_path, cube, ages, lats, lons, valid, obs_long):
+    """Both PPE lanes must borrow the same network shapes per truth.
+
+    They share one seeded rng, so the streams only stay aligned while both consume it
+    in the same order: one age permutation per truth, then one draw per noise
+    realisation. Averaging the draws in a single vectorised call would desynchronise
+    them and silently unpair the comparison.
+    """
+    kw = dict(n_shapes=3, n_select=2, truth_stride=1, seed=0)
+    g.run_ppe_generative(
+        cube, ages, lats, lons, valid, obs_long, str(tmp_path / "gen"),
+        sampler=_sampler(cube, valid), gamma_grid=(0.01,), n_samples=2,
+        n_samples_select=2, n_noise=5, sel_subsample_truths=None, n_prior_samples=2, **kw)
+    ex.run_ppe(cube, ages, lats, lons, valid, obs_long, str(tmp_path / "pixel"),
+               b_scales=(1.0,), n_noise=5, **kw)
+
+    gen = np.load(tmp_path / "gen" / "ppe_analysis.npz")["drawn_ages"]
+    pixel = np.load(tmp_path / "pixel" / "ppe_analysis.npz")["drawn_ages"]
+    assert np.array_equal(gen, pixel)
 
 
 def test_run_withholding_generative_schema_and_npz(tmp_path, cube, ages, lats, lons, valid, obs_long):

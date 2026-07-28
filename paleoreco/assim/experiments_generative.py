@@ -30,7 +30,7 @@ from paleoreco.data.splits import chronological_half_split
 from paleoreco.assim.observations import observations_at_age, representativeness_variance
 from paleoreco.assim.innovation import obs_cell_index
 from paleoreco.assim.priors import build_prior
-from paleoreco.eval import calibration, da
+from paleoreco.eval import calibration
 from paleoreco.assim.experiments import (
     _obs_geometry, _draw_usable_ages, _naive_geometry, _naive_apply,
     _naive_obs_predictions, _pad_obs, _skill_rows, _ssim_rows, _field_calibration_rows,
@@ -57,7 +57,7 @@ def _native_calibration_rows(truth: np.ndarray, ens: np.ndarray, base: dict) -> 
     for chan_name, c in channels:
         t = truth.ravel() if c is None else truth[c]
         e = ens.reshape(ens.shape[0], -1) if c is None else ens[:, c]
-        mean, var = e.mean(axis=0), e.var(axis=0)
+        mean, var = e.mean(axis=0), e.var(axis=0, ddof=1)
         for metric, value in (
             ("ecr", calibration.ecr(t, mean, var)),
             ("sharpness", calibration.sharpness(var)),
@@ -77,7 +77,7 @@ def run_ppe_generative(
     valid: np.ndarray, long, out_dir: str, *, sampler,
     gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 16,
     n_samples_select: int = 8, n_shapes: int = 5, n_select: int = 4,
-    truth_stride: int = 10, sel_subsample_truths: int | None = 12,
+    n_noise: int = 5, truth_stride: int = 10, sel_subsample_truths: int | None = 12,
     n_prior_samples: int = 32, sel_tol: float = SEL_TOL, seed: int = 0,
     progress_every: int | None = None,
 ) -> pd.DataFrame:
@@ -87,8 +87,14 @@ def run_ppe_generative(
     network geometries, the first ``n_select`` for selection and the last for the
     test. ``gamma`` is swept on the selection shapes over ``sel_subsample_truths``
     truths (``None`` uses all), then the winner runs on the full test split.
-    Pseudo-obs are the truth at each site plus one ``N(0, sse)`` draw (shared across
-    ``gamma``); ``R = diag(sse)``.
+    Pseudo-obs are the truth at each site plus the mean of ``n_noise`` ``N(0, sse)``
+    draws (shared across ``gamma``); ``R = diag(sse)``.
+
+    Averaging the draws matches the classical lane, which averages ``n_noise``
+    analyses and, being affine in the observations, thereby assimilates the same
+    mean; without it the two lanes would assimilate observations of different
+    effective precision. Consuming the shared ``rng`` one draw at a time also keeps
+    the two lanes' streams aligned, so both draw the same network shapes per truth.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
     prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
@@ -113,7 +119,8 @@ def run_ppe_generative(
         for k_age in shape_ages:
             g = _obs_geometry(observations_at_age(long, int(k_age)), lats, lons, safe_flat)
             row_g.append(g)
-            row_n.append(rng.normal(0.0, np.sqrt(g["sse"])))
+            row_n.append(np.mean([rng.normal(0.0, np.sqrt(g["sse"]))
+                                  for _ in range(n_noise)], axis=0))
         geoms.append(row_g)
         noise.append(row_n)
 
@@ -153,17 +160,16 @@ def run_ppe_generative(
     recon_test = np.zeros((T, *shape))
     post_test = np.zeros((T, *shape))
     naive_test = {"nearest": np.zeros((T, *shape)), "idw": np.zeros((T, *shape))}
-    ens_valid, dist_test, test_obs = [], [], []
+    ens_valid, test_obs = [], []
     t0 = time.time()
     for ti in range(T):
         g, y, ens = _post_mean(ti, n_select, gamma_star, n_samples)
         recon_test[ti] = ens.mean(axis=0)
-        post_test[ti] = ens.var(axis=0)
+        post_test[ti] = ens.var(axis=0, ddof=1)
         ens_valid.append(ens[:, :, safe_valid])                 # (K, 2, n_valid)
         naive_geom = _naive_geometry(lats, lons, g, len(VARS))
         for kind in naive_test:
             naive_test[kind][ti] = _naive_apply(kind, naive_geom, y, shape)
-        dist_test.append(da.nearest_obs_distance(lats, lons, g["lat"], g["lon"]))
         test_obs.append({"lat": g["lat"], "lon": g["lon"],
                          "val": truth_anoms[ti].ravel()[g["gather"]],
                          "chan": g["gather"] // (len(lats) * len(lons))})
@@ -186,8 +192,8 @@ def run_ppe_generative(
         rows += _skill_rows(truth_anoms, naive_test[kind], safe_valid, events, nb)
         rows += _ssim_rows(truth_anoms, naive_test[kind], safe_valid, events, nb)
 
-    prior_ens = sampler.sample_prior(n_prior_samples, seed=seed + 99)
-    prior_ens_var = prior_ens.var(axis=0)
+    prior_ens = sampler.sample_prior(n_prior_samples, seed=seed + 1_000_000)
+    prior_ens_var = prior_ens.var(axis=0, ddof=1)
     obs_lat, obs_lon, obs_val, obs_chan, obs_n = _pad_obs(test_obs, T)
     npz = {
         "truth_anom": truth_anoms, "clim_mean": prior.clim_mean.astype(np.float64),
@@ -202,7 +208,10 @@ def run_ppe_generative(
     config = {"lane": LANE_PPE, "space": "generative", "selected": {"b_scale": gamma_star},
               "gamma_grid": [float(g) for g in gamma_grid], "n_samples": n_samples,
               "n_samples_select": n_samples_select, "n_shapes": n_shapes, "n_select": n_select,
-              "truth_stride": truth_stride, "seed": seed, "sampler": _sampler_meta(sampler),
+              "n_noise": n_noise, "n_truths": int(T), "truth_stride": truth_stride,
+              "sel_subsample_truths": sel_subsample_truths,
+              "n_prior_samples": n_prior_samples, "sel_tol": sel_tol,
+              "seed": seed, "sampler": _sampler_meta(sampler),
               "prior_meta": prior.meta}
     _write(out_dir, LANE_PPE, "analysis", rows, npz, config)
     return pd.DataFrame(rows)
@@ -272,7 +281,7 @@ def run_withholding_generative(
             sse.append(o["sse"][wk].astype(np.float64))
             rep_out.append(rep[gw // n_cells])
             pred.append(ens_w.mean(axis=0))
-            post_var.append(ens_w.var(axis=0))
+            post_var.append(ens_w.var(axis=0, ddof=1))
             prior_var.append(diagB[gw])
             ens_cols.append(ens_w)
             nv, d = _naive_obs_predictions(
@@ -373,7 +382,7 @@ def _native_obs_calibration_rows(tp: dict, base: dict) -> list[dict]:
         if sel.sum() < 2:
             continue
         a, e = tp["actual"][sel], tp["ens"][:, sel]
-        var = e.var(axis=0) + extra[sel]
+        var = e.var(axis=0, ddof=1) + extra[sel]
         for metric, value in (
             ("ecr", calibration.ecr(a, e.mean(axis=0), var)),
             ("sharpness", calibration.sharpness(var)),

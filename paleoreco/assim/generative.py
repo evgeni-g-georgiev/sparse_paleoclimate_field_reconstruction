@@ -150,8 +150,13 @@ class GuidedSampler(Method):
     # -- Method contract -------------------------------------------------
     @staticmethod
     def reduce(ensemble: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Ensemble ``(n, 2, H, W)`` to per-cell mean and variance."""
-        return ensemble.mean(axis=0), ensemble.var(axis=0)
+        """Ensemble ``(n, 2, H, W)`` to per-cell mean and variance.
+
+        The variance is the unbiased estimate: scatter about the sample mean
+        understates the spread by ``(n - 1) / n``, which at the ensemble sizes used
+        here is a systematic few percent against an analytic posterior variance.
+        """
+        return ensemble.mean(axis=0), ensemble.var(axis=0, ddof=1)
 
     def analyze(self, obs: Observations, background_anom: np.ndarray) -> AnalysisResult:
         ens = self.sample_posterior(obs.gather, obs.y_anom, obs.sse,
