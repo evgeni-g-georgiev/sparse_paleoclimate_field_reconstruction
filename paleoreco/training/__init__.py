@@ -1,9 +1,10 @@
-"""Model training: losses, the AE/VAE trainers, and the CV fold loop.
+"""Model training: losses, the model trainers, and the CV fold loop.
 
-* :mod:`paleoreco.training.losses`      - masked reconstruction + VAE ELBO losses.
-* :mod:`paleoreco.training.trainer_ae`  - ConvAE training loop.
-* :mod:`paleoreco.training.trainer_vae` - ConvBetaVAE training loop (KL warmup).
-* :mod:`paleoreco.training.cv`          - per-fold anomaly centring, fit/eval loop, refit.
+* :mod:`paleoreco.training.losses`            - masked reconstruction + VAE ELBO losses.
+* :mod:`paleoreco.training.trainer_ae`        - ConvAE training loop.
+* :mod:`paleoreco.training.trainer_vae`       - ConvBetaVAE training loop (KL warmup).
+* :mod:`paleoreco.training.trainer_diffusion` - EDM denoiser training loop.
+* :mod:`paleoreco.training.cv`                - per-fold anomaly centring, fit/eval loop, refit.
 
 ``set_seed`` is re-exported as the one cross-trainer convenience.
 """
