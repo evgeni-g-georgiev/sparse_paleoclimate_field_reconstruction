@@ -23,6 +23,8 @@ from paleoreco.models.diffusion import CircularUNet, EDMDenoiser
 SKILL = {"ce", "corr", "rmse", "rrmse", "amplitude", "ssim"}
 GAUSS_CAL = {"crps", "crpss", "rcrv_bias", "rcrv_dispersion", "coverage90"}
 NATIVE_CAL = {"ecr", "sharpness", "crps_ens", "coverage90_ens"}
+# The sampling-error-corrected RRMSE, which is the surface gamma is selected on.
+SELECTION = {"rrmse_ens"}
 
 
 def _sampler(cube, valid):
@@ -52,7 +54,7 @@ def test_run_ppe_generative_schema_and_npz(tmp_path, cube, ages, lats, lons, val
     gen = df[df["method"] == "generative"]
     assert (gen["space"] == "generative").all()
     assert set(gen["split"]) == {"selection", "test"}
-    assert (SKILL | GAUSS_CAL | NATIVE_CAL).issubset(set(gen["metric"]))
+    assert (SKILL | GAUSS_CAL | NATIVE_CAL | SELECTION).issubset(set(gen["metric"]))
     # gamma is the operating point, recorded as b_scale.
     cfg = json.load(open(out / "ppe_config.json"))
     assert cfg["selected"]["b_scale"] in (0.01, 0.1)

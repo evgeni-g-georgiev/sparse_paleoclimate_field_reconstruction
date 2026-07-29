@@ -14,6 +14,10 @@ workload, then the winner is run once on the full test split. Rows carry
 selection rule (:func:`select_best_config`) and the reported test rows match the
 classical lanes. Calibration is scored both as a Gaussian summary of the
 ensemble (directly comparable to 3DVar) and natively over the ensemble.
+
+Each pass builds its whole list of posterior draws before executing it, so a sampler
+that spreads draws over worker processes stays fed and the progress line quotes an
+ETA over the pass rather than over one gamma.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from paleoreco.data.splits import chronological_half_split
 from paleoreco.assim.observations import observations_at_age, representativeness_variance
 from paleoreco.assim.innovation import obs_cell_index
 from paleoreco.assim.priors import build_prior
+from paleoreco.assim.generative import PosteriorJob
 from paleoreco.eval import calibration
 from paleoreco.assim.experiments import (
     _obs_geometry, _draw_usable_ages, _naive_geometry, _naive_apply,
@@ -38,13 +43,43 @@ from paleoreco.assim.experiments import (
     _report_progress, select_best_config, _NAN_REG, LANE_PPE, SEL_TOL,
 )
 
-GAMMA_GRID = (0.003, 0.01, 0.03, 0.1, 0.3)
+GAMMA_GRID = (0.01, 0.02, 0.03, 0.05, 0.1)
 _GEN = {"method": "generative", "space": "generative", **_NAN_REG}
 
 
+def _stream(sampler, jobs, label: str, progress_every: int | None):
+    """Yield each job's ensemble in order, reporting progress over the whole list.
+
+    Every draw costs the same (``n_steps * (2 + n_correct)`` network evaluations,
+    independent of how many observations it carries), so the linear-rate ETA
+    :func:`_report_progress` prints is accurate rather than indicative.
+    """
+    t0 = time.time()
+    for k, ens in enumerate(sampler.imap_posterior(jobs)):
+        yield ens
+        if progress_every and (k + 1) % progress_every == 0:
+            _report_progress(label, k + 1, len(jobs), t0)
+
+
 # ---------------------------------------------------------------------------
-# Native ensemble calibration (over and above the Gaussian-summary rows).
+# Selection surface and native ensemble calibration.
 # ---------------------------------------------------------------------------
+def _ens_rrmse_row(truth: np.ndarray, pred: np.ndarray, post_var: np.ndarray,
+                   n: int, base: dict) -> dict:
+    """Pooled RRMSE with the ``n``-member sampling error removed.
+
+    The mean of ``n`` posterior draws carries an extra ``mean(post_var) / n`` of
+    squared error, and the posterior spread grows with ``gamma``, so the raw
+    ensemble RRMSE tilts selection toward small ``gamma``. Subtracting it compares
+    operating points at their large-ensemble value.
+    """
+    mse = float(np.mean((pred - truth) ** 2)) - float(np.mean(post_var)) / n
+    sd = float(np.std(truth))
+    value = float(np.sqrt(max(mse, 0.0)) / sd) if sd > 0 else float("nan")
+    return {**base, "do_event": "all", "channel": "pooled",
+            "metric": "rrmse_ens", "value": value}
+
+
 def _native_calibration_rows(truth: np.ndarray, ens: np.ndarray, base: dict) -> list[dict]:
     """ECR, sharpness, native CRPS/coverage over a ``(K, C, N)`` ensemble, pooled and per channel.
 
@@ -75,8 +110,8 @@ def _native_calibration_rows(truth: np.ndarray, ens: np.ndarray, base: dict) -> 
 def run_ppe_generative(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long, out_dir: str, *, sampler,
-    gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 16,
-    n_samples_select: int = 8, n_shapes: int = 5, n_select: int = 4,
+    gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 32,
+    n_samples_select: int = 16, n_shapes: int = 5, n_select: int = 4,
     n_noise: int = 5, truth_stride: int = 10, sel_subsample_truths: int | None = 12,
     n_prior_samples: int = 32, sel_tol: float = SEL_TOL, seed: int = 0,
     progress_every: int | None = None,
@@ -95,6 +130,8 @@ def run_ppe_generative(
     mean; without it the two lanes would assimilate observations of different
     effective precision. Consuming the shared ``rng`` one draw at a time also keeps
     the two lanes' streams aligned, so both draw the same network shapes per truth.
+
+    ``progress_every`` counts posterior draws.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
     prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
@@ -129,31 +166,37 @@ def run_ppe_generative(
         y = truth_anoms[ti].ravel()[g["gather"]] + noise[ti][si]
         return g, y
 
-    def _post_mean(ti, si, gamma, n):
+    def _job(ti, si, gamma, n):
         g, y = _obs(ti, si)
-        ens = sampler.sample_posterior(g["gather"], y, g["sse"], gamma, n,
-                                       seed=seed + ti * n_shapes + si)
-        return g, y, ens
+        return PosteriorJob(g["gather"], y, g["sse"], gamma, n,
+                            seed + ti * n_shapes + si)
 
     # -- selection: sweep gamma on selection shapes over a truth subset ----
     sel_ti = (np.arange(T) if sel_subsample_truths is None
               else np.linspace(0, T - 1, min(sel_subsample_truths, T)).round().astype(int))
     sel_ti = np.unique(sel_ti)
+    sel_keys = [(gamma, ti) for gamma in gamma_grid for ti in sel_ti
+                for _ in range(n_select)]
+    sel_jobs = [_job(ti, si, gamma, n_samples_select)
+                for gamma in gamma_grid for ti in sel_ti for si in range(n_select)]
+
+    means, varis = [], []
+    for ens in _stream(sampler, sel_jobs, "ppe selection draws", progress_every):
+        means.append(ens.mean(axis=0))
+        varis.append(ens.var(axis=0, ddof=1))
+
     rows: list[dict] = []
-    t0 = time.time()
-    for gi, gamma in enumerate(gamma_grid):
-        recon, truth_pool = [], []
-        for ti in sel_ti:
-            for si in range(n_select):
-                _, _, ens = _post_mean(ti, si, gamma, n_samples_select)
-                recon.append(ens.mean(axis=0))
-                truth_pool.append(truth_anoms[ti])
+    for gamma in gamma_grid:
+        sel = [k for k, (gm, _) in enumerate(sel_keys) if gm == gamma]
+        recon = np.stack([means[k] for k in sel])
+        post = np.stack([varis[k] for k in sel])
+        truth_pool = np.stack([truth_anoms[sel_keys[k][1]] for k in sel])
         base = {**_GEN, "lane": LANE_PPE, "fold": -1, "b_scale": float(gamma),
                 "background": "climatological", "split": "selection"}
-        rows += _skill_rows(np.stack(truth_pool), np.stack(recon), safe_valid,
+        rows += _skill_rows(truth_pool, recon, safe_valid,
                             np.zeros(len(recon), np.int64), base)
-        if progress_every:
-            _report_progress("gamma", gi + 1, len(gamma_grid), t0)
+        rows.append(_ens_rrmse_row(truth_pool[:, :, safe_valid], recon[:, :, safe_valid],
+                                   post[:, :, safe_valid], n_samples_select, base))
     gamma_star = select_best_config(_sel_rrmse(rows), sel_tol=sel_tol)["b_scale"]
 
     # -- test: run the winner on the held-out shape, all truths ------------
@@ -161,9 +204,10 @@ def run_ppe_generative(
     post_test = np.zeros((T, *shape))
     naive_test = {"nearest": np.zeros((T, *shape)), "idw": np.zeros((T, *shape))}
     ens_valid, test_obs = [], []
-    t0 = time.time()
-    for ti in range(T):
-        g, y, ens = _post_mean(ti, n_select, gamma_star, n_samples)
+    test_jobs = [_job(ti, n_select, gamma_star, n_samples) for ti in range(T)]
+    for ti, ens in enumerate(_stream(sampler, test_jobs, "ppe test draws",
+                                     progress_every)):
+        g, y = _obs(ti, n_select)
         recon_test[ti] = ens.mean(axis=0)
         post_test[ti] = ens.var(axis=0, ddof=1)
         ens_valid.append(ens[:, :, safe_valid])                 # (K, 2, n_valid)
@@ -173,12 +217,13 @@ def run_ppe_generative(
         test_obs.append({"lat": g["lat"], "lon": g["lon"],
                          "val": truth_anoms[ti].ravel()[g["gather"]],
                          "chan": g["gather"] // (len(lats) * len(lons))})
-        if progress_every and (ti + 1) % progress_every == 0:
-            _report_progress("truth", ti + 1, T, t0)
 
     base = {**_GEN, "lane": LANE_PPE, "fold": -1, "b_scale": float(gamma_star),
             "background": "climatological", "split": "test"}
     rows += _skill_rows(truth_anoms, recon_test, safe_valid, events, base)
+    rows.append(_ens_rrmse_row(truth_anoms[:, :, safe_valid],
+                               recon_test[:, :, safe_valid],
+                               post_test[:, :, safe_valid], n_samples, base))
     rows += _ssim_rows(truth_anoms, recon_test, safe_valid, events, base)
     rows += _field_calibration_rows(truth_anoms, recon_test, post_test, prior_var,
                                     safe_valid, events, base)
@@ -223,8 +268,8 @@ def run_ppe_generative(
 def run_withholding_generative(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long, out_dir: str, *, sampler,
-    gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 16,
-    n_samples_select: int = 8, k_folds: int = 5, fold_kind: str = "random",
+    gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 32,
+    n_samples_select: int = 16, k_folds: int = 5, fold_kind: str = "random",
     age_stride: int = 6, sel_tol: float = SEL_TOL, seed: int = 0,
     progress_every: int | None = None,
 ) -> pd.DataFrame:
@@ -236,6 +281,8 @@ def run_withholding_generative(
     with ``rep_var`` estimated per fold from the assimilated sites only. Ages are
     thinned by ``age_stride`` on both passes to bound the sampling cost; the stride
     is recorded in the config.
+
+    ``progress_every`` counts posterior draws.
     """
     from paleoreco.assim.experiments import _site_folds
 
@@ -257,12 +304,14 @@ def run_withholding_generative(
         rv = representativeness_variance(long, cell_all, sites=sites)
         return np.array([rv.get(v, 0.0) for v in VARS])
 
-    def predict(assim_sites, target_sites, gamma, n):
-        """Assimilate ``assim_sites``, return withheld-site predictions pooled over ages."""
+    def fold_split(assim_sites, target_sites):
+        """Per-age observation split for one assim/target pair, free of ``gamma``.
+
+        The split is what the posterior draws are built from, and it does not depend
+        on the operating point, so one build serves the whole grid.
+        """
         rep = rep_lookup(assim_sites)
-        actual, channel, sse, rep_out = [], [], [], []
-        pred, post_var, prior_var, dist, ens_cols = [], [], [], [], []
-        naive = {"nearest": [], "idw": []}
+        out = []
         for age in obs_ages:
             o = observations_at_age(long, int(age))
             gather = obs_cell_index(o["lat"], o["lon"], o["channel"], lats, lons)
@@ -273,73 +322,94 @@ def run_withholding_generative(
                 continue
             y_anom = (o["y"][kept] - o["my"][kept]).astype(np.float64)
             gk, gw = gather[kept], gather[wk]
-            r = o["sse"][kept].astype(np.float64) + rep[gk // n_cells]
-            ens = sampler.sample_posterior(gk, y_anom, r, gamma, n, seed=seed + int(age))
-            ens_w = ens.reshape(n, -1)[:, gw]                   # (n, n_w)
-            actual.append((o["y"][wk] - o["my"][wk]).astype(np.float64))
-            channel.append(gw // n_cells)
-            sse.append(o["sse"][wk].astype(np.float64))
-            rep_out.append(rep[gw // n_cells])
-            pred.append(ens_w.mean(axis=0))
-            post_var.append(ens_w.var(axis=0, ddof=1))
-            prior_var.append(diagB[gw])
-            ens_cols.append(ens_w)
             nv, d = _naive_obs_predictions(
                 {"lat": o["lat"][kept], "lon": o["lon"][kept], "y": y_anom, "chan": gk // n_cells},
                 {"lat": o["lat"][wk], "lon": o["lon"][wk], "chan": gw // n_cells}, len(VARS))
-            for kind in naive:
-                naive[kind].append(nv[kind])
-            dist.append(d)
-        if not actual:
-            return None
-        return {"actual": np.concatenate(actual), "channel": np.concatenate(channel),
-                "sse": np.concatenate(sse), "rep_var": np.concatenate(rep_out),
-                "pred": np.concatenate(pred), "post_var": np.concatenate(post_var),
-                "prior_var": np.concatenate(prior_var), "ens": np.concatenate(ens_cols, axis=1),
-                "distance_km": np.concatenate(dist),
-                "naive": {k: np.concatenate(v) for k, v in naive.items()}}
+            out.append({
+                "age": int(age), "gk": gk, "gw": gw, "y_anom": y_anom,
+                "r": o["sse"][kept].astype(np.float64) + rep[gk // n_cells],
+                "actual": (o["y"][wk] - o["my"][wk]).astype(np.float64),
+                "channel": gw // n_cells, "sse": o["sse"][wk].astype(np.float64),
+                "rep_var": rep[gw // n_cells], "prior_var": diagB[gw],
+                "naive": nv, "distance_km": d})
+        return out
 
-    def skill_and_calib(tp, gamma, split, fold):
+    def fold_jobs(splits, gamma, n):
+        return [PosteriorJob(s["gk"], s["y_anom"], s["r"], gamma, n, seed + s["age"])
+                for s in splits]
+
+    def collect(splits, cols):
+        """Withheld-site predictions for one fold, from its withheld-column ensembles."""
+        if not splits:
+            return None
+        keys = ("actual", "channel", "sse", "rep_var", "prior_var", "distance_km")
+        out = {k: np.concatenate([s[k] for s in splits]) for k in keys}
+        out["pred"] = np.concatenate([c.mean(axis=0) for c in cols])
+        out["post_var"] = np.concatenate([c.var(axis=0, ddof=1) for c in cols])
+        out["ens"] = np.concatenate(cols, axis=1)
+        out["naive"] = {k: np.concatenate([s["naive"][k] for s in splits])
+                        for k in splits[0]["naive"]}
+        return out
+
+    def skill_and_calib(tp, gamma, split, fold, n):
         base = {**_GEN, "lane": lane, "fold": fold, "b_scale": float(gamma),
                 "background": "climatological", "split": split}
         out = _withholding_rows(tp["actual"], tp["pred"], tp["channel"], base)
         groups = _obs_channel_groups(tp["channel"])
         out += _calibration_rows(tp["actual"], tp["pred"], tp["post_var"] + tp["sse"] + tp["rep_var"],
                                  gamma * tp["prior_var"] + tp["sse"] + tp["rep_var"], groups, base)
+        out.append(_ens_rrmse_row(tp["actual"], tp["pred"], tp["post_var"], n, base))
         return out
 
     # -- selection: rotate the val fold, pool, pick gamma -----------------
+    sel_splits = [fold_split(all_sites - fold_sets[(i + 1) % k_folds] - fold_sets[i],
+                             fold_sets[(i + 1) % k_folds]) for i in range(k_folds)]
+    sel_flat = [s for _ in gamma_grid for sp in sel_splits for s in sp]
+    sel_jobs = [j for gamma in gamma_grid for sp in sel_splits
+                for j in fold_jobs(sp, gamma, n_samples_select)]
+    sel_cols = [ens.reshape(n_samples_select, -1)[:, s["gw"]]
+                for s, ens in zip(sel_flat, _stream(sampler, sel_jobs,
+                                                    f"withholding selection draws ({lane})",
+                                                    progress_every))]
+
     rows: list[dict] = []
-    t0 = time.time()
-    for gi, gamma in enumerate(gamma_grid):
+    at = 0
+    for gamma in gamma_grid:
         parts = []
-        for i in range(k_folds):
-            assim = all_sites - fold_sets[(i + 1) % k_folds] - fold_sets[i]
-            tp = predict(assim, fold_sets[(i + 1) % k_folds], gamma, n_samples_select)
+        for sp in sel_splits:
+            tp = collect(sp, sel_cols[at:at + len(sp)])
+            at += len(sp)
             if tp is not None:
                 parts.append(tp)
         if parts:
-            rows += skill_and_calib(_concat(parts), gamma, "selection", -1)
-        if progress_every:
-            _report_progress(f"gamma ({lane})", gi + 1, len(gamma_grid), t0)
+            rows += skill_and_calib(_concat(parts), gamma, "selection", -1,
+                                    n_samples_select)
     gamma_star = select_best_config(_sel_rrmse(rows, lane), sel_tol=sel_tol)["b_scale"]
 
     # -- test: assimilate 4 folds, predict the 5th ------------------------
+    test_splits = [fold_split(all_sites - fold_sets[i], fold_sets[i])
+                   for i in range(k_folds)]
+    test_flat = [s for sp in test_splits for s in sp]
+    test_jobs = [j for sp in test_splits for j in fold_jobs(sp, gamma_star, n_samples)]
+    test_cols = [ens.reshape(n_samples, -1)[:, s["gw"]]
+                 for s, ens in zip(test_flat, _stream(sampler, test_jobs,
+                                                      f"withholding test draws ({lane})",
+                                                      progress_every))]
+
     pooled = []
-    t0 = time.time()
-    for i in range(k_folds):
-        tp = predict(all_sites - fold_sets[i], fold_sets[i], gamma_star, n_samples)
+    at = 0
+    for i, sp in enumerate(test_splits):
+        tp = collect(sp, test_cols[at:at + len(sp)])
+        at += len(sp)
         if tp is None:
             continue
-        rows += skill_and_calib(tp, gamma_star, "test", i)
+        rows += skill_and_calib(tp, gamma_star, "test", i, n_samples)
         pooled.append(tp)
-        if progress_every:
-            _report_progress(f"test-fold ({lane})", i + 1, k_folds, t0)
 
     predictions = {"b_scales": np.asarray([gamma_star]), "rep_var_full": rep_lookup(all_sites)}
     if pooled:
         tp = _concat(pooled)
-        rows += skill_and_calib(tp, gamma_star, "test", -1)
+        rows += skill_and_calib(tp, gamma_star, "test", -1, n_samples)
         native_base = {**_GEN, "lane": lane, "fold": -1, "b_scale": float(gamma_star),
                        "background": "climatological", "split": "test"}
         rows += _native_obs_calibration_rows(tp, native_base)
@@ -405,10 +475,10 @@ def _concat(parts: list[dict]) -> dict:
 
 
 def _sel_rrmse(rows: list[dict], lane: str = LANE_PPE) -> pd.DataFrame:
-    """Pooled selection-split RRMSE rows, the surface ``gamma`` is chosen on."""
+    """Sampling-error-corrected selection-split RRMSE, the surface ``gamma`` is chosen on."""
     M = pd.DataFrame(rows)
     return M[(M.lane == lane) & (M.split == "selection") & (M.channel == "pooled")
-             & (M.do_event == "all") & (M.metric == "rrmse")]
+             & (M.do_event == "all") & (M.metric == "rrmse_ens")]
 
 
 def _sampler_meta(sampler) -> dict:
