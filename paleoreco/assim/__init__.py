@@ -16,6 +16,8 @@ Methods and drivers, reached by submodule path rather than re-exported:
 * :mod:`paleoreco.assim.priors`       - the Prior container and its tapers.
 * :mod:`paleoreco.assim.threedvar`    - gain-form pixel 3DVar.
 * :mod:`paleoreco.assim.latent`       - latent-space 3DVar.
+* :mod:`paleoreco.assim.generative`   - guided posterior sampling from a score prior.
+* :mod:`paleoreco.assim.sampler_pool` - the guided sampler across worker processes.
 * :mod:`paleoreco.assim.experiments`  - PPE and withholding lane runners.
 """
 

@@ -18,6 +18,8 @@ units. Masked cells are held at zero throughout.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 
@@ -38,6 +40,22 @@ def _edm_sigmas(n_steps: int, sigma_min: float, sigma_max: float, rho: float) ->
     r = 1.0 / rho
     sig = (sigma_max ** r + i / (n_steps - 1) * (sigma_min ** r - sigma_max ** r)) ** rho
     return np.concatenate([sig, [0.0]])
+
+
+@dataclass(frozen=True)
+class PosteriorJob:
+    """One posterior draw: an observation network, its operating point, and its seed.
+
+    Carrying the seed on the job is what makes a batch of draws order-independent,
+    so the same list yields the same ensembles however it is executed.
+    """
+
+    gather: np.ndarray
+    y_anom: np.ndarray
+    r_diag: np.ndarray
+    gamma: float
+    n: int
+    seed: int
 
 
 class GuidedSampler(Method):
@@ -146,6 +164,12 @@ class GuidedSampler(Method):
             return -0.5 * ((y_t[None, :] - pred) ** 2 / v).sum()
 
         return self._denorm(self._sample(n, guidance, seed))
+
+    def imap_posterior(self, jobs):
+        """Posterior ensembles for a sequence of :class:`PosteriorJob`, in order."""
+        for j in jobs:
+            yield self.sample_posterior(j.gather, j.y_anom, j.r_diag, j.gamma,
+                                        j.n, j.seed)
 
     # -- Method contract -------------------------------------------------
     @staticmethod
