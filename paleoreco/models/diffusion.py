@@ -188,3 +188,15 @@ class EDMDenoiser(nn.Module):
         """Score ``grad log p(x; sigma) = (D(x; sigma) - x) / sigma^2`` (Tweedie)."""
         sigma = self._broadcast(sigma, x.shape[0], x.device, x.dtype)
         return (self.forward(x, sigma) - x) / sigma[:, None, None, None] ** 2
+
+
+def load_denoiser(path: str, map_location="cpu") -> tuple[EDMDenoiser, list[float]]:
+    """Rebuild a denoiser and its per-channel anomaly scales from a checkpoint.
+
+    The scales come back as the stored list, which is what the sampler's normalised
+    frame is defined against; a denoiser loaded without them cannot be used.
+    """
+    ckpt = torch.load(path, map_location=map_location)
+    net = EDMDenoiser(CircularUNet(**ckpt["config"]), ckpt["sigma_data"])
+    net.load_state_dict(ckpt["state_dict"])
+    return net, ckpt["channel_scales"]
