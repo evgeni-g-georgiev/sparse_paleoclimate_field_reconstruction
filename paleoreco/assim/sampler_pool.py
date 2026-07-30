@@ -22,11 +22,12 @@ from paleoreco.models.diffusion import load_denoiser
 _SAMPLER: GuidedSampler | None = None
 
 
-def _init_worker(checkpoint_path: str, safe_valid: np.ndarray, kwargs: dict) -> None:
+def _init_worker(checkpoint_path: str, safe_valid: np.ndarray, prior_var: np.ndarray,
+                 kwargs: dict) -> None:
     """Build this worker's sampler once, so the model and CUDA context are reused."""
     global _SAMPLER
     net, scales = load_denoiser(checkpoint_path)
-    _SAMPLER = GuidedSampler(net, np.asarray(scales), safe_valid, **kwargs)
+    _SAMPLER = GuidedSampler(net, np.asarray(scales), safe_valid, prior_var, **kwargs)
 
 
 def _run_posterior(job) -> np.ndarray:
@@ -41,16 +42,19 @@ def _run_prior(n: int, seed: int) -> np.ndarray:
 class SamplerPool:
     """A :class:`GuidedSampler` replicated across worker processes.
 
-    ``n_steps``, ``n_correct``, ``tau`` and ``sd`` are mirrored from the sampler the
-    workers build, so a run's provenance record does not depend on how it executed.
+    ``n_steps``, ``n_correct``, ``tau``, ``sd`` and ``prior_var`` are mirrored from the
+    sampler the workers build, so a run's provenance record does not depend on how it
+    executed.
     """
 
-    def __init__(self, checkpoint_path: str, safe_valid: np.ndarray, *,
-                 n_workers: int = 4, gamma: float = 1e-2, n_samples: int = 16,
+    def __init__(self, checkpoint_path: str, safe_valid: np.ndarray,
+                 prior_var: np.ndarray, *,
+                 n_workers: int = 4, gamma: float = 1.0, n_samples: int = 16,
                  n_steps: int = 64, n_correct: int = 2, corrector_tau: float = 0.3,
                  device: str | None = None):
         if n_workers < 1:
             raise ValueError(f"n_workers must be >= 1; got {n_workers}")
+        self.prior_var = np.asarray(prior_var, dtype=np.float64)
         self.gamma = gamma
         self.n_samples = n_samples
         self.n_steps = n_steps
@@ -67,7 +71,8 @@ class SamplerPool:
         ctx = multiprocessing.get_context("spawn")
         self._pool = ctx.Pool(n_workers, initializer=_init_worker,
                               initargs=(str(checkpoint_path),
-                                        np.asarray(safe_valid, dtype=bool), kwargs))
+                                        np.asarray(safe_valid, dtype=bool),
+                                        self.prior_var, kwargs))
 
     def imap_posterior(self, jobs):
         """Posterior ensembles for a sequence of :class:`PosteriorJob`, in order."""

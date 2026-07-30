@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from paleoreco.assim.generative import GuidedSampler, channel_scales
+from paleoreco.assim.generative import GuidedSampler, channel_scales, likelihood_var
 from paleoreco.assim.method import Observations
 
 
@@ -35,13 +35,25 @@ def _sampler(Sigma, shape, **kw):
     # channel_scales == sigma_data makes the normalised frame equal the anomaly frame.
     scales = np.full(shape[0], _AnalyticDenoiser.sigma_data)
     return GuidedSampler(_AnalyticDenoiser(Sigma), scales, np.ones(shape[1:], bool),
-                         device="cpu", **kw)
+                         np.diag(Sigma).reshape(shape), device="cpu", **kw)
 
 
 def _spd(d, seed):
     rng = np.random.default_rng(seed)
     A = rng.standard_normal((d, d))
     return A @ A.T / d + 0.3 * np.eye(d)
+
+
+def test_likelihood_var_brackets_r_and_r_plus_prior_var():
+    r, b = np.array([0.2, 0.5]), np.array([1.0, 4.0])
+    assert np.allclose(likelihood_var(r, b, 1e-4, 1.0), r, atol=1e-6)
+    assert np.allclose(likelihood_var(r, b, 1e6, 1.0), r + b, rtol=1e-6)
+    mid, high = likelihood_var(r, b, 0.5, 1.0), likelihood_var(r, b, 2.0, 1.0)
+    assert (r < mid).all() and (mid < high).all() and (high < r + b).all()
+
+
+def test_likelihood_var_is_r_where_the_prior_has_no_variance():
+    assert likelihood_var(np.array([0.3]), np.array([0.0]), 1.0, 1.0) == 0.3
 
 
 def test_channel_scales_are_per_channel_std():
@@ -61,7 +73,8 @@ def test_prior_sampling_recovers_gaussian_covariance():
     assert rel < 0.4
 
 
-def test_posterior_mean_matches_kalman():
+def _kalman_rel(gamma):
+    """Relative error of the guided posterior mean against the closed-form update."""
     shape = (2, 2, 2)
     d = int(np.prod(shape))
     Sigma = _spd(d, 0)
@@ -74,9 +87,20 @@ def test_posterior_mean_matches_kalman():
     H[0, 0], H[1, 5] = 1.0, 1.0
     kalman = Sigma @ H.T @ np.linalg.inv(H @ Sigma @ H.T + np.diag(R)) @ y
 
-    ens = samp.sample_posterior(gather, y, R, gamma=1e-3, n=4000, seed=2).reshape(4000, -1)
-    rel = np.linalg.norm(ens.mean(0) - kalman) / np.linalg.norm(kalman)
-    assert rel < 0.1
+    ens = samp.sample_posterior(gather, y, R, gamma=gamma, n=4000, seed=2).reshape(4000, -1)
+    return np.linalg.norm(ens.mean(0) - kalman) / np.linalg.norm(kalman)
+
+
+def test_posterior_mean_matches_kalman():
+    assert _kalman_rel(1e-3) < 0.1
+
+
+def test_posterior_mean_matches_kalman_at_the_gaussian_gamma():
+    """``gamma = 1`` carries the full prior-variance term, and the closed form survives
+    it: taking only Sigma's diagonal while Sigma is correlated costs nothing here, so
+    the same bound as the vanishing-gamma case holds.
+    """
+    assert _kalman_rel(1.0) < 0.1
 
 
 def test_masked_cells_stay_zero():
@@ -84,14 +108,16 @@ def test_masked_cells_stay_zero():
     safe = np.ones((4, 4), bool)
     safe[0] = False
     samp = GuidedSampler(_AnalyticDenoiser(np.eye(np.prod(shape))),
-                         np.full(2, 0.5), safe, n_steps=8, n_correct=1, device="cpu")
+                         np.full(2, 0.5), safe, np.ones(shape),
+                         n_steps=8, n_correct=1, device="cpu")
     x = samp.sample_prior(3, seed=0)
     assert np.allclose(x[:, :, ~safe], 0.0)
 
 
 def test_analyze_returns_mean_and_variance():
     shape = (2, 2, 2)
-    samp = _sampler(_spd(8, 1), shape, n_steps=8, n_correct=1, n_samples=6, gamma=0.01)
+    # gamma away from the constructor default, so this also covers analyze reading it.
+    samp = _sampler(_spd(8, 1), shape, n_steps=8, n_correct=1, n_samples=6, gamma=2.0)
     obs = Observations(gather=np.array([0, 5]), y_anom=np.array([0.5, -0.5]),
                        sse=np.array([0.1, 0.1]))
     res = samp.analyze(obs, np.zeros(int(np.prod(shape))))

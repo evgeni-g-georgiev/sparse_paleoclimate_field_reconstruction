@@ -7,13 +7,14 @@ truth draws, site folds, representativeness variance, metric rows, and tidy CSV
 schema are reused unchanged, so the generative method drops into notebook 09's
 cross-method comparison with no special-casing.
 
-``gamma`` (the likelihood inflation) is the tuned operating point, the analogue
-of 3DVar ``b_scale``: swept on the held-out selection split over a reduced
-workload, then the winner is run once on the full test split. Rows carry
-``method="generative"``, ``space="generative"``, and ``b_scale=gamma`` so the
-selection rule (:func:`select_best_config`) and the reported test rows match the
-classical lanes. Calibration is scored both as a Gaussian summary of the
-ensemble (directly comparable to 3DVar) and natively over the ensemble.
+``gamma`` scales the prior-variance term of the likelihood covariance and is the
+tuned operating point, the analogue of 3DVar ``b_scale``: swept on the held-out
+selection split over a reduced workload, then the winner is run once on the full
+test split. Rows carry ``method="generative"``, ``space="generative"``, and
+``b_scale=gamma`` so the selection rule (:func:`select_best_config`) and the
+reported test rows match the classical lanes. Calibration is scored both as a
+Gaussian summary of the ensemble (directly comparable to 3DVar) and natively over
+the ensemble.
 
 Each pass builds its whole list of posterior draws before executing it, so a sampler
 that spreads draws over worker processes stays fed and the progress line quotes an
@@ -43,7 +44,7 @@ from paleoreco.assim.experiments import (
     _report_progress, select_best_config, _NAN_REG, LANE_PPE, SEL_TOL,
 )
 
-GAMMA_GRID = (0.01, 0.02, 0.03, 0.05, 0.1)
+GAMMA_GRID = (0.25, 0.5, 1.0, 2.0, 4.0)
 _GEN = {"method": "generative", "space": "generative", **_NAN_REG}
 
 
@@ -113,7 +114,7 @@ def run_ppe_generative(
     gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 32,
     n_samples_select: int = 16, n_shapes: int = 5, n_select: int = 4,
     n_noise: int = 5, truth_stride: int = 10, sel_subsample_truths: int | None = 12,
-    n_prior_samples: int = 32, sel_tol: float = SEL_TOL, seed: int = 0,
+    sel_tol: float = SEL_TOL, seed: int = 0,
     progress_every: int | None = None,
 ) -> pd.DataFrame:
     """Same-model PPE with a generative prior; guided sampling replaces the gain.
@@ -237,12 +238,13 @@ def run_ppe_generative(
         rows += _skill_rows(truth_anoms, naive_test[kind], safe_valid, events, nb)
         rows += _ssim_rows(truth_anoms, naive_test[kind], safe_valid, events, nb)
 
-    prior_ens = sampler.sample_prior(n_prior_samples, seed=seed + 1_000_000)
-    prior_ens_var = prior_ens.var(axis=0, ddof=1)
     obs_lat, obs_lon, obs_val, obs_chan, obs_n = _pad_obs(test_obs, T)
     npz = {
         "truth_anom": truth_anoms, "clim_mean": prior.clim_mean.astype(np.float64),
-        "safe_valid": safe_valid, "prior_var": prior_var, "prior_ens_var": prior_ens_var,
+        "safe_valid": safe_valid, "prior_var": prior_var,
+        # The same variance the likelihood reads, so the diagnostic and the guidance
+        # cannot disagree.
+        "prior_ens_var": sampler.prior_var,
         "post_var": post_test[None], "recon_climatological": recon_test[None],
         "b_scales": np.asarray([gamma_star]), "lats": np.asarray(lats), "lons": np.asarray(lons),
         "drawn_ages": drawn_ages, "truth_clim": truth_clim,
@@ -254,8 +256,7 @@ def run_ppe_generative(
               "gamma_grid": [float(g) for g in gamma_grid], "n_samples": n_samples,
               "n_samples_select": n_samples_select, "n_shapes": n_shapes, "n_select": n_select,
               "n_noise": n_noise, "n_truths": int(T), "truth_stride": truth_stride,
-              "sel_subsample_truths": sel_subsample_truths,
-              "n_prior_samples": n_prior_samples, "sel_tol": sel_tol,
+              "sel_subsample_truths": sel_subsample_truths, "sel_tol": sel_tol,
               "seed": seed, "sampler": _sampler_meta(sampler),
               "prior_meta": prior.meta}
     _write(out_dir, LANE_PPE, "analysis", rows, npz, config)
@@ -356,8 +357,10 @@ def run_withholding_generative(
                 "background": "climatological", "split": split}
         out = _withholding_rows(tp["actual"], tp["pred"], tp["channel"], base)
         groups = _obs_channel_groups(tp["channel"])
+        # The CRPSS reference is the do-nothing forecast N(0, diag B), matching the PPE
+        # lane. gamma scales the likelihood, not the prior, so it does not enter here.
         out += _calibration_rows(tp["actual"], tp["pred"], tp["post_var"] + tp["sse"] + tp["rep_var"],
-                                 gamma * tp["prior_var"] + tp["sse"] + tp["rep_var"], groups, base)
+                                 tp["prior_var"] + tp["sse"] + tp["rep_var"], groups, base)
         out.append(_ens_rrmse_row(tp["actual"], tp["pred"], tp["post_var"], n, base))
         return out
 

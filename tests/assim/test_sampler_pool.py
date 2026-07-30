@@ -17,6 +17,10 @@ from paleoreco.training._common import set_seed
 
 GRID = (12, 12)
 SCALES = np.array([1.5, 1.0])
+# Varying per cell and per channel, so a channel mix-up or a reshape of the flattened
+# map would change the draws rather than pass silently.
+PRIOR_VAR = np.stack([np.linspace(0.5, 2.0, GRID[0] * GRID[1]).reshape(GRID),
+                      np.linspace(0.2, 1.0, GRID[0] * GRID[1]).reshape(GRID)])
 KW = dict(n_steps=4, n_correct=1, device="cpu")
 
 
@@ -29,7 +33,7 @@ def _jobs(n=3):
     rng = np.random.default_rng(0)
     gather = np.array([5, 20, 150, 200])
     return [PosteriorJob(gather, rng.normal(0.0, 1.0, len(gather)),
-                         np.full(len(gather), 0.1), gamma=0.01, n=2, seed=k)
+                         np.full(len(gather), 0.1), gamma=1.0, n=2, seed=k)
             for k in range(n)]
 
 
@@ -44,7 +48,7 @@ def _checkpoint(tmp_path):
 
 
 def test_imap_posterior_matches_sample_posterior():
-    samp = GuidedSampler(_net(), SCALES, np.ones(GRID, bool), **KW)
+    samp = GuidedSampler(_net(), SCALES, np.ones(GRID, bool), PRIOR_VAR, **KW)
     jobs = _jobs()
     for job, ens in zip(jobs, samp.imap_posterior(jobs)):
         direct = samp.sample_posterior(job.gather, job.y_anom, job.r_diag,
@@ -54,9 +58,9 @@ def test_imap_posterior_matches_sample_posterior():
 
 def test_pool_matches_serial(tmp_path):
     jobs = _jobs()
-    serial = list(GuidedSampler(_net(), SCALES, np.ones(GRID, bool),
+    serial = list(GuidedSampler(_net(), SCALES, np.ones(GRID, bool), PRIOR_VAR,
                                 **KW).imap_posterior(jobs))
-    with SamplerPool(_checkpoint(tmp_path), np.ones(GRID, bool),
+    with SamplerPool(_checkpoint(tmp_path), np.ones(GRID, bool), PRIOR_VAR,
                      n_workers=2, **KW) as pool:
         pooled = list(pool.imap_posterior(jobs))
         single = pool.sample_posterior(jobs[0].gather, jobs[0].y_anom, jobs[0].r_diag,
@@ -71,7 +75,8 @@ def test_pool_matches_serial(tmp_path):
 
 
 def test_pool_closes_its_workers(tmp_path):
-    pool = SamplerPool(_checkpoint(tmp_path), np.ones(GRID, bool), n_workers=2, **KW)
+    pool = SamplerPool(_checkpoint(tmp_path), np.ones(GRID, bool), PRIOR_VAR,
+                       n_workers=2, **KW)
     pool.close()
     with pytest.raises(ValueError):
         pool.sample_prior(1)

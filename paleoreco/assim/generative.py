@@ -5,9 +5,11 @@ the Gaussian background of 3DVar. Reconstruction is posterior sampling: run the
 EDM reverse process, but at every step add the observation-guidance score
 ``grad log p(y | x_sigma)`` from a Gaussian likelihood, so the ensemble is pulled
 toward the proxies (Manshausen et al. 2025; Rozet and Louppe 2023; Chung et al.
-2023). The likelihood covariance ``V = R + sigma^2 gamma`` self-anneals: early
-(large ``sigma``) the denoised estimate is unreliable and the observations barely
-count, and as ``sigma -> 0`` each site is trusted at its own error ``R``.
+2023). The likelihood covariance is ``R`` plus the denoiser's own conditional
+variance at the observed cells (:func:`likelihood_var`), so it self-anneals per
+site: early (large ``sigma``) the denoised estimate is unreliable and the
+observations barely count, and as ``sigma -> 0`` each site is trusted at its own
+error ``R``.
 
 Sampling follows the predictor-corrector scheme: an EDM 2nd-order Heun predictor
 (Karras 2022, Alg. 1) plus ``n_correct`` Langevin corrector steps per level
@@ -42,6 +44,19 @@ def _edm_sigmas(n_steps: int, sigma_min: float, sigma_max: float, rho: float) ->
     return np.concatenate([sig, [0.0]])
 
 
+def likelihood_var(r, prior_var, sigma: float, gamma: float):
+    """Diagonal of the observation likelihood covariance at one noise level.
+
+    The proxy error ``r``, plus the variance of the denoiser's own estimate of the
+    clean field at those cells. Under a Gaussian prior of variance ``prior_var`` that
+    second term is exactly ``prior_var sigma^2 / (prior_var + sigma^2)``, running from
+    ``prior_var`` (the analogue of ``H B H^T``) at high noise down to zero as
+    ``sigma -> 0``, so ``gamma = 1`` is the Gaussian value and a tuned ``gamma``
+    reports how far the prior's stated variance can be trusted. Numpy or torch.
+    """
+    return r + gamma * prior_var * sigma ** 2 / (prior_var + sigma ** 2)
+
+
 @dataclass(frozen=True)
 class PosteriorJob:
     """One posterior draw: an observation network, its operating point, and its seed.
@@ -64,12 +79,15 @@ class GuidedSampler(Method):
     ``analyze`` reduces an ensemble to a Gaussian ``(mean, variance)`` for the
     method-agnostic metrics; :meth:`sample_posterior` and :meth:`sample_prior`
     expose the raw ensembles the calibration and prior-vs-posterior diagnostics
-    need. ``gamma`` is the likelihood inflation (analogue of 3DVar ``b_scale``);
-    ``n_samples`` sets the ensemble size that :meth:`analyze` draws.
+    need. ``prior_var`` is the prior's per-cell variance in anomaly units, shaped
+    like one field, which the likelihood covariance reads at the observed cells;
+    ``gamma`` scales that term, 1 being its Gaussian value. ``n_samples`` sets the
+    ensemble size that :meth:`analyze` draws.
     """
 
     def __init__(self, denoiser, channel_scales: np.ndarray, safe_valid: np.ndarray,
-                 *, gamma: float = 1e-2, n_samples: int = 16, n_steps: int = 64,
+                 prior_var: np.ndarray,
+                 *, gamma: float = 1.0, n_samples: int = 16, n_steps: int = 64,
                  n_correct: int = 2, corrector_tau: float = 0.3,
                  sigma_min: float = SIGMA_MIN, sigma_max: float = SIGMA_MAX, rho: float = RHO,
                  device: str | None = None):
@@ -83,6 +101,11 @@ class GuidedSampler(Method):
         self.safe_valid = np.asarray(safe_valid, dtype=bool)
         self.shape = (len(self.scale), *self.safe_valid.shape)
         self.n_cells = self.safe_valid.size
+        pv = np.asarray(prior_var, dtype=np.float64)
+        if pv.shape != self.shape:
+            raise ValueError(f"prior_var shape {pv.shape} does not match field shape "
+                             f"{self.shape}")
+        self.prior_var = pv
         self.gamma = gamma
         self.n_samples = n_samples
         self.n_steps = n_steps
@@ -93,6 +116,9 @@ class GuidedSampler(Method):
         self._mask = torch.as_tensor(self.safe_valid.astype(np.float32), device=self.device)
         self._mult_t = torch.as_tensor(self.mult, device=self.device, dtype=torch.float32)
         self._ndim = float(self.shape[0] * int(self.safe_valid.sum()))
+        # Converted once: the likelihood is evaluated in the normalised frame at every
+        # step of every draw.
+        self._prior_var_norm = (pv * (self.mult ** 2)[:, None, None]).ravel()
 
     # -- normalisation ---------------------------------------------------
     def _to_norm_obs(self, gather: np.ndarray, y_anom: np.ndarray, r_diag: np.ndarray):
@@ -154,13 +180,16 @@ class GuidedSampler(Method):
                          gamma: float, n: int, seed: int = 0) -> np.ndarray:
         """``n`` posterior fields conditioned on one observation network, ``(n, 2, H, W)``."""
         y_norm, r_norm = self._to_norm_obs(gather, y_anom, r_diag)
-        idx = torch.as_tensor(np.asarray(gather), device=self.device, dtype=torch.long)
+        g = np.asarray(gather)
+        idx = torch.as_tensor(g, device=self.device, dtype=torch.long)
         y_t = torch.as_tensor(y_norm, device=self.device, dtype=torch.float32)
         r_t = torch.as_tensor(r_norm, device=self.device, dtype=torch.float32)
+        b_t = torch.as_tensor(self._prior_var_norm[g], device=self.device,
+                              dtype=torch.float32)
 
         def guidance(x_hat: torch.Tensor, sigma: float) -> torch.Tensor:
             pred = x_hat.reshape(x_hat.shape[0], -1)[:, idx]
-            v = r_t + sigma ** 2 * gamma
+            v = likelihood_var(r_t, b_t, sigma, gamma)
             return -0.5 * ((y_t[None, :] - pred) ** 2 / v).sum()
 
         return self._denorm(self._sample(n, guidance, seed))

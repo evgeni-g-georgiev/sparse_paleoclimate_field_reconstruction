@@ -29,10 +29,11 @@ SELECTION = {"rrmse_ens"}
 
 def _sampler(cube, valid):
     stats = compute_zscore_stats(cube, np.arange(len(cube)), valid)
-    scales = channel_scales(apply_anomaly(cube, stats), stats["safe_valid"])
+    anom = apply_anomaly(cube, stats)
+    scales = channel_scales(anom, stats["safe_valid"])
     net = EDMDenoiser(CircularUNet(base_channels=16, depth=2, grid_shape=cube.shape[2:]))
-    return GuidedSampler(net, scales, stats["safe_valid"], n_steps=4, n_correct=1,
-                         device="cpu")
+    return GuidedSampler(net, scales, stats["safe_valid"], anom.var(axis=0, ddof=1),
+                         n_steps=4, n_correct=1, device="cpu")
 
 
 def _varying_obs(obs_long):
@@ -47,8 +48,8 @@ def test_run_ppe_generative_schema_and_npz(tmp_path, cube, ages, lats, lons, val
     out = tmp_path / "generative"
     df = g.run_ppe_generative(
         cube, ages, lats, lons, valid, obs_long, str(out), sampler=_sampler(cube, valid),
-        gamma_grid=(0.01, 0.1), n_samples=4, n_samples_select=2, n_shapes=3, n_select=2,
-        truth_stride=1, sel_subsample_truths=None, n_prior_samples=4, seed=0)
+        gamma_grid=(0.5, 1.0), n_samples=4, n_samples_select=2, n_shapes=3, n_select=2,
+        truth_stride=1, sel_subsample_truths=None, seed=0)
 
     assert (df["method"] == "generative").any()
     gen = df[df["method"] == "generative"]
@@ -57,8 +58,8 @@ def test_run_ppe_generative_schema_and_npz(tmp_path, cube, ages, lats, lons, val
     assert (SKILL | GAUSS_CAL | NATIVE_CAL | SELECTION).issubset(set(gen["metric"]))
     # gamma is the operating point, recorded as b_scale.
     cfg = json.load(open(out / "ppe_config.json"))
-    assert cfg["selected"]["b_scale"] in (0.01, 0.1)
-    assert set(gen.loc[gen["split"] == "selection", "b_scale"]) == {0.01, 0.1}
+    assert cfg["selected"]["b_scale"] in (0.5, 1.0)
+    assert set(gen.loc[gen["split"] == "selection", "b_scale"]) == {0.5, 1.0}
 
     z = np.load(out / "ppe_analysis.npz")
     for k in ("truth_anom", "safe_valid", "b_scales", "recon_climatological", "prior_var",
@@ -80,8 +81,8 @@ def test_ppe_lanes_draw_identical_networks(tmp_path, cube, ages, lats, lons, val
     kw = dict(n_shapes=3, n_select=2, truth_stride=1, seed=0)
     g.run_ppe_generative(
         cube, ages, lats, lons, valid, obs_long, str(tmp_path / "gen"),
-        sampler=_sampler(cube, valid), gamma_grid=(0.01,), n_samples=2,
-        n_samples_select=2, n_noise=5, sel_subsample_truths=None, n_prior_samples=2, **kw)
+        sampler=_sampler(cube, valid), gamma_grid=(1.0,), n_samples=2,
+        n_samples_select=2, n_noise=5, sel_subsample_truths=None, **kw)
     ex.run_ppe(cube, ages, lats, lons, valid, obs_long, str(tmp_path / "pixel"),
                b_scales=(1.0,), n_noise=5, **kw)
 
@@ -94,7 +95,7 @@ def test_run_withholding_generative_schema_and_npz(tmp_path, cube, ages, lats, l
     out = tmp_path / "generative"
     df = g.run_withholding_generative(
         cube, ages, lats, lons, valid, _varying_obs(obs_long), str(out),
-        sampler=_sampler(cube, valid), gamma_grid=(0.01, 0.1), n_samples=4,
+        sampler=_sampler(cube, valid), gamma_grid=(0.5, 1.0), n_samples=4,
         n_samples_select=2, k_folds=3, age_stride=1, seed=0)
 
     gen = df[df["method"] == "generative"]
