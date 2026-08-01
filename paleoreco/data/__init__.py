@@ -1,4 +1,4 @@
-"""Data substrate: the Prior cube, CV splits, and the constant-CO2 model run.
+"""Data substrate: the Prior cube, CV splits, regridding, and the constant-CO2 model run.
 
 The cube loader and its anomaly helpers are the heavily-used public surface, so
 they are re-exported here: ``from paleoreco.data import build_prior_cube`` (and
@@ -7,6 +7,7 @@ submodules to keep this namespace focused:
 
 * :mod:`paleoreco.data.cube`        - Prior.csv -> dense cube, anomaly, Dataset.
 * :mod:`paleoreco.data.splits`      - train/val/test and blocked CV over the age axis.
+* :mod:`paleoreco.data.regrid`      - conservative rectilinear regridding.
 * :mod:`paleoreco.data.equilibrium` - CCSM4 constant-CO2 run to per-decade fields.
 """
 

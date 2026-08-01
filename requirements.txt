@@ -16,6 +16,7 @@ scikit-learn          # PCA, TruncatedSVD, KMeans in eval/
 
 # ---- Domain-specific --------------------------------------------------------
 xarray                # labelled grids for the downloaded CCSM4 run
+xarray-regrid         # area-weighted conservative remap in paleoreco.data.regrid
 
 # ---- Data acquisition -------------------------------------------------------
 # Used only by paleoreco/data/download_ccsm4.py to pull the CCSM4 truth run from
