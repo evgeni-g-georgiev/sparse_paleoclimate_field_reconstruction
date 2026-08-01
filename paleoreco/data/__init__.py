@@ -8,7 +8,8 @@ submodules to keep this namespace focused:
 * :mod:`paleoreco.data.cube`        - Prior.csv -> dense cube, anomaly, Dataset.
 * :mod:`paleoreco.data.splits`      - train/val/test and blocked CV over the age axis.
 * :mod:`paleoreco.data.regrid`      - conservative rectilinear regridding.
-* :mod:`paleoreco.data.equilibrium` - CCSM4 constant-CO2 run to per-decade fields.
+* :mod:`paleoreco.data.equilibrium` - CCSM4 constant-CO2 run to per-decade fields, on its
+  own grid or on a target one.
 """
 
 from __future__ import annotations
