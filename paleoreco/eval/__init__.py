@@ -5,7 +5,7 @@ generic primitives without depending on AE-specific contracts:
 
 * :mod:`paleoreco.eval.shared`
     Model-family-agnostic primitives. POD baseline, per-cell °C RMSE
-    arithmetic, all the figure-producing plotters (reconstruction
+    arithmetic, and the reconstruction-side plotters (reconstruction
     grids, RMSE maps, latent-sweep curves, distribution histograms).
     These take numpy arrays: they don't care which model produced them.
 
@@ -31,7 +31,8 @@ generic primitives without depending on AE-specific contracts:
 * :mod:`paleoreco.eval.projection`
     Principal-component projections of a field stack, the 1-D linear
     projections used to inspect a sample of fields for departures from
-    Gaussianity.
+    Gaussianity, plus the plots and the sign convention that let two
+    stacks' score distributions be read side by side.
 
 * :mod:`paleoreco.eval.da`
     Reconstruction skill: pooled scalars, per-cell maps, skill against
@@ -67,7 +68,11 @@ from paleoreco.eval.gaussianity import (
     plot_pairwise_gaussianity,
 )
 from paleoreco.eval.projection import (
+    orient_pcs,
+    pc_pattern_correlation,
     pca_scores,
+    plot_pc_score_distributions,
+    plot_pc_score_qq,
 )
 from paleoreco.eval.shared import (
     compute_E_d,
@@ -128,5 +133,9 @@ __all__ = [
     "plot_innovation_gaussianity",
     "plot_pairwise_gaussianity",
     # projection
+    "orient_pcs",
+    "pc_pattern_correlation",
     "pca_scores",
+    "plot_pc_score_distributions",
+    "plot_pc_score_qq",
 ]
