@@ -22,6 +22,7 @@ xarray                # labelled grids for the downloaded CCSM4 run
 # ERDA; not imported by the rest of the package.
 fsspec[http]          # HTTP range reads of the remote run (pulls aiohttp)
 h5netcdf              # NetCDF engine for xarray.open_dataset (pulls h5py)
+numcodecs             # blosc decode of the WeatherBench 2 zarr chunks (download_wb2)
 
 # ---- Notebook + dev experience ---------------------------------------------
 ipykernel
