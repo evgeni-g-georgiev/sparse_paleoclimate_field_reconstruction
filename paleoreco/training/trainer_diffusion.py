@@ -10,9 +10,9 @@ to move them.
 Training runs fixed-length, or against a held-out split with early stopping when
 one is given. An EMA of the weights is kept because sampling quality reads the
 averaged weights, not the last step, so the held-out score reads the EMA rather
-than the live weights. The checkpoint carries the per-channel normalisation
-scalars alongside the weights so the sampler reconstructs the model and its
-anomaly frame together.
+than the live weights. The checkpoint carries the per-cell normalisation field
+alongside the weights so the sampler reconstructs the model and its anomaly frame
+together.
 """
 
 from __future__ import annotations
@@ -132,7 +132,7 @@ def train(
     batch_size: int = 32,
     device: str | torch.device = "cpu",
     checkpoint_path: str | None = None,
-    channel_scales: np.ndarray | None = None,
+    scales: np.ndarray | None = None,
     checkpoint_extra: dict | None = None,
     ema_decay: float | None = 0.999,
     seed: int = 0,
@@ -142,7 +142,7 @@ def train(
 ) -> dict[str, Any]:
     """Train the denoiser on the normalised anomaly cube; return a history dict.
 
-    ``cube_norm`` is ``(N, 2, H, W)`` in the per-channel-scaled anomaly frame with
+    ``cube_norm`` is ``(N, 2, H, W)`` in the per-cell-scaled anomaly frame with
     masked cells at zero. The saved ``state_dict`` is the EMA weights when
     ``ema_decay`` is set, else the final weights.
 
@@ -294,9 +294,10 @@ def train(
         os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
         payload = {"epoch": epochs_trained - 1, "state_dict": state,
                    "config": model.config, "sigma_data": model.sigma_data}
-        if channel_scales is not None:
-            # Store as a plain list so the checkpoint loads under weights_only.
-            payload["channel_scales"] = np.asarray(channel_scales, dtype=np.float64).tolist()
+        if scales is not None:
+            # Store as a plain list so the checkpoint loads under weights_only; a numpy
+            # array does not survive that load.
+            payload["scales"] = np.asarray(scales, dtype=np.float64).tolist()
         if checkpoint_extra:
             payload.update(checkpoint_extra)
         # Write beside the target and rename, so an interrupted save cannot truncate

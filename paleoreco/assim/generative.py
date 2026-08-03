@@ -14,8 +14,10 @@ error ``R``.
 Sampling follows the predictor-corrector scheme: an EDM 2nd-order Heun predictor
 (Karras 2022, Alg. 1) plus ``n_correct`` Langevin corrector steps per level
 (Rozet 2023, Alg. 4, step ``delta = tau * dim / ||s||^2``). Fields live in the
-per-channel-scaled anomaly frame during sampling and are returned in anomaly
-units. Masked cells are held at zero throughout.
+per-cell-scaled anomaly frame during sampling and are returned in anomaly units,
+so the network sees unit variance everywhere and the spatial variance pattern is
+carried by the scale field rather than learned. Masked cells are held at zero
+throughout.
 """
 
 from __future__ import annotations
@@ -29,11 +31,15 @@ from paleoreco.assim.method import AnalysisResult, Method, Observations
 from paleoreco.models.diffusion import SIGMA_DATA, SIGMA_MAX, SIGMA_MIN, RHO
 
 
-def channel_scales(cube_anom: np.ndarray, safe_valid: np.ndarray) -> np.ndarray:
-    """Per-channel anomaly std over valid cells, the diffusion normalisation scalars."""
+def cell_scales(cube_anom: np.ndarray, safe_valid: np.ndarray) -> np.ndarray:
+    """Per-cell anomaly std, the diffusion normalisation field, shape ``(C, H, W)``.
+
+    Masked cells hold no variance and would divide by zero, so they carry one; the
+    mask pins them to zero everywhere downstream regardless.
+    """
     v = np.asarray(safe_valid, dtype=bool)
     x = np.asarray(cube_anom, dtype=np.float64)
-    return np.array([x[:, c][:, v].std() for c in range(x.shape[1])])
+    return np.where(v, x.std(axis=0), 1.0)
 
 
 def _edm_sigmas(n_steps: int, sigma_min: float, sigma_max: float, rho: float) -> np.ndarray:
@@ -85,7 +91,7 @@ class GuidedSampler(Method):
     ensemble size that :meth:`analyze` draws.
     """
 
-    def __init__(self, denoiser, channel_scales: np.ndarray, safe_valid: np.ndarray,
+    def __init__(self, denoiser, scales: np.ndarray, safe_valid: np.ndarray,
                  prior_var: np.ndarray,
                  *, gamma: float = 1.0, n_samples: int = 16, n_steps: int = 64,
                  n_correct: int = 2, corrector_tau: float = 0.3,
@@ -96,11 +102,13 @@ class GuidedSampler(Method):
                                                else "cpu"))
         self.denoiser = denoiser.to(self.device).eval()
         self.sd = float(getattr(denoiser, "sigma_data", SIGMA_DATA))
-        self.scale = np.asarray(channel_scales, dtype=np.float64)          # (2,)
+        self.scale = np.asarray(scales, dtype=np.float64)                  # (C, H, W)
         self.mult = self.sd / self.scale                                  # anomaly -> normalised
         self.safe_valid = np.asarray(safe_valid, dtype=bool)
-        self.shape = (len(self.scale), *self.safe_valid.shape)
-        self.n_cells = self.safe_valid.size
+        if self.scale.ndim != 3 or self.scale.shape[1:] != self.safe_valid.shape:
+            raise ValueError(f"scales shape {self.scale.shape} is not a field over the "
+                             f"{self.safe_valid.shape} grid")
+        self.shape = self.scale.shape
         pv = np.asarray(prior_var, dtype=np.float64)
         if pv.shape != self.shape:
             raise ValueError(f"prior_var shape {pv.shape} does not match field shape "
@@ -118,19 +126,18 @@ class GuidedSampler(Method):
         self._ndim = float(self.shape[0] * int(self.safe_valid.sum()))
         # Converted once: the likelihood is evaluated in the normalised frame at every
         # step of every draw.
-        self._prior_var_norm = (pv * (self.mult ** 2)[:, None, None]).ravel()
+        self._prior_var_norm = (pv * self.mult ** 2).ravel()
 
     # -- normalisation ---------------------------------------------------
     def _to_norm_obs(self, gather: np.ndarray, y_anom: np.ndarray, r_diag: np.ndarray):
-        """Normalise observation values and error variance per their channel."""
-        chan = np.asarray(gather) // self.n_cells
-        m = self.mult[chan]
+        """Normalise observation values and error variance by their own cell's scale."""
+        m = self.mult.ravel()[np.asarray(gather)]
         return (np.asarray(y_anom, dtype=np.float64) * m,
                 np.asarray(r_diag, dtype=np.float64) * m ** 2)
 
     def _denorm(self, x: torch.Tensor) -> np.ndarray:
         """Normalised field batch to anomaly-unit numpy ``(n, 2, H, W)``."""
-        x = x / self._mult_t[None, :, None, None]
+        x = x / self._mult_t[None]
         return x.detach().cpu().numpy().astype(np.float64)
 
     # -- score -----------------------------------------------------------

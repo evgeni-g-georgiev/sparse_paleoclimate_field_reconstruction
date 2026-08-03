@@ -128,14 +128,15 @@ def test_val_split_cannot_write_a_checkpoint(tmp_path, cube, valid):
 def test_checkpoint_roundtrips_config_and_weights(tmp_path, cube, valid):
     cube_norm, safe = _cube_norm(cube, valid)
     path = str(tmp_path / "diffusion.pt")
-    scales = np.array([2.0, 1.0])
+    scales = np.linspace(0.5, 2.0, 2 * 12 * 12).reshape(2, 12, 12)
     td.train(_model(), cube_norm, safe, max_epochs=3, batch_size=8, ema_decay=None,
-             checkpoint_path=path, channel_scales=scales, seed=0,
+             checkpoint_path=path, scales=scales, seed=0,
              checkpoint_extra={"selection": {"best_epoch": 2}},
              verbose=False, progress=False)
     ckpt = torch.load(path, map_location="cpu")
     assert ckpt["config"]["grid_shape"] == (12, 12)
-    assert np.allclose(ckpt["channel_scales"], scales)
+    assert np.shape(ckpt["scales"]) == (2, 12, 12)
+    assert np.allclose(ckpt["scales"], scales)
     # Provenance must survive the weights_only load the sampler uses.
     assert ckpt["selection"]["best_epoch"] == 2
     reloaded = EDMDenoiser(CircularUNet(**ckpt["config"]), ckpt["sigma_data"])

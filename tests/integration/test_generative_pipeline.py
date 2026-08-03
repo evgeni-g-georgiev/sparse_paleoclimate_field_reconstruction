@@ -16,7 +16,7 @@ import pandas as pd
 
 from paleoreco.assim import experiments as ex
 from paleoreco.assim import experiments_generative as g
-from paleoreco.assim.generative import GuidedSampler, channel_scales
+from paleoreco.assim.generative import GuidedSampler, cell_scales
 from paleoreco.data.cube import apply_anomaly, compute_zscore_stats
 from paleoreco.models.diffusion import CircularUNet, EDMDenoiser
 
@@ -30,7 +30,7 @@ SELECTION = {"rrmse_ens"}
 def _sampler(cube, valid):
     stats = compute_zscore_stats(cube, np.arange(len(cube)), valid)
     anom = apply_anomaly(cube, stats)
-    scales = channel_scales(anom, stats["safe_valid"])
+    scales = cell_scales(anom, stats["safe_valid"])
     net = EDMDenoiser(CircularUNet(base_channels=16, depth=2, grid_shape=cube.shape[2:]))
     return GuidedSampler(net, scales, stats["safe_valid"], anom.var(axis=0, ddof=1),
                          n_steps=4, n_correct=1, device="cpu")

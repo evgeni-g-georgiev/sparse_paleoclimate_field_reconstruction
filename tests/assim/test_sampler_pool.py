@@ -16,9 +16,10 @@ from paleoreco.models.diffusion import CircularUNet, EDMDenoiser
 from paleoreco.training._common import set_seed
 
 GRID = (12, 12)
-SCALES = np.array([1.5, 1.0])
-# Varying per cell and per channel, so a channel mix-up or a reshape of the flattened
-# map would change the draws rather than pass silently.
+# Both fields vary per cell and per channel, so a channel mix-up or a reshape of the
+# flattened map would change the draws rather than pass silently.
+SCALES = np.stack([np.linspace(1.0, 2.0, GRID[0] * GRID[1]).reshape(GRID),
+                   np.linspace(0.6, 1.4, GRID[0] * GRID[1]).reshape(GRID)])
 PRIOR_VAR = np.stack([np.linspace(0.5, 2.0, GRID[0] * GRID[1]).reshape(GRID),
                       np.linspace(0.2, 1.0, GRID[0] * GRID[1]).reshape(GRID)])
 KW = dict(n_steps=4, n_correct=1, device="cpu")
@@ -43,7 +44,7 @@ def _checkpoint(tmp_path):
     path = tmp_path / "diffusion.pt"
     torch.save({"state_dict": net.state_dict(), "config": net.config,
                 "sigma_data": net.sigma_data,
-                "channel_scales": SCALES.tolist()}, path)
+                "scales": SCALES.tolist()}, path)
     return str(path)
 
 

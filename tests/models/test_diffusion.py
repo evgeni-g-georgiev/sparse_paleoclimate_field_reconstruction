@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
-from paleoreco.models.diffusion import CircularUNet, EDMDenoiser
+from paleoreco.models.diffusion import CircularUNet, EDMDenoiser, load_denoiser
 
 
 def _denoiser(grid=(32, 64)):
@@ -40,3 +41,25 @@ def test_sigma_accepts_scalar_and_per_sample():
     x = torch.randn(4, 2, 32, 64)
     assert d(x, torch.tensor(0.7)).shape == x.shape
     assert d(x, torch.rand(4) + 0.1).shape == x.shape
+
+
+def test_load_denoiser_rejects_a_checkpoint_without_scales(tmp_path):
+    """Weights alone do not define the frame they were trained in, so a checkpoint
+    that predates the per-cell field must fail loudly rather than load."""
+    d = _denoiser(grid=(12, 12))
+    path = tmp_path / "diffusion.pt"
+    torch.save({"state_dict": d.state_dict(), "config": d.config,
+                "sigma_data": d.sigma_data}, path)
+    with pytest.raises(KeyError, match="per-cell"):
+        load_denoiser(str(path))
+
+
+def test_load_denoiser_returns_the_stored_scale_field(tmp_path):
+    d = _denoiser(grid=(12, 12))
+    scales = [[[0.5] * 12] * 12] * 2
+    path = tmp_path / "diffusion.pt"
+    torch.save({"state_dict": d.state_dict(), "config": d.config,
+                "sigma_data": d.sigma_data, "scales": scales}, path)
+    net, loaded = load_denoiser(str(path))
+    assert loaded == scales
+    assert net.config == d.config

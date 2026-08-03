@@ -190,13 +190,16 @@ class EDMDenoiser(nn.Module):
         return (self.forward(x, sigma) - x) / sigma[:, None, None, None] ** 2
 
 
-def load_denoiser(path: str, map_location="cpu") -> tuple[EDMDenoiser, list[float]]:
-    """Rebuild a denoiser and its per-channel anomaly scales from a checkpoint.
+def load_denoiser(path: str, map_location="cpu") -> tuple[EDMDenoiser, list]:
+    """Rebuild a denoiser and its per-cell anomaly scale field from a checkpoint.
 
-    The scales come back as the stored list, which is what the sampler's normalised
-    frame is defined against; a denoiser loaded without them cannot be used.
+    The scales come back as the stored nested list, which is what the sampler's
+    normalised frame is defined against; a denoiser loaded without them cannot be used.
     """
     ckpt = torch.load(path, map_location=map_location)
+    if "scales" not in ckpt:
+        raise KeyError(f"{path} carries no 'scales' field, so it predates the per-cell "
+                       "normalisation frame and its weights cannot be used in it")
     net = EDMDenoiser(CircularUNet(**ckpt["config"]), ckpt["sigma_data"])
     net.load_state_dict(ckpt["state_dict"])
-    return net, ckpt["channel_scales"]
+    return net, ckpt["scales"]

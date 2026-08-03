@@ -9,9 +9,10 @@ and the observation guidance without a trained network.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
-from paleoreco.assim.generative import GuidedSampler, channel_scales, likelihood_var
+from paleoreco.assim.generative import GuidedSampler, cell_scales, likelihood_var
 from paleoreco.assim.method import Observations
 
 
@@ -32,8 +33,9 @@ class _AnalyticDenoiser(torch.nn.Module):
 
 
 def _sampler(Sigma, shape, **kw):
-    # channel_scales == sigma_data makes the normalised frame equal the anomaly frame.
-    scales = np.full(shape[0], _AnalyticDenoiser.sigma_data)
+    # A scale field of sigma_data everywhere makes the normalised frame equal the
+    # anomaly frame, so the closed forms below are checked in anomaly units.
+    scales = np.full(shape, _AnalyticDenoiser.sigma_data)
     return GuidedSampler(_AnalyticDenoiser(Sigma), scales, np.ones(shape[1:], bool),
                          np.diag(Sigma).reshape(shape), device="cpu", **kw)
 
@@ -56,11 +58,32 @@ def test_likelihood_var_is_r_where_the_prior_has_no_variance():
     assert likelihood_var(np.array([0.3]), np.array([0.0]), 1.0, 1.0) == 0.3
 
 
-def test_channel_scales_are_per_channel_std():
+def test_cell_scales_are_per_cell_std():
     cube = np.zeros((5, 2, 4, 4))
-    cube[:, 0] = np.arange(5)[:, None, None]     # channel 0 varies
-    s = channel_scales(cube, np.ones((4, 4), bool))
-    assert s[0] > 0 and s[1] == 0.0
+    cube[:, 0, 1, 2] = np.arange(5)              # one cell of channel 0 varies
+    s = cell_scales(cube, np.ones((4, 4), bool))
+    assert s.shape == (2, 4, 4)
+    assert s[0, 1, 2] == pytest.approx(np.arange(5).std())
+    assert s[0, 0, 0] == 0.0 and (s[1] == 0.0).all()
+
+
+def test_cell_scales_are_one_on_masked_cells():
+    """Masked cells hold no variance, so they must not reach the sampler as a zero
+    divisor."""
+    cube = np.zeros((5, 2, 4, 4))
+    safe = np.ones((4, 4), bool)
+    safe[0] = False
+    s = cell_scales(cube, safe)
+    assert (s[:, ~safe] == 1.0).all()
+    assert (s[:, safe] == 0.0).all()
+
+
+def test_guided_sampler_rejects_scales_off_the_grid():
+    shape = (2, 4, 4)
+    with pytest.raises(ValueError, match="not a field over"):
+        GuidedSampler(_AnalyticDenoiser(np.eye(int(np.prod(shape)))),
+                      np.full(2, 0.5), np.ones(shape[1:], bool), np.ones(shape),
+                      n_steps=4, n_correct=1, device="cpu")
 
 
 def test_prior_sampling_recovers_gaussian_covariance():
@@ -108,7 +131,7 @@ def test_masked_cells_stay_zero():
     safe = np.ones((4, 4), bool)
     safe[0] = False
     samp = GuidedSampler(_AnalyticDenoiser(np.eye(np.prod(shape))),
-                         np.full(2, 0.5), safe, np.ones(shape),
+                         np.full(shape, 0.5), safe, np.ones(shape),
                          n_steps=8, n_correct=1, device="cpu")
     x = samp.sample_prior(3, seed=0)
     assert np.allclose(x[:, :, ~safe], 0.0)
