@@ -23,6 +23,7 @@ ETA over the pass rather than over one gamma.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import time
@@ -488,6 +489,30 @@ def _sampler_meta(sampler) -> dict:
     """JSON-safe record of the sampler configuration."""
     return {"n_steps": sampler.n_steps, "n_correct": sampler.n_correct,
             "corrector_tau": sampler.tau, "sigma_data": sampler.sd}
+
+
+def clear_lane(out_dir: str, lane: str) -> None:
+    """Remove one lane's artefacts and its rows from the shared metrics CSV.
+
+    The runners append, so re-running a lane into a directory that already holds it
+    would double its rows. Clearing per lane rather than per directory lets one lane be
+    re-run without disturbing another that shares the CSV.
+    """
+    if not os.path.isdir(out_dir):
+        return
+    for pattern in (f"{lane}_*.npz", f"{lane}_*.json"):
+        for path in glob.glob(os.path.join(out_dir, pattern)):
+            os.remove(path)
+
+    csv_path = os.path.join(out_dir, "metrics.csv")
+    if not os.path.exists(csv_path):
+        return
+    rows = pd.read_csv(csv_path)
+    kept = rows[rows["lane"] != lane]
+    if kept.empty:
+        os.remove(csv_path)
+    else:
+        kept.to_csv(csv_path, index=False)
 
 
 def _write(out_dir: str, lane: str, npz_kind: str, rows: list[dict],
