@@ -10,19 +10,22 @@ import numpy as np
 import pytest
 import torch
 
-from paleoreco.assim.generative import GuidedSampler, PosteriorJob
+from paleoreco.assim.generative import GuidedSampler, PosteriorJob, guidance_cov
 from paleoreco.assim.sampler_pool import SamplerPool
 from paleoreco.models.diffusion import CircularUNet, EDMDenoiser
 from paleoreco.training._common import set_seed
 
 GRID = (12, 12)
-# Both fields vary per cell and per channel, so a channel mix-up or a reshape of the
-# flattened map would change the draws rather than pass silently.
+# The scale field varies per cell and per channel, and B is correlated with varying
+# diagonal, so a channel mix-up or a reshape of the flattened map would change the
+# draws rather than pass silently.
 SCALES = np.stack([np.linspace(1.0, 2.0, GRID[0] * GRID[1]).reshape(GRID),
                    np.linspace(0.6, 1.4, GRID[0] * GRID[1]).reshape(GRID)])
-PRIOR_VAR = np.stack([np.linspace(0.5, 2.0, GRID[0] * GRID[1]).reshape(GRID),
-                      np.linspace(0.2, 1.0, GRID[0] * GRID[1]).reshape(GRID)])
-KW = dict(n_steps=4, n_correct=1, device="cpu")
+_D = 2 * GRID[0] * GRID[1]
+_A = np.random.default_rng(0).standard_normal((_D, _D))
+COV = guidance_cov(_A @ _A.T / _D + np.diag(np.linspace(0.2, 2.0, _D)),
+                   SCALES, np.ones(GRID, bool))
+KW = dict(n_steps=4, device="cpu")
 
 
 def _net():
@@ -49,7 +52,7 @@ def _checkpoint(tmp_path):
 
 
 def test_imap_posterior_matches_sample_posterior():
-    samp = GuidedSampler(_net(), SCALES, np.ones(GRID, bool), PRIOR_VAR, **KW)
+    samp = GuidedSampler(_net(), SCALES, np.ones(GRID, bool), COV, **KW)
     jobs = _jobs()
     for job, ens in zip(jobs, samp.imap_posterior(jobs)):
         direct = samp.sample_posterior(job.gather, job.y_anom, job.r_diag,
@@ -59,9 +62,9 @@ def test_imap_posterior_matches_sample_posterior():
 
 def test_pool_matches_serial(tmp_path):
     jobs = _jobs()
-    serial = list(GuidedSampler(_net(), SCALES, np.ones(GRID, bool), PRIOR_VAR,
+    serial = list(GuidedSampler(_net(), SCALES, np.ones(GRID, bool), COV,
                                 **KW).imap_posterior(jobs))
-    with SamplerPool(_checkpoint(tmp_path), np.ones(GRID, bool), PRIOR_VAR,
+    with SamplerPool(_checkpoint(tmp_path), np.ones(GRID, bool), COV,
                      n_workers=2, **KW) as pool:
         pooled = list(pool.imap_posterior(jobs))
         single = pool.sample_posterior(jobs[0].gather, jobs[0].y_anom, jobs[0].r_diag,
@@ -76,7 +79,7 @@ def test_pool_matches_serial(tmp_path):
 
 
 def test_pool_closes_its_workers(tmp_path):
-    pool = SamplerPool(_checkpoint(tmp_path), np.ones(GRID, bool), PRIOR_VAR,
+    pool = SamplerPool(_checkpoint(tmp_path), np.ones(GRID, bool), COV,
                        n_workers=2, **KW)
     pool.close()
     with pytest.raises(ValueError):

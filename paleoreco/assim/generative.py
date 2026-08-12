@@ -3,21 +3,25 @@
 The unconditional diffusion prior of :mod:`paleoreco.models.diffusion` replaces
 the Gaussian background of 3DVar. Reconstruction is posterior sampling: run the
 EDM reverse process, but at every step add the observation-guidance score
-``grad log p(y | x_sigma)`` from a Gaussian likelihood, so the ensemble is pulled
-toward the proxies (Manshausen et al. 2025; Rozet and Louppe 2023; Chung et al.
-2023). The likelihood covariance is ``R`` plus the denoiser's own conditional
-variance at the observed cells (:func:`likelihood_var`), so it self-anneals per
-site: early (large ``sigma``) the denoised estimate is unreliable and the
-observations barely count, and as ``sigma -> 0`` each site is trusted at its own
-error ``R``.
+``grad log p(y | x_sigma)`` from a Gaussian likelihood (Manshausen et al. 2025;
+Rozet and Louppe 2023; Chung et al. 2023). The likelihood covariance couples the
+observations through the annealed background covariance,
 
-Sampling follows the predictor-corrector scheme: an EDM 2nd-order Heun predictor
-(Karras 2022, Alg. 1) plus ``n_correct`` Langevin corrector steps per level
-(Rozet 2023, Alg. 4, step ``delta = tau * dim / ||s||^2``). Fields live in the
-per-cell-scaled anomaly frame during sampling and are returned in anomaly units,
-so the network sees unit variance everywhere and the spatial variance pattern is
-carried by the scale field rather than learned. Masked cells are held at zero
-throughout.
+    S(sigma) = gamma * H Sigma(sigma) H^T + R,
+
+where ``Sigma(sigma)`` shares the background covariance B's eigenbasis with each
+eigenvalue ``lam`` shrunk to ``lam sigma^2 / (lam + sigma^2)``, the exact
+conditional covariance of a Gaussian prior at noise level ``sigma`` (Boys et al.
+2023). Nearby sites therefore share their evidence instead of counting as
+independent: S runs from ``gamma * H B H^T + R``, the 3DVar innovation
+covariance, at high ``sigma`` down to ``R`` as ``sigma -> 0``. ``gamma`` scales
+the prior block and is the tuned operating point.
+
+Sampling is the EDM 2nd-order Heun predictor (Karras 2022, Alg. 1). Fields live
+in the per-cell-scaled anomaly frame during sampling and are returned in anomaly
+units, so the network sees unit variance everywhere and the spatial variance
+pattern is carried by the scale field rather than learned. Masked cells are held
+at zero throughout.
 """
 
 from __future__ import annotations
@@ -50,17 +54,47 @@ def _edm_sigmas(n_steps: int, sigma_min: float, sigma_max: float, rho: float) ->
     return np.concatenate([sig, [0.0]])
 
 
-def likelihood_var(r, prior_var, sigma: float, gamma: float):
-    """Diagonal of the observation likelihood covariance at one noise level.
+@dataclass(frozen=True)
+class GuidanceCov:
+    """Eigendecomposition of a background covariance in the normalised frame.
 
-    The proxy error ``r``, plus the variance of the denoiser's own estimate of the
-    clean field at those cells. Under a Gaussian prior of variance ``prior_var`` that
-    second term is exactly ``prior_var sigma^2 / (prior_var + sigma^2)``, running from
-    ``prior_var`` (the analogue of ``H B H^T``) at high noise down to zero as
-    ``sigma -> 0``, so ``gamma = 1`` is the Gaussian value and a tuned ``gamma``
-    reports how far the prior's stated variance can be trusted. Numpy or torch.
+    ``U`` is ``(D, D)`` float32, ``lam`` its eigenvalues clipped at zero; ``meta``
+    records how the covariance was built (taper settings, source ages) so a run's
+    config can state what the guidance believed. Holds numpy arrays only, so it
+    pickles into sampler-pool workers.
     """
-    return r + gamma * prior_var * sigma ** 2 / (prior_var + sigma ** 2)
+
+    U: np.ndarray
+    lam: np.ndarray
+    meta: dict
+
+
+def guidance_cov(B: np.ndarray, scales: np.ndarray, safe_valid: np.ndarray,
+                 *, sigma_data: float = SIGMA_DATA, meta: dict | None = None) -> GuidanceCov:
+    """Transform a background covariance into the sampler's normalised frame.
+
+    ``B`` is ``(D, D)`` in anomaly units; ``scales`` is the per-cell std field the
+    checkpoint carries. Masked rows and columns are zeroed so masked cells can
+    neither receive nor exert guidance. One eigh here saves a solve per noise
+    level later: every S(sigma) shares the same eigenbasis.
+    """
+    scale = np.asarray(scales, dtype=np.float64)
+    safe_flat = np.broadcast_to(np.asarray(safe_valid, dtype=bool), scale.shape).ravel()
+    mult = np.where(safe_flat, sigma_data / scale.ravel(), 1.0)
+    Bn = np.asarray(B, dtype=np.float64) * np.outer(mult, mult)
+    Bn[~safe_flat, :] = 0.0
+    Bn[:, ~safe_flat] = 0.0
+    Bn = 0.5 * (Bn + Bn.T)
+    lam, U = np.linalg.eigh(Bn)
+    return GuidanceCov(U=U.astype(np.float32), lam=np.clip(lam, 0.0, None),
+                       meta=dict(meta or {}))
+
+
+def annealed_obs_cov(U_g: torch.Tensor, lam: torch.Tensor, r_norm: torch.Tensor,
+                     sigma: float, gamma: float) -> torch.Tensor:
+    """S(sigma) for one network: gamma-scaled annealed prior block plus diag R."""
+    f = lam * sigma ** 2 / (lam + sigma ** 2)
+    return gamma * ((U_g * f[None, :]) @ U_g.T) + torch.diag(r_norm)
 
 
 @dataclass(frozen=True)
@@ -85,16 +119,14 @@ class GuidedSampler(Method):
     ``analyze`` reduces an ensemble to a Gaussian ``(mean, variance)`` for the
     method-agnostic metrics; :meth:`sample_posterior` and :meth:`sample_prior`
     expose the raw ensembles the calibration and prior-vs-posterior diagnostics
-    need. ``prior_var`` is the prior's per-cell variance in anomaly units, shaped
-    like one field, which the likelihood covariance reads at the observed cells;
-    ``gamma`` scales that term, 1 being its Gaussian value. ``n_samples`` sets the
-    ensemble size that :meth:`analyze` draws.
+    need. ``cov`` is the guidance covariance in the normalised frame
+    (:func:`guidance_cov`); ``gamma`` scales its prior block, 1 being the
+    Gaussian value. ``n_samples`` sets the ensemble size :meth:`analyze` draws.
     """
 
     def __init__(self, denoiser, scales: np.ndarray, safe_valid: np.ndarray,
-                 prior_var: np.ndarray,
+                 cov: GuidanceCov,
                  *, gamma: float = 1.0, n_samples: int = 16, n_steps: int = 64,
-                 n_correct: int = 2, corrector_tau: float = 0.3,
                  sigma_min: float = SIGMA_MIN, sigma_max: float = SIGMA_MAX, rho: float = RHO,
                  device: str | None = None):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available()
@@ -109,24 +141,18 @@ class GuidedSampler(Method):
             raise ValueError(f"scales shape {self.scale.shape} is not a field over the "
                              f"{self.safe_valid.shape} grid")
         self.shape = self.scale.shape
-        pv = np.asarray(prior_var, dtype=np.float64)
-        if pv.shape != self.shape:
-            raise ValueError(f"prior_var shape {pv.shape} does not match field shape "
-                             f"{self.shape}")
-        self.prior_var = pv
+        d = int(np.prod(self.shape))
+        if cov.U.shape != (d, d):
+            raise ValueError(f"cov.U shape {cov.U.shape} does not match the "
+                             f"{d}-dim flattened state")
+        self.cov = cov
         self.gamma = gamma
         self.n_samples = n_samples
         self.n_steps = n_steps
-        self.n_correct = n_correct
-        self.tau = corrector_tau
         self.sigmas = _edm_sigmas(n_steps, sigma_min, sigma_max, rho)
 
         self._mask = torch.as_tensor(self.safe_valid.astype(np.float32), device=self.device)
         self._mult_t = torch.as_tensor(self.mult, device=self.device, dtype=torch.float32)
-        self._ndim = float(self.shape[0] * int(self.safe_valid.sum()))
-        # Converted once: the likelihood is evaluated in the normalised frame at every
-        # step of every draw.
-        self._prior_var_norm = (pv * self.mult ** 2).ravel()
 
     # -- normalisation ---------------------------------------------------
     def _to_norm_obs(self, gather: np.ndarray, y_anom: np.ndarray, r_diag: np.ndarray):
@@ -155,7 +181,7 @@ class GuidedSampler(Method):
         return (prior + g) * self._mask
 
     def _sample(self, n: int, guidance, seed: int) -> torch.Tensor:
-        """EDM Heun predictor + Langevin corrector reverse loop; normalised fields."""
+        """EDM Heun predictor reverse loop; normalised fields."""
         gen = torch.Generator(device=self.device).manual_seed(int(seed))
 
         def randn(shape):
@@ -171,11 +197,6 @@ class GuidedSampler(Method):
                 continue
             d2 = -sig_next * self._score(x_pred, sig_next, guidance)
             x = (x + (sig_next - sig) * 0.5 * (d + d2)) * self._mask
-            for _ in range(self.n_correct):
-                s = self._score(x, sig_next, guidance)
-                snorm2 = s.flatten(1).pow(2).sum(1).clamp_min(1e-12)
-                delta = (self.tau * self._ndim / snorm2)[:, None, None, None]
-                x = (x + delta * s + torch.sqrt(2.0 * delta) * randn(x.shape)) * self._mask
         return x
 
     # -- public sampling -------------------------------------------------
@@ -190,14 +211,24 @@ class GuidedSampler(Method):
         g = np.asarray(gather)
         idx = torch.as_tensor(g, device=self.device, dtype=torch.long)
         y_t = torch.as_tensor(y_norm, device=self.device, dtype=torch.float32)
-        r_t = torch.as_tensor(r_norm, device=self.device, dtype=torch.float32)
-        b_t = torch.as_tensor(self._prior_var_norm[g], device=self.device,
-                              dtype=torch.float32)
+
+        # Assemble and invert S per noise level in float64 on the CPU, then cast:
+        # a float32 S^-1 held constant in the graph keeps the quadratic form's
+        # gradient exact while the m x m inversions stay well conditioned.
+        U_g = torch.as_tensor(self.cov.U[g], dtype=torch.float64)
+        lam = torch.as_tensor(self.cov.lam, dtype=torch.float64)
+        r_t = torch.as_tensor(r_norm, dtype=torch.float64)
+        sinv = {}
+        for s in self.sigmas[:-1]:
+            S = annealed_obs_cov(U_g, lam, r_t, float(s), gamma)
+            Si = torch.cholesky_inverse(torch.linalg.cholesky(S))
+            Si = 0.5 * (Si + Si.T)
+            sinv[float(s)] = Si.to(device=self.device, dtype=torch.float32)
 
         def guidance(x_hat: torch.Tensor, sigma: float) -> torch.Tensor:
             pred = x_hat.reshape(x_hat.shape[0], -1)[:, idx]
-            v = likelihood_var(r_t, b_t, sigma, gamma)
-            return -0.5 * ((y_t[None, :] - pred) ** 2 / v).sum()
+            r = y_t[None, :] - pred
+            return -0.5 * torch.einsum("nm,mk,nk->", r, sinv[float(sigma)], r)
 
         return self._denorm(self._sample(n, guidance, seed))
 

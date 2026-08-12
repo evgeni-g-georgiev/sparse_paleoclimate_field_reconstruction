@@ -12,7 +12,9 @@ import numpy as np
 import pytest
 import torch
 
-from paleoreco.assim.generative import GuidedSampler, cell_scales, likelihood_var
+from paleoreco.assim.generative import (
+    GuidedSampler, annealed_obs_cov, cell_scales, guidance_cov,
+)
 from paleoreco.assim.method import Observations
 
 
@@ -32,12 +34,17 @@ class _AnalyticDenoiser(torch.nn.Module):
         return (x.reshape(x.shape[0], -1) @ M.T).reshape(x.shape)
 
 
-def _sampler(Sigma, shape, **kw):
+def _cov(Sigma, shape):
     # A scale field of sigma_data everywhere makes the normalised frame equal the
-    # anomaly frame, so the closed forms below are checked in anomaly units.
+    # anomaly frame, so the guidance covariance is Sigma itself.
+    scales = np.full(shape, _AnalyticDenoiser.sigma_data)
+    return guidance_cov(Sigma, scales, np.ones(shape[1:], bool))
+
+
+def _sampler(Sigma, shape, **kw):
     scales = np.full(shape, _AnalyticDenoiser.sigma_data)
     return GuidedSampler(_AnalyticDenoiser(Sigma), scales, np.ones(shape[1:], bool),
-                         np.diag(Sigma).reshape(shape), device="cpu", **kw)
+                         _cov(Sigma, shape), device="cpu", **kw)
 
 
 def _spd(d, seed):
@@ -46,16 +53,34 @@ def _spd(d, seed):
     return A @ A.T / d + 0.3 * np.eye(d)
 
 
-def test_likelihood_var_brackets_r_and_r_plus_prior_var():
-    r, b = np.array([0.2, 0.5]), np.array([1.0, 4.0])
-    assert np.allclose(likelihood_var(r, b, 1e-4, 1.0), r, atol=1e-6)
-    assert np.allclose(likelihood_var(r, b, 1e6, 1.0), r + b, rtol=1e-6)
-    mid, high = likelihood_var(r, b, 0.5, 1.0), likelihood_var(r, b, 2.0, 1.0)
-    assert (r < mid).all() and (mid < high).all() and (high < r + b).all()
+def test_guidance_cov_zeroes_masked_cells_and_clips():
+    shape = (2, 2, 2)
+    d = int(np.prod(shape))
+    safe = np.ones(shape[1:], bool)
+    safe[0, 0] = False
+    cov = guidance_cov(_spd(d, 3), np.full(shape, 0.5), safe)
+    assert cov.U.shape == (d, d) and cov.U.dtype == np.float32
+    assert (cov.lam >= 0).all()
+    Bn = (cov.U * cov.lam[None, :]) @ cov.U.T
+    masked = ~np.broadcast_to(safe, shape).ravel()
+    assert np.allclose(Bn[masked, :], 0.0, atol=1e-5)
+    assert np.allclose(Bn[:, masked], 0.0, atol=1e-5)
 
 
-def test_likelihood_var_is_r_where_the_prior_has_no_variance():
-    assert likelihood_var(np.array([0.3]), np.array([0.0]), 1.0, 1.0) == 0.3
+def test_annealed_obs_cov_limits():
+    d = 8
+    Sigma = _spd(d, 0)
+    lam_np, U_np = np.linalg.eigh(Sigma)
+    g = np.array([0, 5])
+    r = torch.tensor([0.2, 0.5], dtype=torch.float64)
+    U_g = torch.as_tensor(U_np[g], dtype=torch.float64)
+    lam = torch.as_tensor(lam_np, dtype=torch.float64)
+    gamma = 2.0
+
+    low = annealed_obs_cov(U_g, lam, r, 1e-5, gamma).numpy()
+    assert np.allclose(low, np.diag(r.numpy()), atol=1e-8)
+    high = annealed_obs_cov(U_g, lam, r, 1e5, gamma).numpy()
+    assert np.allclose(high, gamma * Sigma[np.ix_(g, g)] + np.diag(r.numpy()), rtol=1e-6)
 
 
 def test_cell_scales_are_per_cell_std():
@@ -80,34 +105,44 @@ def test_cell_scales_are_one_on_masked_cells():
 
 def test_guided_sampler_rejects_scales_off_the_grid():
     shape = (2, 4, 4)
+    d = int(np.prod(shape))
     with pytest.raises(ValueError, match="not a field over"):
-        GuidedSampler(_AnalyticDenoiser(np.eye(int(np.prod(shape)))),
-                      np.full(2, 0.5), np.ones(shape[1:], bool), np.ones(shape),
-                      n_steps=4, n_correct=1, device="cpu")
+        GuidedSampler(_AnalyticDenoiser(np.eye(d)), np.full(2, 0.5),
+                      np.ones(shape[1:], bool), _cov(np.eye(d), shape),
+                      n_steps=4, device="cpu")
+
+
+def test_guided_sampler_rejects_cov_off_the_state():
+    shape = (2, 4, 4)
+    d = int(np.prod(shape))
+    small = _cov(np.eye(8), (2, 2, 2))
+    with pytest.raises(ValueError, match="does not match"):
+        GuidedSampler(_AnalyticDenoiser(np.eye(d)), np.full(shape, 0.5),
+                      np.ones(shape[1:], bool), small, n_steps=4, device="cpu")
 
 
 def test_prior_sampling_recovers_gaussian_covariance():
     shape = (2, 2, 2)
     Sigma = _spd(np.prod(shape), 0)
-    samp = _sampler(Sigma, shape, n_steps=128, n_correct=4, corrector_tau=0.3)
+    samp = _sampler(Sigma, shape, n_steps=128)
     x = samp.sample_prior(4000, seed=1).reshape(4000, -1)
     rel = np.linalg.norm(np.cov(x, rowvar=False) - Sigma) / np.linalg.norm(Sigma)
     assert np.abs(x.mean(0)).max() < 0.15
     assert rel < 0.4
 
 
-def _kalman_rel(gamma):
+def _kalman_rel(gamma, Sigma=None, gather=(0, 5), y=(1.2, -0.8)):
     """Relative error of the guided posterior mean against the closed-form update."""
     shape = (2, 2, 2)
     d = int(np.prod(shape))
-    Sigma = _spd(d, 0)
-    samp = _sampler(Sigma, shape, n_steps=128, n_correct=4, corrector_tau=0.3)
+    Sigma = _spd(d, 0) if Sigma is None else Sigma
+    samp = _sampler(Sigma, shape, n_steps=128)
 
-    gather = np.array([0, 5])
-    y = np.array([1.2, -0.8])
-    R = np.array([0.05, 0.05])
-    H = np.zeros((2, d))
-    H[0, 0], H[1, 5] = 1.0, 1.0
+    gather = np.asarray(gather)
+    y = np.asarray(y, dtype=np.float64)
+    R = np.full(len(gather), 0.05)
+    H = np.zeros((len(gather), d))
+    H[np.arange(len(gather)), gather] = 1.0
     kalman = Sigma @ H.T @ np.linalg.inv(H @ Sigma @ H.T + np.diag(R)) @ y
 
     ens = samp.sample_posterior(gather, y, R, gamma=gamma, n=4000, seed=2).reshape(4000, -1)
@@ -115,24 +150,50 @@ def _kalman_rel(gamma):
 
 
 def test_posterior_mean_matches_kalman():
-    assert _kalman_rel(1e-3) < 0.1
-
-
-def test_posterior_mean_matches_kalman_at_the_gaussian_gamma():
-    """``gamma = 1`` carries the full prior-variance term, and the closed form survives
-    it: taking only Sigma's diagonal while Sigma is correlated costs nothing here, so
-    the same bound as the vanishing-gamma case holds.
-    """
+    """``gamma = 1`` is exact moment matching for this prior: the guidance covariance
+    equals the true annealed conditional covariance at every noise level, so the
+    closed-form update must survive it."""
     assert _kalman_rel(1.0) < 0.1
+
+
+def test_gamma_scales_posterior_spread_at_observed_cells():
+    """Shrinking the prior block of S pins the observed cells (near-zero spread);
+    growing it loosens them. The spread at the observed cells must rise with gamma."""
+    shape = (2, 2, 2)
+    Sigma = _spd(8, 0)
+    samp = _sampler(Sigma, shape, n_steps=64)
+    gather = np.array([0, 5])
+    y = np.array([1.2, -0.8])
+    R = np.full(2, 0.05)
+    spread = []
+    for gamma in (1e-3, 1.0, 4.0):
+        ens = samp.sample_posterior(gather, y, R, gamma=gamma, n=500, seed=3)
+        spread.append(ens.reshape(500, -1).var(axis=0)[gather].mean())
+    assert spread[0] < spread[1] < spread[2]
+
+
+def test_posterior_mean_matches_kalman_with_clustered_obs():
+    """Adjacent observed cells of a strongly correlated prior.
+
+    Correlated sites are the geometry where a per-site (diagonal) likelihood
+    over-counts shared evidence; the full covariance must keep the closed form.
+    """
+    d = 8
+    rng = np.random.default_rng(7)
+    A = rng.standard_normal((d, 2))
+    Sigma = A @ A.T + 0.1 * np.eye(d)            # long-range structure, 2 dominant modes
+    assert _kalman_rel(1.0, Sigma=Sigma, gather=(0, 1, 2, 3),
+                       y=(1.5, -1.0, 0.8, -1.2)) < 0.1
 
 
 def test_masked_cells_stay_zero():
     shape = (2, 4, 4)
+    d = int(np.prod(shape))
     safe = np.ones((4, 4), bool)
     safe[0] = False
-    samp = GuidedSampler(_AnalyticDenoiser(np.eye(np.prod(shape))),
-                         np.full(shape, 0.5), safe, np.ones(shape),
-                         n_steps=8, n_correct=1, device="cpu")
+    cov = guidance_cov(np.eye(d), np.full(shape, 0.5), safe)
+    samp = GuidedSampler(_AnalyticDenoiser(np.eye(d)),
+                         np.full(shape, 0.5), safe, cov, n_steps=8, device="cpu")
     x = samp.sample_prior(3, seed=0)
     assert np.allclose(x[:, :, ~safe], 0.0)
 
@@ -140,7 +201,7 @@ def test_masked_cells_stay_zero():
 def test_analyze_returns_mean_and_variance():
     shape = (2, 2, 2)
     # gamma away from the constructor default, so this also covers analyze reading it.
-    samp = _sampler(_spd(8, 1), shape, n_steps=8, n_correct=1, n_samples=6, gamma=2.0)
+    samp = _sampler(_spd(8, 1), shape, n_steps=8, n_samples=6, gamma=2.0)
     obs = Observations(gather=np.array([0, 5]), y_anom=np.array([0.5, -0.5]),
                        sse=np.array([0.1, 0.1]))
     res = samp.analyze(obs, np.zeros(int(np.prod(shape))))

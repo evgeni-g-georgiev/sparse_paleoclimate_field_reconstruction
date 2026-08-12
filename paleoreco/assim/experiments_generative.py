@@ -7,8 +7,8 @@ truth draws, site folds, representativeness variance, metric rows, and tidy CSV
 schema are reused unchanged, so the generative method drops into notebook 09's
 cross-method comparison with no special-casing.
 
-``gamma`` scales the prior-variance term of the likelihood covariance and is the
-tuned operating point, the analogue of 3DVar ``b_scale``: swept on the held-out
+``gamma`` scales the prior block of the guidance covariance and is the tuned
+operating point, the analogue of 3DVar ``b_scale``: swept on the held-out
 selection split over a reduced workload, then the winner is run once on the full
 test split. Rows carry ``method="generative"``, ``space="generative"``, and
 ``b_scale=gamma`` so the selection rule (:func:`select_best_config`) and the
@@ -52,8 +52,8 @@ _GEN = {"method": "generative", "space": "generative", **_NAN_REG}
 def _stream(sampler, jobs, label: str, progress_every: int | None):
     """Yield each job's ensemble in order, reporting progress over the whole list.
 
-    Every draw costs the same (``n_steps * (2 + n_correct)`` network evaluations,
-    independent of how many observations it carries), so the linear-rate ETA
+    Every draw costs the same (``2 * n_steps - 1`` network evaluations, independent
+    of how many observations it carries), so the linear-rate ETA
     :func:`_report_progress` prints is accurate rather than indicative.
     """
     t0 = time.time()
@@ -111,7 +111,7 @@ def _native_calibration_rows(truth: np.ndarray, ens: np.ndarray, base: dict) -> 
 # ---------------------------------------------------------------------------
 def run_ppe_generative(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
-    valid: np.ndarray, long, out_dir: str, *, sampler,
+    valid: np.ndarray, long, out_dir: str, *, sampler, prior_ens_var: np.ndarray,
     gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 32,
     n_samples_select: int = 16, n_shapes: int = 5, n_select: int = 4,
     n_noise: int = 5, truth_stride: int = 10, sel_subsample_truths: int | None = 12,
@@ -133,6 +133,8 @@ def run_ppe_generative(
     effective precision. Consuming the shared ``rng`` one draw at a time also keeps
     the two lanes' streams aligned, so both draw the same network shapes per truth.
 
+    ``prior_ens_var`` is the sampled prior's per-cell variance, stored in the
+    analysis npz for the prior-vs-posterior spread diagnostics.
     ``progress_every`` counts posterior draws.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
@@ -243,9 +245,9 @@ def run_ppe_generative(
     npz = {
         "truth_anom": truth_anoms, "clim_mean": prior.clim_mean.astype(np.float64),
         "safe_valid": safe_valid, "prior_var": prior_var,
-        # The same variance the likelihood reads, so the diagnostic and the guidance
-        # cannot disagree.
-        "prior_ens_var": sampler.prior_var,
+        # Per-cell spread of the sampled prior, for the prior-vs-posterior figures;
+        # the guidance itself reads the full covariance, not this diagonal.
+        "prior_ens_var": np.asarray(prior_ens_var, dtype=np.float64),
         "post_var": post_test[None], "recon_climatological": recon_test[None],
         "b_scales": np.asarray([gamma_star]), "lats": np.asarray(lats), "lons": np.asarray(lons),
         "drawn_ages": drawn_ages, "truth_clim": truth_clim,
@@ -487,8 +489,8 @@ def _sel_rrmse(rows: list[dict], lane: str = LANE_PPE) -> pd.DataFrame:
 
 def _sampler_meta(sampler) -> dict:
     """JSON-safe record of the sampler configuration."""
-    return {"n_steps": sampler.n_steps, "n_correct": sampler.n_correct,
-            "corrector_tau": sampler.tau, "sigma_data": sampler.sd}
+    return {"n_steps": sampler.n_steps, "sigma_data": sampler.sd,
+            "guidance_cov": dict(sampler.cov.meta)}
 
 
 def clear_lane(out_dir: str, lane: str) -> None:

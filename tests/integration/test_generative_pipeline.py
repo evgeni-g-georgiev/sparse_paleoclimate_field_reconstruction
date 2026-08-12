@@ -16,7 +16,7 @@ import pandas as pd
 
 from paleoreco.assim import experiments as ex
 from paleoreco.assim import experiments_generative as g
-from paleoreco.assim.generative import GuidedSampler, cell_scales
+from paleoreco.assim.generative import GuidedSampler, cell_scales, guidance_cov
 from paleoreco.data.cube import apply_anomaly, compute_zscore_stats
 from paleoreco.models.diffusion import CircularUNet, EDMDenoiser
 
@@ -28,12 +28,16 @@ SELECTION = {"rrmse_ens"}
 
 
 def _sampler(cube, valid):
+    """Tiny sampler on the fixture cube, plus the prior-variance diagnostic field."""
     stats = compute_zscore_stats(cube, np.arange(len(cube)), valid)
     anom = apply_anomaly(cube, stats)
     scales = cell_scales(anom, stats["safe_valid"])
+    cov = guidance_cov(np.cov(anom.reshape(len(anom), -1), rowvar=False),
+                       scales, stats["safe_valid"])
     net = EDMDenoiser(CircularUNet(base_channels=16, depth=2, grid_shape=cube.shape[2:]))
-    return GuidedSampler(net, scales, stats["safe_valid"], anom.var(axis=0, ddof=1),
-                         n_steps=4, n_correct=1, device="cpu")
+    sampler = GuidedSampler(net, scales, stats["safe_valid"], cov,
+                            n_steps=4, device="cpu")
+    return sampler, anom.var(axis=0, ddof=1)
 
 
 def _varying_obs(obs_long):
@@ -46,8 +50,10 @@ def _varying_obs(obs_long):
 
 def test_run_ppe_generative_schema_and_npz(tmp_path, cube, ages, lats, lons, valid, obs_long):
     out = tmp_path / "generative"
+    sampler, prior_ens_var = _sampler(cube, valid)
     df = g.run_ppe_generative(
-        cube, ages, lats, lons, valid, obs_long, str(out), sampler=_sampler(cube, valid),
+        cube, ages, lats, lons, valid, obs_long, str(out), sampler=sampler,
+        prior_ens_var=prior_ens_var,
         gamma_grid=(0.5, 1.0), n_samples=4, n_samples_select=2, n_shapes=3, n_select=2,
         truth_stride=1, sel_subsample_truths=None, seed=0)
 
@@ -79,9 +85,10 @@ def test_ppe_lanes_draw_identical_networks(tmp_path, cube, ages, lats, lons, val
     them and silently unpair the comparison.
     """
     kw = dict(n_shapes=3, n_select=2, truth_stride=1, seed=0)
+    sampler, prior_ens_var = _sampler(cube, valid)
     g.run_ppe_generative(
         cube, ages, lats, lons, valid, obs_long, str(tmp_path / "gen"),
-        sampler=_sampler(cube, valid), gamma_grid=(1.0,), n_samples=2,
+        sampler=sampler, prior_ens_var=prior_ens_var, gamma_grid=(1.0,), n_samples=2,
         n_samples_select=2, n_noise=5, sel_subsample_truths=None, **kw)
     ex.run_ppe(cube, ages, lats, lons, valid, obs_long, str(tmp_path / "pixel"),
                b_scales=(1.0,), n_noise=5, **kw)
@@ -95,7 +102,7 @@ def test_run_withholding_generative_schema_and_npz(tmp_path, cube, ages, lats, l
     out = tmp_path / "generative"
     df = g.run_withholding_generative(
         cube, ages, lats, lons, valid, _varying_obs(obs_long), str(out),
-        sampler=_sampler(cube, valid), gamma_grid=(0.5, 1.0), n_samples=4,
+        sampler=_sampler(cube, valid)[0], gamma_grid=(0.5, 1.0), n_samples=4,
         n_samples_select=2, k_folds=3, age_stride=1, seed=0)
 
     gen = df[df["method"] == "generative"]

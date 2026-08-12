@@ -16,18 +16,18 @@ import multiprocessing
 import numpy as np
 import torch
 
-from paleoreco.assim.generative import GuidedSampler, PosteriorJob
+from paleoreco.assim.generative import GuidanceCov, GuidedSampler, PosteriorJob
 from paleoreco.models.diffusion import load_denoiser
 
 _SAMPLER: GuidedSampler | None = None
 
 
-def _init_worker(checkpoint_path: str, safe_valid: np.ndarray, prior_var: np.ndarray,
+def _init_worker(checkpoint_path: str, safe_valid: np.ndarray, cov: GuidanceCov,
                  kwargs: dict) -> None:
     """Build this worker's sampler once, so the model and CUDA context are reused."""
     global _SAMPLER
     net, scales = load_denoiser(checkpoint_path)
-    _SAMPLER = GuidedSampler(net, np.asarray(scales), safe_valid, prior_var, **kwargs)
+    _SAMPLER = GuidedSampler(net, np.asarray(scales), safe_valid, cov, **kwargs)
 
 
 def _run_posterior(job) -> np.ndarray:
@@ -42,37 +42,35 @@ def _run_prior(n: int, seed: int) -> np.ndarray:
 class SamplerPool:
     """A :class:`GuidedSampler` replicated across worker processes.
 
-    ``n_steps``, ``n_correct``, ``tau``, ``sd`` and ``prior_var`` are mirrored from the
-    sampler the workers build, so a run's provenance record does not depend on how it
-    executed.
+    ``n_steps``, ``sd`` and ``cov`` are mirrored from the sampler the workers
+    build, so a run's provenance record does not depend on how it executed.
+    ``cov`` is prebuilt by the caller: one eigendecomposition serves every worker
+    instead of one per process, at the price of pickling its eigenbasis into each
+    worker once at pool construction.
     """
 
     def __init__(self, checkpoint_path: str, safe_valid: np.ndarray,
-                 prior_var: np.ndarray, *,
+                 cov: GuidanceCov, *,
                  n_workers: int = 4, gamma: float = 1.0, n_samples: int = 16,
-                 n_steps: int = 64, n_correct: int = 2, corrector_tau: float = 0.3,
-                 device: str | None = None):
+                 n_steps: int = 64, device: str | None = None):
         if n_workers < 1:
             raise ValueError(f"n_workers must be >= 1; got {n_workers}")
-        self.prior_var = np.asarray(prior_var, dtype=np.float64)
+        self.cov = cov
         self.gamma = gamma
         self.n_samples = n_samples
         self.n_steps = n_steps
-        self.n_correct = n_correct
-        self.tau = corrector_tau
         # Read sigma_data on the CPU rather than building a sampler here, so the
         # parent process never takes a CUDA context of its own.
         self.sd = float(torch.load(checkpoint_path, map_location="cpu")["sigma_data"])
 
         kwargs = {"gamma": gamma, "n_samples": n_samples, "n_steps": n_steps,
-                  "n_correct": n_correct, "corrector_tau": corrector_tau,
                   "device": device}
         # spawn, not fork: a forked process cannot initialise CUDA.
         ctx = multiprocessing.get_context("spawn")
         self._pool = ctx.Pool(n_workers, initializer=_init_worker,
                               initargs=(str(checkpoint_path),
                                         np.asarray(safe_valid, dtype=bool),
-                                        self.prior_var, kwargs))
+                                        cov, kwargs))
 
     def imap_posterior(self, jobs):
         """Posterior ensembles for a sequence of :class:`PosteriorJob`, in order."""
