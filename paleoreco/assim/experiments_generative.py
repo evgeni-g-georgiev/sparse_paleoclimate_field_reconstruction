@@ -16,6 +16,12 @@ reported test rows match the classical lanes. Calibration is scored both as a
 Gaussian summary of the ensemble (directly comparable to 3DVar) and natively over
 the ensemble.
 
+The hybrid runners tune ``(amp, sigma_switch, gamma)`` jointly on the same
+selection split. ``amp`` and ``sigma_switch`` change the denoiser itself, so each
+grid point takes its own sampler from a caller-supplied factory; rows carry
+``method="generative_hybrid"`` plus ``hybrid_amp`` / ``hybrid_switch`` columns and
+the winner is the argmin of the debiased selection RRMSE.
+
 Each pass builds its whole list of posterior draws before executing it, so a sampler
 that spreads draws over worker processes stays fed and the progress line quotes an
 ETA over the pass rather than over one gamma.
@@ -24,6 +30,7 @@ ETA over the pass rather than over one gamma.
 from __future__ import annotations
 
 import glob
+import itertools
 import json
 import os
 import time
@@ -46,7 +53,14 @@ from paleoreco.assim.experiments import (
 )
 
 GAMMA_GRID = (0.25, 0.5, 1.0, 2.0, 4.0)
+AMP_GRID = (1.0, 2.0)
+SWITCH_GRID = (0.5, 1.0, 2.0, 4.0)
+HYBRID_GAMMA_GRID = (0.5, 1.0, 2.0)
 _GEN = {"method": "generative", "space": "generative", **_NAN_REG}
+# _append_csv appends positionally, so both hybrid runners must spell their columns
+# in this one order; the nan placeholders pin where the overrides land.
+_HYB = {"method": "generative_hybrid", "space": "generative", **_NAN_REG,
+        "hybrid_amp": np.nan, "hybrid_switch": np.nan}
 
 
 def _stream(sampler, jobs, label: str, progress_every: int | None):
@@ -109,6 +123,158 @@ def _native_calibration_rows(truth: np.ndarray, ens: np.ndarray, base: dict) -> 
 # ---------------------------------------------------------------------------
 # Same-model pseudo-proxy lane.
 # ---------------------------------------------------------------------------
+def _ppe_setup(cube, ages, lats, lons, valid, long, *, n_shapes: int, n_noise: int,
+               truth_stride: int, seed: int) -> dict:
+    """Truths, network geometries and pseudo-obs shared by every PPE operating point.
+
+    One seeded rng draws the geometries and noise, consumed one draw at a time so
+    the stream stays aligned with the classical lane and both draw the same network
+    shapes per truth. The ``job`` closure carries the per-draw seed, so a job list
+    reproduces however it executes.
+    """
+    ages_i = np.asarray(ages, dtype=np.int64)
+    prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
+    prior = build_prior(cube, ages, lats, lons, prior_idx, valid)
+    safe_valid = prior.safe_valid
+    shape = (len(VARS), len(lats), len(lons))
+    safe_flat = np.broadcast_to(safe_valid, shape).ravel()
+    prior_var = np.diag(prior.B).reshape(shape)                 # CE/CRPSS reference
+
+    truth_cube = cube[truth_idx].astype(np.float64)
+    truth_clim = truth_cube.mean(axis=0)
+    truth_anoms = truth_cube - truth_clim
+    T = len(truth_anoms)
+
+    rng = np.random.default_rng(seed)
+    geoms, drawn_ages, noise = [], np.zeros((T, n_shapes), np.int64), []
+    for ti in range(T):
+        shape_ages = _draw_usable_ages(long, rng, lats, lons, safe_flat, n_shapes)
+        drawn_ages[ti] = shape_ages
+        row_g, row_n = [], []
+        for k_age in shape_ages:
+            g = _obs_geometry(observations_at_age(long, int(k_age)), lats, lons, safe_flat)
+            row_g.append(g)
+            row_n.append(np.mean([rng.normal(0.0, np.sqrt(g["sse"]))
+                                  for _ in range(n_noise)], axis=0))
+        geoms.append(row_g)
+        noise.append(row_n)
+
+    def obs(ti, si):
+        g = geoms[ti][si]
+        y = truth_anoms[ti].ravel()[g["gather"]] + noise[ti][si]
+        return g, y
+
+    def job(ti, si, gamma, n):
+        g, y = obs(ti, si)
+        return PosteriorJob(g["gather"], y, g["sse"], gamma, n,
+                            seed + ti * n_shapes + si)
+
+    return dict(prior=prior, safe_valid=safe_valid, shape=shape, prior_var=prior_var,
+                truth_anoms=truth_anoms, truth_clim=truth_clim, T=T,
+                events=np.zeros(T, dtype=np.int64), drawn_ages=drawn_ages,
+                lats=lats, lons=lons, obs=obs, job=job)
+
+
+def _sel_truths(T: int, sel_subsample_truths: int | None) -> np.ndarray:
+    """Truth indices the selection sweep runs on (``None`` uses all)."""
+    if sel_subsample_truths is None:
+        return np.arange(T)
+    return np.unique(np.linspace(0, T - 1, min(sel_subsample_truths, T))
+                     .round().astype(int))
+
+
+def _ppe_selection_rows(sampler, S: dict, gamma_grid, sel_ti, n_select: int,
+                        n_samples_select: int, base: dict,
+                        progress_every: int | None, label: str) -> list[dict]:
+    """Selection-split skill rows for one sampler swept over ``gamma_grid``.
+
+    ``base`` carries the row identity (method and operating-point columns) with a
+    ``b_scale`` placeholder each gamma overrides in place, keeping the tidy CSV's
+    column order independent of who built the rows.
+    """
+    truth_anoms, safe_valid = S["truth_anoms"], S["safe_valid"]
+    sel_keys = [(gamma, ti) for gamma in gamma_grid for ti in sel_ti
+                for _ in range(n_select)]
+    sel_jobs = [S["job"](ti, si, gamma, n_samples_select)
+                for gamma in gamma_grid for ti in sel_ti for si in range(n_select)]
+
+    means, varis = [], []
+    for ens in _stream(sampler, sel_jobs, label, progress_every):
+        means.append(ens.mean(axis=0))
+        varis.append(ens.var(axis=0, ddof=1))
+
+    rows: list[dict] = []
+    for gamma in gamma_grid:
+        sel = [k for k, (gm, _) in enumerate(sel_keys) if gm == gamma]
+        recon = np.stack([means[k] for k in sel])
+        post = np.stack([varis[k] for k in sel])
+        truth_pool = np.stack([truth_anoms[sel_keys[k][1]] for k in sel])
+        gbase = {**base, "b_scale": float(gamma)}
+        rows += _skill_rows(truth_pool, recon, safe_valid,
+                            np.zeros(len(recon), np.int64), gbase)
+        rows.append(_ens_rrmse_row(truth_pool[:, :, safe_valid], recon[:, :, safe_valid],
+                                   post[:, :, safe_valid], n_samples_select, gbase))
+    return rows
+
+
+def _ppe_test_pass(sampler, S: dict, gamma_star: float, n_samples: int, n_select: int,
+                   base: dict, prior_ens_var: np.ndarray,
+                   progress_every: int | None, label: str) -> tuple[list[dict], dict]:
+    """Winner-only test split: the full metric rows plus the analysis npz payload."""
+    truth_anoms, safe_valid, shape = S["truth_anoms"], S["safe_valid"], S["shape"]
+    T, events, lats, lons = S["T"], S["events"], S["lats"], S["lons"]
+    recon_test = np.zeros((T, *shape))
+    post_test = np.zeros((T, *shape))
+    naive_test = {"nearest": np.zeros((T, *shape)), "idw": np.zeros((T, *shape))}
+    ens_valid, test_obs = [], []
+    test_jobs = [S["job"](ti, n_select, gamma_star, n_samples) for ti in range(T)]
+    for ti, ens in enumerate(_stream(sampler, test_jobs, label, progress_every)):
+        g, y = S["obs"](ti, n_select)
+        recon_test[ti] = ens.mean(axis=0)
+        post_test[ti] = ens.var(axis=0, ddof=1)
+        ens_valid.append(ens[:, :, safe_valid])                 # (K, 2, n_valid)
+        naive_geom = _naive_geometry(lats, lons, g, len(VARS))
+        for kind in naive_test:
+            naive_test[kind][ti] = _naive_apply(kind, naive_geom, y, shape)
+        test_obs.append({"lat": g["lat"], "lon": g["lon"],
+                         "val": truth_anoms[ti].ravel()[g["gather"]],
+                         "chan": g["gather"] // (len(lats) * len(lons))})
+
+    tbase = {**base, "b_scale": float(gamma_star)}
+    rows = _skill_rows(truth_anoms, recon_test, safe_valid, events, tbase)
+    rows.append(_ens_rrmse_row(truth_anoms[:, :, safe_valid],
+                               recon_test[:, :, safe_valid],
+                               post_test[:, :, safe_valid], n_samples, tbase))
+    rows += _ssim_rows(truth_anoms, recon_test, safe_valid, events, tbase)
+    rows += _field_calibration_rows(truth_anoms, recon_test, post_test, S["prior_var"],
+                                    safe_valid, events, tbase)
+    truth_valid = truth_anoms[:, :, safe_valid].transpose(1, 0, 2).reshape(len(VARS), -1)
+    ens_all = np.concatenate([e.reshape(e.shape[0], len(VARS), -1) for e in ens_valid], axis=2)
+    rows += _native_calibration_rows(truth_valid, ens_all, tbase)
+
+    for kind in naive_test:
+        nb = {"method": kind, "space": "generative", **_NAN_REG, "lane": LANE_PPE,
+              "fold": -1, "b_scale": 1.0, "background": "none", "split": "test"}
+        rows += _skill_rows(truth_anoms, naive_test[kind], safe_valid, events, nb)
+        rows += _ssim_rows(truth_anoms, naive_test[kind], safe_valid, events, nb)
+
+    obs_lat, obs_lon, obs_val, obs_chan, obs_n = _pad_obs(test_obs, T)
+    npz = {
+        "truth_anom": truth_anoms, "clim_mean": S["prior"].clim_mean.astype(np.float64),
+        "safe_valid": safe_valid, "prior_var": S["prior_var"],
+        # Per-cell spread of the sampled prior, for the prior-vs-posterior figures;
+        # the guidance itself reads the full covariance, not this diagonal.
+        "prior_ens_var": np.asarray(prior_ens_var, dtype=np.float64),
+        "post_var": post_test[None], "recon_climatological": recon_test[None],
+        "b_scales": np.asarray([gamma_star]), "lats": np.asarray(lats), "lons": np.asarray(lons),
+        "drawn_ages": S["drawn_ages"], "truth_clim": S["truth_clim"],
+        "naive_nearest": naive_test["nearest"], "naive_idw": naive_test["idw"],
+        "obs_lat": obs_lat, "obs_lon": obs_lon, "obs_val": obs_val,
+        "obs_chan": obs_chan, "obs_n": obs_n,
+    }
+    return rows, npz
+
+
 def run_ppe_generative(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long, out_dir: str, *, sampler, prior_ens_var: np.ndarray,
@@ -137,131 +303,103 @@ def run_ppe_generative(
     analysis npz for the prior-vs-posterior spread diagnostics.
     ``progress_every`` counts posterior draws.
     """
-    ages_i = np.asarray(ages, dtype=np.int64)
-    prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
-    prior = build_prior(cube, ages, lats, lons, prior_idx, valid)
-    safe_valid = prior.safe_valid
-    shape = (len(VARS), len(lats), len(lons))
-    safe_flat = np.broadcast_to(safe_valid, shape).ravel()
-    prior_var = np.diag(prior.B).reshape(shape)                 # CE/CRPSS reference
+    S = _ppe_setup(cube, ages, lats, lons, valid, long, n_shapes=n_shapes,
+                   n_noise=n_noise, truth_stride=truth_stride, seed=seed)
+    sel_ti = _sel_truths(S["T"], sel_subsample_truths)
+    base = {**_GEN, "lane": LANE_PPE, "fold": -1, "b_scale": np.nan,
+            "background": "climatological"}
 
-    truth_cube = cube[truth_idx].astype(np.float64)
-    truth_clim = truth_cube.mean(axis=0)
-    truth_anoms = truth_cube - truth_clim
-    T = len(truth_anoms)
-    events = np.zeros(T, dtype=np.int64)
-
-    rng = np.random.default_rng(seed)
-    geoms, drawn_ages, noise = [], np.zeros((T, n_shapes), np.int64), []
-    for ti in range(T):
-        shape_ages = _draw_usable_ages(long, rng, lats, lons, safe_flat, n_shapes)
-        drawn_ages[ti] = shape_ages
-        row_g, row_n = [], []
-        for k_age in shape_ages:
-            g = _obs_geometry(observations_at_age(long, int(k_age)), lats, lons, safe_flat)
-            row_g.append(g)
-            row_n.append(np.mean([rng.normal(0.0, np.sqrt(g["sse"]))
-                                  for _ in range(n_noise)], axis=0))
-        geoms.append(row_g)
-        noise.append(row_n)
-
-    def _obs(ti, si):
-        g = geoms[ti][si]
-        y = truth_anoms[ti].ravel()[g["gather"]] + noise[ti][si]
-        return g, y
-
-    def _job(ti, si, gamma, n):
-        g, y = _obs(ti, si)
-        return PosteriorJob(g["gather"], y, g["sse"], gamma, n,
-                            seed + ti * n_shapes + si)
-
-    # -- selection: sweep gamma on selection shapes over a truth subset ----
-    sel_ti = (np.arange(T) if sel_subsample_truths is None
-              else np.linspace(0, T - 1, min(sel_subsample_truths, T)).round().astype(int))
-    sel_ti = np.unique(sel_ti)
-    sel_keys = [(gamma, ti) for gamma in gamma_grid for ti in sel_ti
-                for _ in range(n_select)]
-    sel_jobs = [_job(ti, si, gamma, n_samples_select)
-                for gamma in gamma_grid for ti in sel_ti for si in range(n_select)]
-
-    means, varis = [], []
-    for ens in _stream(sampler, sel_jobs, "ppe selection draws", progress_every):
-        means.append(ens.mean(axis=0))
-        varis.append(ens.var(axis=0, ddof=1))
-
-    rows: list[dict] = []
-    for gamma in gamma_grid:
-        sel = [k for k, (gm, _) in enumerate(sel_keys) if gm == gamma]
-        recon = np.stack([means[k] for k in sel])
-        post = np.stack([varis[k] for k in sel])
-        truth_pool = np.stack([truth_anoms[sel_keys[k][1]] for k in sel])
-        base = {**_GEN, "lane": LANE_PPE, "fold": -1, "b_scale": float(gamma),
-                "background": "climatological", "split": "selection"}
-        rows += _skill_rows(truth_pool, recon, safe_valid,
-                            np.zeros(len(recon), np.int64), base)
-        rows.append(_ens_rrmse_row(truth_pool[:, :, safe_valid], recon[:, :, safe_valid],
-                                   post[:, :, safe_valid], n_samples_select, base))
+    rows = _ppe_selection_rows(sampler, S, gamma_grid, sel_ti, n_select,
+                               n_samples_select, {**base, "split": "selection"},
+                               progress_every, "ppe selection draws")
     gamma_star = select_best_config(_sel_rrmse(rows), sel_tol=sel_tol)["b_scale"]
 
-    # -- test: run the winner on the held-out shape, all truths ------------
-    recon_test = np.zeros((T, *shape))
-    post_test = np.zeros((T, *shape))
-    naive_test = {"nearest": np.zeros((T, *shape)), "idw": np.zeros((T, *shape))}
-    ens_valid, test_obs = [], []
-    test_jobs = [_job(ti, n_select, gamma_star, n_samples) for ti in range(T)]
-    for ti, ens in enumerate(_stream(sampler, test_jobs, "ppe test draws",
-                                     progress_every)):
-        g, y = _obs(ti, n_select)
-        recon_test[ti] = ens.mean(axis=0)
-        post_test[ti] = ens.var(axis=0, ddof=1)
-        ens_valid.append(ens[:, :, safe_valid])                 # (K, 2, n_valid)
-        naive_geom = _naive_geometry(lats, lons, g, len(VARS))
-        for kind in naive_test:
-            naive_test[kind][ti] = _naive_apply(kind, naive_geom, y, shape)
-        test_obs.append({"lat": g["lat"], "lon": g["lon"],
-                         "val": truth_anoms[ti].ravel()[g["gather"]],
-                         "chan": g["gather"] // (len(lats) * len(lons))})
+    test_rows, npz = _ppe_test_pass(sampler, S, gamma_star, n_samples, n_select,
+                                    {**base, "split": "test"}, prior_ens_var,
+                                    progress_every, "ppe test draws")
+    rows += test_rows
 
-    base = {**_GEN, "lane": LANE_PPE, "fold": -1, "b_scale": float(gamma_star),
-            "background": "climatological", "split": "test"}
-    rows += _skill_rows(truth_anoms, recon_test, safe_valid, events, base)
-    rows.append(_ens_rrmse_row(truth_anoms[:, :, safe_valid],
-                               recon_test[:, :, safe_valid],
-                               post_test[:, :, safe_valid], n_samples, base))
-    rows += _ssim_rows(truth_anoms, recon_test, safe_valid, events, base)
-    rows += _field_calibration_rows(truth_anoms, recon_test, post_test, prior_var,
-                                    safe_valid, events, base)
-    truth_valid = truth_anoms[:, :, safe_valid].transpose(1, 0, 2).reshape(len(VARS), -1)
-    ens_all = np.concatenate([e.reshape(e.shape[0], len(VARS), -1) for e in ens_valid], axis=2)
-    rows += _native_calibration_rows(truth_valid, ens_all, base)
-
-    for kind in naive_test:
-        nb = {"method": kind, "space": "generative", **_NAN_REG, "lane": LANE_PPE,
-              "fold": -1, "b_scale": 1.0, "background": "none", "split": "test"}
-        rows += _skill_rows(truth_anoms, naive_test[kind], safe_valid, events, nb)
-        rows += _ssim_rows(truth_anoms, naive_test[kind], safe_valid, events, nb)
-
-    obs_lat, obs_lon, obs_val, obs_chan, obs_n = _pad_obs(test_obs, T)
-    npz = {
-        "truth_anom": truth_anoms, "clim_mean": prior.clim_mean.astype(np.float64),
-        "safe_valid": safe_valid, "prior_var": prior_var,
-        # Per-cell spread of the sampled prior, for the prior-vs-posterior figures;
-        # the guidance itself reads the full covariance, not this diagonal.
-        "prior_ens_var": np.asarray(prior_ens_var, dtype=np.float64),
-        "post_var": post_test[None], "recon_climatological": recon_test[None],
-        "b_scales": np.asarray([gamma_star]), "lats": np.asarray(lats), "lons": np.asarray(lons),
-        "drawn_ages": drawn_ages, "truth_clim": truth_clim,
-        "naive_nearest": naive_test["nearest"], "naive_idw": naive_test["idw"],
-        "obs_lat": obs_lat, "obs_lon": obs_lon, "obs_val": obs_val,
-        "obs_chan": obs_chan, "obs_n": obs_n,
-    }
     config = {"lane": LANE_PPE, "space": "generative", "selected": {"b_scale": gamma_star},
               "gamma_grid": [float(g) for g in gamma_grid], "n_samples": n_samples,
               "n_samples_select": n_samples_select, "n_shapes": n_shapes, "n_select": n_select,
-              "n_noise": n_noise, "n_truths": int(T), "truth_stride": truth_stride,
+              "n_noise": n_noise, "n_truths": int(S["T"]), "truth_stride": truth_stride,
               "sel_subsample_truths": sel_subsample_truths, "sel_tol": sel_tol,
               "seed": seed, "sampler": _sampler_meta(sampler),
-              "prior_meta": prior.meta}
+              "prior_meta": S["prior"].meta}
+    _write(out_dir, LANE_PPE, "analysis", rows, npz, config)
+    return pd.DataFrame(rows)
+
+
+def _prior_var(sampler, n: int, seed: int) -> np.ndarray:
+    """Per-cell variance of ``n`` unconditional draws, batched to bound memory."""
+    ens = [sampler.sample_prior(min(64, n - k), seed=seed + k // 64)
+           for k in range(0, n, 64)]
+    return np.concatenate(ens).var(axis=0, ddof=1)
+
+
+def run_ppe_generative_hybrid(
+    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+    valid: np.ndarray, long, out_dir: str, *, make_sampler,
+    amp_grid: tuple[float, ...] = AMP_GRID,
+    switch_grid: tuple[float, ...] = SWITCH_GRID,
+    gamma_grid: tuple[float, ...] = HYBRID_GAMMA_GRID, n_samples: int = 32,
+    n_samples_select: int = 16, n_shapes: int = 5, n_select: int = 4,
+    n_noise: int = 5, truth_stride: int = 10, sel_subsample_truths: int | None = 12,
+    n_prior_var: int = 512, seed: int = 0,
+    progress_every: int | None = None,
+) -> pd.DataFrame:
+    """Same-model PPE for the hybrid denoiser, tuned over (amp, sigma_switch, gamma).
+
+    ``make_sampler(amp, sigma_switch)`` returns a context manager yielding a sampler
+    whose denoiser and guidance share the amp-scaled covariance; the combos run
+    sequentially, so one grid point's workers hold the GPU at a time. Every combo
+    shares one set of truths, geometries and pseudo-obs (the ``seed`` protocol of
+    :func:`run_ppe_generative`), the winner is the argmin of the debiased selection
+    RRMSE, and only the winner runs the test split. ``prior_ens_var`` cannot be an
+    argument here because it belongs to the winner, so ``n_prior_var`` unconditional
+    winner draws stand in for it.
+    """
+    S = _ppe_setup(cube, ages, lats, lons, valid, long, n_shapes=n_shapes,
+                   n_noise=n_noise, truth_stride=truth_stride, seed=seed)
+    sel_ti = _sel_truths(S["T"], sel_subsample_truths)
+    base = {**_HYB, "lane": LANE_PPE, "fold": -1, "b_scale": np.nan,
+            "background": "climatological"}
+
+    rows: list[dict] = []
+    for amp, switch in itertools.product(amp_grid, switch_grid):
+        cbase = {**base, "hybrid_amp": float(amp), "hybrid_switch": float(switch),
+                 "split": "selection"}
+        with make_sampler(amp, switch) as smp:
+            rows += _ppe_selection_rows(
+                smp, S, gamma_grid, sel_ti, n_select, n_samples_select, cbase,
+                progress_every,
+                f"hybrid selection draws (amp={amp:g}, switch={switch:g})")
+
+    sel = _sel_rrmse(rows)
+    win = sel.loc[sel["value"].idxmin()]
+    amp_s, switch_s = float(win["hybrid_amp"]), float(win["hybrid_switch"])
+    gamma_s = float(win["b_scale"])
+
+    with make_sampler(amp_s, switch_s) as smp:
+        prior_ens_var = _prior_var(smp, n_prior_var, seed)
+        test_rows, npz = _ppe_test_pass(
+            smp, S, gamma_s, n_samples, n_select,
+            {**base, "hybrid_amp": amp_s, "hybrid_switch": switch_s, "split": "test"},
+            prior_ens_var, progress_every, "hybrid test draws")
+        sampler_meta = _sampler_meta(smp)
+    rows += test_rows
+
+    config = {"lane": LANE_PPE, "space": "generative", "method": "generative_hybrid",
+              "selected": {"b_scale": gamma_s, "hybrid_amp": amp_s,
+                           "hybrid_switch": switch_s},
+              "amp_grid": [float(a) for a in amp_grid],
+              "switch_grid": [float(s) for s in switch_grid],
+              "gamma_grid": [float(g) for g in gamma_grid],
+              "n_samples": n_samples, "n_samples_select": n_samples_select,
+              "n_shapes": n_shapes, "n_select": n_select, "n_noise": n_noise,
+              "n_truths": int(S["T"]), "truth_stride": truth_stride,
+              "sel_subsample_truths": sel_subsample_truths, "n_prior_var": n_prior_var,
+              "seed": seed, "sampler": sampler_meta, "prior_meta": S["prior"].meta}
     _write(out_dir, LANE_PPE, "analysis", rows, npz, config)
     return pd.DataFrame(rows)
 
@@ -269,25 +407,9 @@ def run_ppe_generative(
 # ---------------------------------------------------------------------------
 # Real-proxy withholding lane.
 # ---------------------------------------------------------------------------
-def run_withholding_generative(
-    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
-    valid: np.ndarray, long, out_dir: str, *, sampler,
-    gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 32,
-    n_samples_select: int = 16, k_folds: int = 5, fold_kind: str = "random",
-    age_stride: int = 6, sel_tol: float = SEL_TOL, seed: int = 0,
-    progress_every: int | None = None,
-) -> pd.DataFrame:
-    """Nested-CV site withholding with a generative prior; age-subsampled for cost.
-
-    Two passes over one ``k_folds`` site partition: selection (assimilate 3 folds,
-    predict the val fold, pooled over the rotation) picks ``gamma``; the test pass
-    (assimilate 4 folds, predict the 5th) reports it. ``R = diag(sse + rep_var)``
-    with ``rep_var`` estimated per fold from the assimilated sites only. Ages are
-    thinned by ``age_stride`` on both passes to bound the sampling cost; the stride
-    is recorded in the config.
-
-    ``progress_every`` counts posterior draws.
-    """
+def _withholding_setup(cube, ages, lats, lons, valid, long, *, k_folds: int,
+                       fold_kind: str, age_stride: int, seed: int) -> dict:
+    """Prior, site folds and observation-split closures shared by every operating point."""
     from paleoreco.assim.experiments import _site_folds
 
     prior = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid)
@@ -342,40 +464,49 @@ def run_withholding_generative(
         return [PosteriorJob(s["gk"], s["y_anom"], s["r"], gamma, n, seed + s["age"])
                 for s in splits]
 
-    def collect(splits, cols):
-        """Withheld-site predictions for one fold, from its withheld-column ensembles."""
-        if not splits:
-            return None
-        keys = ("actual", "channel", "sse", "rep_var", "prior_var", "distance_km")
-        out = {k: np.concatenate([s[k] for s in splits]) for k in keys}
-        out["pred"] = np.concatenate([c.mean(axis=0) for c in cols])
-        out["post_var"] = np.concatenate([c.var(axis=0, ddof=1) for c in cols])
-        out["ens"] = np.concatenate(cols, axis=1)
-        out["naive"] = {k: np.concatenate([s["naive"][k] for s in splits])
-                        for k in splits[0]["naive"]}
-        return out
+    return dict(prior=prior, lane=lane, k_folds=k_folds, obs_ages=obs_ages,
+                fold_sets=fold_sets, all_sites=all_sites, rep_lookup=rep_lookup,
+                fold_split=fold_split, fold_jobs=fold_jobs)
 
-    def skill_and_calib(tp, gamma, split, fold, n):
-        base = {**_GEN, "lane": lane, "fold": fold, "b_scale": float(gamma),
-                "background": "climatological", "split": split}
-        out = _withholding_rows(tp["actual"], tp["pred"], tp["channel"], base)
-        groups = _obs_channel_groups(tp["channel"])
-        # The CRPSS reference is the do-nothing forecast N(0, diag B), matching the PPE
-        # lane. gamma scales the likelihood, not the prior, so it does not enter here.
-        out += _calibration_rows(tp["actual"], tp["pred"], tp["post_var"] + tp["sse"] + tp["rep_var"],
-                                 tp["prior_var"] + tp["sse"] + tp["rep_var"], groups, base)
-        out.append(_ens_rrmse_row(tp["actual"], tp["pred"], tp["post_var"], n, base))
-        return out
 
-    # -- selection: rotate the val fold, pool, pick gamma -----------------
-    sel_splits = [fold_split(all_sites - fold_sets[(i + 1) % k_folds] - fold_sets[i],
-                             fold_sets[(i + 1) % k_folds]) for i in range(k_folds)]
+def _collect(splits, cols):
+    """Withheld-site predictions for one fold, from its withheld-column ensembles."""
+    if not splits:
+        return None
+    keys = ("actual", "channel", "sse", "rep_var", "prior_var", "distance_km")
+    out = {k: np.concatenate([s[k] for s in splits]) for k in keys}
+    out["pred"] = np.concatenate([c.mean(axis=0) for c in cols])
+    out["post_var"] = np.concatenate([c.var(axis=0, ddof=1) for c in cols])
+    out["ens"] = np.concatenate(cols, axis=1)
+    out["naive"] = {k: np.concatenate([s["naive"][k] for s in splits])
+                    for k in splits[0]["naive"]}
+    return out
+
+
+def _withholding_skill_rows(tp: dict, base: dict, n: int) -> list[dict]:
+    """Skill, Gaussian-summary calibration and debiased-RRMSE rows for one pool."""
+    out = _withholding_rows(tp["actual"], tp["pred"], tp["channel"], base)
+    groups = _obs_channel_groups(tp["channel"])
+    # The CRPSS reference is the do-nothing forecast N(0, diag B), matching the PPE
+    # lane. gamma scales the likelihood, not the prior, so it does not enter here.
+    out += _calibration_rows(tp["actual"], tp["pred"], tp["post_var"] + tp["sse"] + tp["rep_var"],
+                             tp["prior_var"] + tp["sse"] + tp["rep_var"], groups, base)
+    out.append(_ens_rrmse_row(tp["actual"], tp["pred"], tp["post_var"], n, base))
+    return out
+
+
+def _withholding_selection_rows(sampler, W: dict, gamma_grid, n_samples_select: int,
+                                base: dict, progress_every: int | None,
+                                label: str) -> list[dict]:
+    """Selection-split rows for one sampler: rotate the val fold, pool per gamma."""
+    k_folds, fold_sets, all_sites = W["k_folds"], W["fold_sets"], W["all_sites"]
+    sel_splits = [W["fold_split"](all_sites - fold_sets[(i + 1) % k_folds] - fold_sets[i],
+                                  fold_sets[(i + 1) % k_folds]) for i in range(k_folds)]
     sel_flat = [s for _ in gamma_grid for sp in sel_splits for s in sp]
     sel_jobs = [j for gamma in gamma_grid for sp in sel_splits
-                for j in fold_jobs(sp, gamma, n_samples_select)]
+                for j in W["fold_jobs"](sp, gamma, n_samples_select)]
     sel_cols = [ens.reshape(n_samples_select, -1)[:, s["gw"]]
-                for s, ens in zip(sel_flat, _stream(sampler, sel_jobs,
-                                                    f"withholding selection draws ({lane})",
+                for s, ens in zip(sel_flat, _stream(sampler, sel_jobs, label,
                                                     progress_every))]
 
     rows: list[dict] = []
@@ -383,46 +514,53 @@ def run_withholding_generative(
     for gamma in gamma_grid:
         parts = []
         for sp in sel_splits:
-            tp = collect(sp, sel_cols[at:at + len(sp)])
+            tp = _collect(sp, sel_cols[at:at + len(sp)])
             at += len(sp)
             if tp is not None:
                 parts.append(tp)
         if parts:
-            rows += skill_and_calib(_concat(parts), gamma, "selection", -1,
-                                    n_samples_select)
-    gamma_star = select_best_config(_sel_rrmse(rows, lane), sel_tol=sel_tol)["b_scale"]
+            rows += _withholding_skill_rows(_concat(parts),
+                                            {**base, "b_scale": float(gamma)},
+                                            n_samples_select)
+    return rows
 
-    # -- test: assimilate 4 folds, predict the 5th ------------------------
-    test_splits = [fold_split(all_sites - fold_sets[i], fold_sets[i])
+
+def _withholding_test_pass(sampler, W: dict, gamma_star: float, n_samples: int,
+                           base: dict, progress_every: int | None,
+                           label: str) -> tuple[list[dict], dict]:
+    """Winner-only test split: per-fold and pooled rows plus the predictions payload."""
+    k_folds, fold_sets, all_sites = W["k_folds"], W["fold_sets"], W["all_sites"]
+    test_splits = [W["fold_split"](all_sites - fold_sets[i], fold_sets[i])
                    for i in range(k_folds)]
     test_flat = [s for sp in test_splits for s in sp]
-    test_jobs = [j for sp in test_splits for j in fold_jobs(sp, gamma_star, n_samples)]
+    test_jobs = [j for sp in test_splits
+                 for j in W["fold_jobs"](sp, gamma_star, n_samples)]
     test_cols = [ens.reshape(n_samples, -1)[:, s["gw"]]
-                 for s, ens in zip(test_flat, _stream(sampler, test_jobs,
-                                                      f"withholding test draws ({lane})",
+                 for s, ens in zip(test_flat, _stream(sampler, test_jobs, label,
                                                       progress_every))]
 
+    tbase = {**base, "b_scale": float(gamma_star)}
+    rows: list[dict] = []
     pooled = []
     at = 0
     for i, sp in enumerate(test_splits):
-        tp = collect(sp, test_cols[at:at + len(sp)])
+        tp = _collect(sp, test_cols[at:at + len(sp)])
         at += len(sp)
         if tp is None:
             continue
-        rows += skill_and_calib(tp, gamma_star, "test", i, n_samples)
+        rows += _withholding_skill_rows(tp, {**tbase, "fold": i}, n_samples)
         pooled.append(tp)
 
-    predictions = {"b_scales": np.asarray([gamma_star]), "rep_var_full": rep_lookup(all_sites)}
+    predictions = {"b_scales": np.asarray([gamma_star]),
+                   "rep_var_full": W["rep_lookup"](all_sites)}
     if pooled:
         tp = _concat(pooled)
-        rows += skill_and_calib(tp, gamma_star, "test", -1, n_samples)
-        native_base = {**_GEN, "lane": lane, "fold": -1, "b_scale": float(gamma_star),
-                       "background": "climatological", "split": "test"}
-        rows += _native_obs_calibration_rows(tp, native_base)
+        rows += _withholding_skill_rows(tp, tbase, n_samples)
+        rows += _native_obs_calibration_rows(tp, tbase)
         for kind, pred in tp["naive"].items():
             rows += _withholding_rows(tp["actual"], pred, tp["channel"],
                                       {"method": kind, "space": "generative", **_NAN_REG,
-                                       "lane": lane, "fold": -1, "b_scale": 1.0,
+                                       "lane": W["lane"], "fold": -1, "b_scale": 1.0,
                                        "background": "none", "split": "test"})
         predictions.update({
             "actual": tp["actual"], "channel": tp["channel"],
@@ -430,12 +568,110 @@ def run_withholding_generative(
             "prior_var_pred": tp["prior_var"], "sse": tp["sse"], "rep_var": tp["rep_var"],
             "distance_km": tp["distance_km"], "naive_nearest": tp["naive"]["nearest"],
             "naive_idw": tp["naive"]["idw"]})
+    return rows, predictions
+
+
+def run_withholding_generative(
+    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+    valid: np.ndarray, long, out_dir: str, *, sampler,
+    gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 32,
+    n_samples_select: int = 16, k_folds: int = 5, fold_kind: str = "random",
+    age_stride: int = 6, sel_tol: float = SEL_TOL, seed: int = 0,
+    progress_every: int | None = None,
+) -> pd.DataFrame:
+    """Nested-CV site withholding with a generative prior; age-subsampled for cost.
+
+    Two passes over one ``k_folds`` site partition: selection (assimilate 3 folds,
+    predict the val fold, pooled over the rotation) picks ``gamma``; the test pass
+    (assimilate 4 folds, predict the 5th) reports it. ``R = diag(sse + rep_var)``
+    with ``rep_var`` estimated per fold from the assimilated sites only. Ages are
+    thinned by ``age_stride`` on both passes to bound the sampling cost; the stride
+    is recorded in the config.
+
+    ``progress_every`` counts posterior draws.
+    """
+    W = _withholding_setup(cube, ages, lats, lons, valid, long, k_folds=k_folds,
+                           fold_kind=fold_kind, age_stride=age_stride, seed=seed)
+    lane = W["lane"]
+    base = {**_GEN, "lane": lane, "fold": -1, "b_scale": np.nan,
+            "background": "climatological"}
+
+    rows = _withholding_selection_rows(sampler, W, gamma_grid, n_samples_select,
+                                       {**base, "split": "selection"}, progress_every,
+                                       f"withholding selection draws ({lane})")
+    gamma_star = select_best_config(_sel_rrmse(rows, lane), sel_tol=sel_tol)["b_scale"]
+
+    test_rows, predictions = _withholding_test_pass(
+        sampler, W, gamma_star, n_samples, {**base, "split": "test"}, progress_every,
+        f"withholding test draws ({lane})")
+    rows += test_rows
 
     config = {"lane": lane, "space": "generative", "selected": {"b_scale": gamma_star},
               "gamma_grid": [float(g) for g in gamma_grid], "n_samples": n_samples,
               "n_samples_select": n_samples_select, "k_folds": k_folds, "fold_kind": fold_kind,
-              "age_stride": age_stride, "n_obs_ages": int(len(obs_ages)), "seed": seed,
-              "sampler": _sampler_meta(sampler), "prior_meta": prior.meta,
+              "age_stride": age_stride, "n_obs_ages": int(len(W["obs_ages"])), "seed": seed,
+              "sampler": _sampler_meta(sampler), "prior_meta": W["prior"].meta,
+              "rep_var_full": {VARS[i]: float(v) for i, v in enumerate(predictions["rep_var_full"])}}
+    _write(out_dir, lane, "predictions", rows, predictions, config)
+    return pd.DataFrame(rows)
+
+
+def run_withholding_generative_hybrid(
+    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+    valid: np.ndarray, long, out_dir: str, *, make_sampler,
+    amp_grid: tuple[float, ...] = AMP_GRID,
+    switch_grid: tuple[float, ...] = SWITCH_GRID,
+    gamma_grid: tuple[float, ...] = HYBRID_GAMMA_GRID, n_samples: int = 32,
+    n_samples_select: int = 16, k_folds: int = 5, fold_kind: str = "random",
+    age_stride: int = 6, seed: int = 0,
+    progress_every: int | None = None,
+) -> pd.DataFrame:
+    """Site withholding for the hybrid denoiser, tuned over (amp, sigma_switch, gamma).
+
+    The nested-CV protocol of :func:`run_withholding_generative`: all combos share
+    one fold partition and observation split, run sequentially through
+    ``make_sampler`` (a context-manager factory, see
+    :func:`run_ppe_generative_hybrid`), and the argmin of the debiased selection
+    RRMSE runs the test rotation.
+    """
+    W = _withholding_setup(cube, ages, lats, lons, valid, long, k_folds=k_folds,
+                           fold_kind=fold_kind, age_stride=age_stride, seed=seed)
+    lane = W["lane"]
+    base = {**_HYB, "lane": lane, "fold": -1, "b_scale": np.nan,
+            "background": "climatological"}
+
+    rows: list[dict] = []
+    for amp, switch in itertools.product(amp_grid, switch_grid):
+        cbase = {**base, "hybrid_amp": float(amp), "hybrid_switch": float(switch),
+                 "split": "selection"}
+        with make_sampler(amp, switch) as smp:
+            rows += _withholding_selection_rows(
+                smp, W, gamma_grid, n_samples_select, cbase, progress_every,
+                f"hybrid selection draws ({lane}, amp={amp:g}, switch={switch:g})")
+
+    sel = _sel_rrmse(rows, lane)
+    win = sel.loc[sel["value"].idxmin()]
+    amp_s, switch_s = float(win["hybrid_amp"]), float(win["hybrid_switch"])
+    gamma_s = float(win["b_scale"])
+
+    with make_sampler(amp_s, switch_s) as smp:
+        test_rows, predictions = _withholding_test_pass(
+            smp, W, gamma_s, n_samples,
+            {**base, "hybrid_amp": amp_s, "hybrid_switch": switch_s, "split": "test"},
+            progress_every, f"hybrid test draws ({lane})")
+        sampler_meta = _sampler_meta(smp)
+    rows += test_rows
+
+    config = {"lane": lane, "space": "generative", "method": "generative_hybrid",
+              "selected": {"b_scale": gamma_s, "hybrid_amp": amp_s,
+                           "hybrid_switch": switch_s},
+              "amp_grid": [float(a) for a in amp_grid],
+              "switch_grid": [float(s) for s in switch_grid],
+              "gamma_grid": [float(g) for g in gamma_grid],
+              "n_samples": n_samples, "n_samples_select": n_samples_select,
+              "k_folds": k_folds, "fold_kind": fold_kind, "age_stride": age_stride,
+              "n_obs_ages": int(len(W["obs_ages"])), "seed": seed,
+              "sampler": sampler_meta, "prior_meta": W["prior"].meta,
               "rep_var_full": {VARS[i]: float(v) for i, v in enumerate(predictions["rep_var_full"])}}
     _write(out_dir, lane, "predictions", rows, predictions, config)
     return pd.DataFrame(rows)

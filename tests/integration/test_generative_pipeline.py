@@ -1,13 +1,14 @@
 """End-to-end smoke test of the generative runners (experiments_generative).
 
-A tiny untrained sampler drives both lanes on the synthetic fixtures. The tests
-guard the tidy-CSV schema, the npz keys notebook 09 reads, the two-split
-structure, and the generative row labels, so the method drops into the
-comparison notebook unchanged.
+A tiny untrained sampler drives both lanes and their hybrid grid variants on the
+synthetic fixtures. The tests guard the tidy-CSV schema, the npz keys notebook 09
+reads, the two-split structure, and the generative row labels, so the methods drop
+into the comparison notebook unchanged.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 
@@ -16,7 +17,9 @@ import pandas as pd
 
 from paleoreco.assim import experiments as ex
 from paleoreco.assim import experiments_generative as g
-from paleoreco.assim.generative import GuidedSampler, cell_scales, guidance_cov
+from paleoreco.assim.generative import (
+    GuidedSampler, HybridDenoiser, cell_scales, guidance_cov,
+)
 from paleoreco.data.cube import apply_anomaly, compute_zscore_stats
 from paleoreco.models.diffusion import CircularUNet, EDMDenoiser
 
@@ -38,6 +41,24 @@ def _sampler(cube, valid):
     sampler = GuidedSampler(net, scales, stats["safe_valid"], cov,
                             n_steps=4, device="cpu")
     return sampler, anom.var(axis=0, ddof=1)
+
+
+def _hybrid_factory(cube, valid):
+    """Hybrid sampler factory: one net and one eigendecomposition serve every combo."""
+    stats = compute_zscore_stats(cube, np.arange(len(cube)), valid)
+    anom = apply_anomaly(cube, stats)
+    scales = cell_scales(anom, stats["safe_valid"])
+    cov = guidance_cov(np.cov(anom.reshape(len(anom), -1), rowvar=False),
+                       scales, stats["safe_valid"])
+    net = EDMDenoiser(CircularUNet(base_channels=16, depth=2, grid_shape=cube.shape[2:]))
+
+    def make_sampler(amp, sigma_switch):
+        scaled = cov.scaled(amp)
+        return contextlib.nullcontext(
+            GuidedSampler(HybridDenoiser(net, scaled, sigma_switch), scales,
+                          stats["safe_valid"], scaled, n_steps=4, device="cpu"))
+
+    return make_sampler
 
 
 def _varying_obs(obs_long):
@@ -96,6 +117,61 @@ def test_ppe_lanes_draw_identical_networks(tmp_path, cube, ages, lats, lons, val
     gen = np.load(tmp_path / "gen" / "ppe_analysis.npz")["drawn_ages"]
     pixel = np.load(tmp_path / "pixel" / "ppe_analysis.npz")["drawn_ages"]
     assert np.array_equal(gen, pixel)
+
+
+def test_run_ppe_generative_hybrid_schema_and_npz(tmp_path, cube, ages, lats, lons, valid, obs_long):
+    out = tmp_path / "generative_hybrid"
+    df = g.run_ppe_generative_hybrid(
+        cube, ages, lats, lons, valid, obs_long, str(out),
+        make_sampler=_hybrid_factory(cube, valid),
+        amp_grid=(1.0, 2.0), switch_grid=(0.5, 8.0), gamma_grid=(1.0,),
+        n_samples=4, n_samples_select=2, n_shapes=3, n_select=2, truth_stride=1,
+        sel_subsample_truths=None, n_prior_var=8, seed=0)
+
+    hyb = df[df["method"] == "generative_hybrid"]
+    assert len(hyb) and (hyb["space"] == "generative").all()
+    assert set(hyb["split"]) == {"selection", "test"}
+    sel = hyb[hyb["split"] == "selection"]
+    assert set(zip(sel["hybrid_amp"], sel["hybrid_switch"])) == {
+        (1.0, 0.5), (1.0, 8.0), (2.0, 0.5), (2.0, 8.0)}
+
+    cfg = json.load(open(out / "ppe_config.json"))
+    assert cfg["selected"]["hybrid_amp"] in (1.0, 2.0)
+    assert cfg["selected"]["hybrid_switch"] in (0.5, 8.0)
+    assert cfg["selected"]["b_scale"] == 1.0
+    test = hyb[hyb["split"] == "test"]
+    assert (test["hybrid_amp"] == cfg["selected"]["hybrid_amp"]).all()
+    assert (test["hybrid_switch"] == cfg["selected"]["hybrid_switch"]).all()
+
+    z = np.load(out / "ppe_analysis.npz")
+    for k in ("truth_anom", "safe_valid", "b_scales", "recon_climatological", "prior_var",
+              "post_var", "obs_n", "obs_chan", "obs_lat", "obs_lon", "lats", "lons",
+              "naive_idw", "naive_nearest", "prior_ens_var"):
+        assert k in z.files, k
+    assert z["recon_climatological"].shape[0] == 1
+    assert np.isclose(z["b_scales"][0], cfg["selected"]["b_scale"])
+
+
+def test_run_withholding_generative_hybrid_schema_and_npz(tmp_path, cube, ages, lats, lons, valid, obs_long):
+    out = tmp_path / "generative_hybrid"
+    df = g.run_withholding_generative_hybrid(
+        cube, ages, lats, lons, valid, _varying_obs(obs_long), str(out),
+        make_sampler=_hybrid_factory(cube, valid),
+        amp_grid=(2.0,), switch_grid=(0.5, 8.0), gamma_grid=(1.0,),
+        n_samples=4, n_samples_select=2, k_folds=3, age_stride=1, seed=0)
+
+    hyb = df[df["method"] == "generative_hybrid"]
+    assert set(hyb["split"]) == {"selection", "test"}
+    rmse = hyb[(hyb["metric"] == "rmse") & (hyb["channel"] == "pooled")]
+    assert len(rmse) and np.isfinite(rmse["value"].to_numpy()).all()
+
+    z = np.load(out / "withholding_random_predictions.npz")
+    for k in ("b_scales", "actual", "climatological_pred", "channel", "post_var_pred",
+              "sse", "rep_var"):
+        assert k in z.files, k
+    cfg = json.load(open(out / "withholding_random_config.json"))
+    assert cfg["selected"]["hybrid_amp"] == 2.0
+    assert cfg["selected"]["hybrid_switch"] in (0.5, 8.0)
 
 
 def test_run_withholding_generative_schema_and_npz(tmp_path, cube, ages, lats, lons, valid, obs_long):
