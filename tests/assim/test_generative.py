@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from paleoreco.assim.generative import (
-    GuidedSampler, annealed_obs_cov, cell_scales, guidance_cov,
+    GuidedSampler, HybridDenoiser, annealed_obs_cov, cell_scales, guidance_cov,
 )
 from paleoreco.assim.method import Observations
 
@@ -194,6 +194,82 @@ def test_masked_cells_stay_zero():
     cov = guidance_cov(np.eye(d), np.full(shape, 0.5), safe)
     samp = GuidedSampler(_AnalyticDenoiser(np.eye(d)),
                          np.full(shape, 0.5), safe, cov, n_steps=8, device="cpu")
+    x = samp.sample_prior(3, seed=0)
+    assert np.allclose(x[:, :, ~safe], 0.0)
+
+
+def _hybrid_sampler(Sigma, amp, sigma_switch, shape, **kw):
+    # The wrapped net carries a deliberately wrong prior (identity), so any result
+    # matching amp * Sigma proves the closed-form branch drove the trajectory.
+    scales = np.full(shape, _AnalyticDenoiser.sigma_data)
+    cov = _cov(Sigma, shape).scaled(amp)
+    net = _AnalyticDenoiser(np.eye(int(np.prod(shape))))
+    return GuidedSampler(HybridDenoiser(net, cov, sigma_switch), scales,
+                         np.ones(shape[1:], bool), cov, device="cpu", **kw)
+
+
+def test_scaled_cov_shares_the_eigenbasis():
+    cov = _cov(_spd(8, 0), (2, 2, 2))
+    doubled = cov.scaled(2.0)
+    assert doubled.U is cov.U
+    assert np.allclose(doubled.lam, 2.0 * cov.lam)
+    assert doubled.meta["amp"] == 2.0 and "amp" not in cov.meta
+
+
+def test_hybrid_denoiser_switches_between_net_and_closed_form():
+    d = 8
+    net = _AnalyticDenoiser(_spd(d, 1))
+    cov = _cov(_spd(d, 2), (2, 2, 2))
+    hyb = HybridDenoiser(net, cov, sigma_switch=1.5)
+    x = torch.randn(3, 2, 2, 2)
+    assert torch.equal(hyb(x, 0.5), net(x, 0.5))
+    for s in (1.5, 4.0):                    # the boundary belongs to the closed form
+        f = cov.lam / (cov.lam + s ** 2)
+        want = (x.reshape(3, -1).numpy() @ cov.U) * f[None, :] @ cov.U.T
+        assert np.allclose(hyb(x, s).reshape(3, -1).numpy(), want, atol=1e-5)
+    assert hyb.sigma_data == net.sigma_data
+
+
+def test_hybrid_prior_recovers_the_scaled_covariance():
+    shape = (2, 2, 2)
+    Sigma = _spd(np.prod(shape), 0)
+    samp = _hybrid_sampler(Sigma, 2.0, 0.0, shape, n_steps=128)
+    x = samp.sample_prior(4000, seed=1).reshape(4000, -1)
+    rel = np.linalg.norm(np.cov(x, rowvar=False) - 2.0 * Sigma) / np.linalg.norm(2.0 * Sigma)
+    assert np.abs(x.mean(0)).max() < 0.25
+    assert rel < 0.4
+
+
+def test_hybrid_posterior_mean_matches_kalman():
+    """``gamma = 1`` with the shared scaled cov is exact moment matching for the
+    hybrid's Gaussian prior, so the closed-form update for ``2 Sigma`` must survive."""
+    shape = (2, 2, 2)
+    d = int(np.prod(shape))
+    Sigma = _spd(d, 0)
+    samp = _hybrid_sampler(Sigma, 2.0, 0.0, shape, n_steps=128)
+
+    gather = np.array([0, 5])
+    y = np.array([1.2, -0.8])
+    R = np.full(2, 0.05)
+    H = np.zeros((2, d))
+    H[np.arange(2), gather] = 1.0
+    S2 = 2.0 * Sigma
+    kalman = S2 @ H.T @ np.linalg.inv(H @ S2 @ H.T + np.diag(R)) @ y
+
+    ens = samp.sample_posterior(gather, y, R, gamma=1.0, n=4000, seed=2).reshape(4000, -1)
+    assert np.linalg.norm(ens.mean(0) - kalman) / np.linalg.norm(kalman) < 0.1
+
+
+def test_hybrid_masked_cells_stay_zero():
+    shape = (2, 4, 4)
+    d = int(np.prod(shape))
+    safe = np.ones((4, 4), bool)
+    safe[0] = False
+    scales = np.full(shape, 0.5)
+    cov = guidance_cov(np.eye(d), scales, safe).scaled(2.0)
+    # A switch inside the 8-step schedule, so both branches run during sampling.
+    hyb = HybridDenoiser(_AnalyticDenoiser(np.eye(d)), cov, 1.0)
+    samp = GuidedSampler(hyb, scales, safe, cov, n_steps=8, device="cpu")
     x = samp.sample_prior(3, seed=0)
     assert np.allclose(x[:, :, ~safe], 0.0)
 

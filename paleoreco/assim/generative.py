@@ -21,7 +21,9 @@ Sampling is the EDM 2nd-order Heun predictor (Karras 2022, Alg. 1). Fields live
 in the per-cell-scaled anomaly frame during sampling and are returned in anomaly
 units, so the network sees unit variance everywhere and the spatial variance
 pattern is carried by the scale field rather than learned. Masked cells are held
-at zero throughout.
+at zero throughout. The prior score comes from the trained net alone or from a
+:class:`HybridDenoiser` that anchors the high-noise regime to the guidance
+covariance.
 """
 
 from __future__ import annotations
@@ -68,6 +70,11 @@ class GuidanceCov:
     lam: np.ndarray
     meta: dict
 
+    def scaled(self, amp: float) -> "GuidanceCov":
+        """The covariance of ``amp * B``: same eigenbasis, eigenvalues scaled."""
+        return GuidanceCov(U=self.U, lam=amp * self.lam,
+                           meta={**self.meta, "amp": float(amp)})
+
 
 def guidance_cov(B: np.ndarray, scales: np.ndarray, safe_valid: np.ndarray,
                  *, sigma_data: float = SIGMA_DATA, meta: dict | None = None) -> GuidanceCov:
@@ -95,6 +102,37 @@ def annealed_obs_cov(U_g: torch.Tensor, lam: torch.Tensor, r_norm: torch.Tensor,
     """S(sigma) for one network: gamma-scaled annealed prior block plus diag R."""
     f = lam * sigma ** 2 / (lam + sigma ** 2)
     return gamma * ((U_g * f[None, :]) @ U_g.T) + torch.diag(r_norm)
+
+
+class HybridDenoiser(torch.nn.Module):
+    """Learned denoiser below ``sigma_switch``, closed-form Gaussian denoiser above.
+
+    The net is essentially untrained at high noise (the EDM lognormal puts ~2% of
+    its training mass above sigma ~3) yet the leading modes' variance is decided
+    there, and learned scores match their Gaussian approximation at moderate-to-high
+    noise anyway (arXiv 2412.09726). At or above the switch this applies the exact
+    denoiser of ``N(0, B)`` for the covariance ``cov`` decomposes, so handing the
+    sampler the same ``cov`` moment-matches prior and guidance by construction; an
+    amplitude on B rides in ``cov`` itself (:meth:`GuidanceCov.scaled`). The
+    closed-form branch stays autograd-friendly because the guidance score
+    differentiates through the denoiser.
+    """
+
+    def __init__(self, net, cov: GuidanceCov, sigma_switch: float):
+        super().__init__()
+        self.net = net
+        self.sigma_data = float(getattr(net, "sigma_data", SIGMA_DATA))
+        self.switch = float(sigma_switch)
+        self.register_buffer("U", torch.as_tensor(cov.U, dtype=torch.float32))
+        self.register_buffer("lam", torch.as_tensor(cov.lam, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor, sigma) -> torch.Tensor:
+        s = float(np.asarray(sigma).reshape(-1)[0])
+        if s < self.switch:
+            return self.net(x, sigma)
+        f = self.lam / (self.lam + s ** 2)
+        xf = x.reshape(x.shape[0], -1)
+        return ((xf @ self.U) * f[None, :] @ self.U.T).reshape(x.shape)
 
 
 @dataclass(frozen=True)

@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 
-from paleoreco.assim.generative import GuidedSampler, PosteriorJob, guidance_cov
+from paleoreco.assim.generative import GuidedSampler, HybridDenoiser, PosteriorJob, guidance_cov
 from paleoreco.assim.sampler_pool import SamplerPool
 from paleoreco.models.diffusion import CircularUNet, EDMDenoiser
 from paleoreco.training._common import set_seed
@@ -76,6 +76,19 @@ def test_pool_matches_serial(tmp_path):
         assert np.allclose(a, b)
     assert np.allclose(single, serial[0])
     assert prior.shape == (2, 2, *GRID)
+
+
+def test_pool_with_a_sigma_switch_matches_serial_hybrid(tmp_path):
+    switch = 1.0            # inside the 4-step schedule, so both branches run
+    jobs = _jobs()
+    hyb = HybridDenoiser(_net(), COV, switch)
+    serial = list(GuidedSampler(hyb, SCALES, np.ones(GRID, bool), COV,
+                                **KW).imap_posterior(jobs))
+    with SamplerPool(_checkpoint(tmp_path), np.ones(GRID, bool), COV,
+                     n_workers=2, sigma_switch=switch, **KW) as pool:
+        pooled = list(pool.imap_posterior(jobs))
+    for a, b in zip(serial, pooled):
+        assert np.allclose(a, b)
 
 
 def test_pool_closes_its_workers(tmp_path):

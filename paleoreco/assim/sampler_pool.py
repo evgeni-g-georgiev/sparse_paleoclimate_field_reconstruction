@@ -16,17 +16,19 @@ import multiprocessing
 import numpy as np
 import torch
 
-from paleoreco.assim.generative import GuidanceCov, GuidedSampler, PosteriorJob
+from paleoreco.assim.generative import GuidanceCov, GuidedSampler, HybridDenoiser, PosteriorJob
 from paleoreco.models.diffusion import load_denoiser
 
 _SAMPLER: GuidedSampler | None = None
 
 
 def _init_worker(checkpoint_path: str, safe_valid: np.ndarray, cov: GuidanceCov,
-                 kwargs: dict) -> None:
+                 kwargs: dict, sigma_switch: float | None) -> None:
     """Build this worker's sampler once, so the model and CUDA context are reused."""
     global _SAMPLER
     net, scales = load_denoiser(checkpoint_path)
+    if sigma_switch is not None:
+        net = HybridDenoiser(net, cov, sigma_switch)
     _SAMPLER = GuidedSampler(net, np.asarray(scales), safe_valid, cov, **kwargs)
 
 
@@ -46,13 +48,15 @@ class SamplerPool:
     build, so a run's provenance record does not depend on how it executed.
     ``cov`` is prebuilt by the caller: one eigendecomposition serves every worker
     instead of one per process, at the price of pickling its eigenbasis into each
-    worker once at pool construction.
+    worker once at pool construction. ``sigma_switch`` wraps each worker's net in a
+    :class:`~paleoreco.assim.generative.HybridDenoiser` around the same ``cov``.
     """
 
     def __init__(self, checkpoint_path: str, safe_valid: np.ndarray,
                  cov: GuidanceCov, *,
                  n_workers: int = 4, gamma: float = 1.0, n_samples: int = 16,
-                 n_steps: int = 64, device: str | None = None):
+                 n_steps: int = 64, sigma_switch: float | None = None,
+                 device: str | None = None):
         if n_workers < 1:
             raise ValueError(f"n_workers must be >= 1; got {n_workers}")
         self.cov = cov
@@ -70,7 +74,7 @@ class SamplerPool:
         self._pool = ctx.Pool(n_workers, initializer=_init_worker,
                               initargs=(str(checkpoint_path),
                                         np.asarray(safe_valid, dtype=bool),
-                                        cov, kwargs))
+                                        cov, kwargs, sigma_switch))
 
     def imap_posterior(self, jobs):
         """Posterior ensembles for a sequence of :class:`PosteriorJob`, in order."""
