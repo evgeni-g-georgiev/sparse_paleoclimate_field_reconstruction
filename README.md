@@ -75,7 +75,7 @@ Points worth calling out:
   sites. Both emit skill, calibration and prior-free nearest-neighbour and
   inverse-distance-weighted reference rows into one tidy metrics schema.
 
-`pytest tests/ -q` gives **87 passed**.
+`pytest tests/ -q` gives **152 passed**.
 
 ## Results
 
