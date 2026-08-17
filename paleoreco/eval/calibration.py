@@ -59,7 +59,13 @@ def crps_ensemble(truth: np.ndarray, samples: np.ndarray) -> np.ndarray:
     accuracy = np.abs(x - y[None, :]).mean(axis=0)
     if n < 2:
         return accuracy
-    pairwise = np.abs(x[:, None, :] - x[None, :, :]).sum(axis=(0, 1))
+    # Sum of |x_i - x_j| over all ordered pairs via the sorted ensemble:
+    # each x_(k) is larger in k pairs and smaller in n-1-k, so the one-way sum
+    # is sum_k (2k - n + 1) x_(k). Materialising the (n, n, n_points) broadcast
+    # instead costs 82 GiB at n=256 over a lane's pooled points.
+    xs = np.sort(x, axis=0)
+    w = 2.0 * np.arange(n, dtype=np.float64) - n + 1.0
+    pairwise = 2.0 * np.einsum("n,np->p", w, xs)
     return accuracy - pairwise / (2.0 * n * (n - 1))
 
 
