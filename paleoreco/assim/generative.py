@@ -160,13 +160,15 @@ class GuidedSampler(Method):
     need. ``cov`` is the guidance covariance in the normalised frame
     (:func:`guidance_cov`); ``gamma`` scales its prior block, 1 being the
     Gaussian value. ``n_samples`` sets the ensemble size :meth:`analyze` draws.
+    ``max_batch`` caps how many fields one reverse pass integrates at once;
+    a posterior draw larger than it is taken in independent chunks.
     """
 
     def __init__(self, denoiser, scales: np.ndarray, safe_valid: np.ndarray,
                  cov: GuidanceCov,
                  *, gamma: float = 1.0, n_samples: int = 16, n_steps: int = 64,
                  sigma_min: float = SIGMA_MIN, sigma_max: float = SIGMA_MAX, rho: float = RHO,
-                 device: str | None = None):
+                 max_batch: int | None = None, device: str | None = None):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available()
                                                else "mps" if torch.backends.mps.is_available()
                                                else "cpu"))
@@ -187,6 +189,9 @@ class GuidedSampler(Method):
         self.gamma = gamma
         self.n_samples = n_samples
         self.n_steps = n_steps
+        if max_batch is not None and max_batch < 1:
+            raise ValueError(f"max_batch must be >= 1 or None; got {max_batch}")
+        self.max_batch = max_batch
         self.sigmas = _edm_sigmas(n_steps, sigma_min, sigma_max, rho)
 
         self._mask = torch.as_tensor(self.safe_valid.astype(np.float32), device=self.device)
@@ -268,7 +273,18 @@ class GuidedSampler(Method):
             r = y_t[None, :] - pred
             return -0.5 * torch.einsum("nm,mk,nk->", r, sinv[float(sigma)], r)
 
-        return self._denorm(self._sample(n, guidance, seed))
+        if self.max_batch is None or n <= self.max_batch:
+            return self._denorm(self._sample(n, guidance, seed))
+        # The guidance backward pass stores denoiser activations for every field
+        # in the batch, so peak memory grows with n. Draws are i.i.d., so a large
+        # ensemble taken in chunks is the same ensemble distributionally; the
+        # S^-1 table above is shared across chunks. Chunk seeds sit far above the
+        # small consecutive integers the experiment runners assign per job, so no
+        # chunk shares a noise stream with any other job's draw.
+        chunks = [self._denorm(self._sample(min(self.max_batch, n - k), guidance,
+                                            (seed << 32) + (1 << 31) + k))
+                  for k in range(0, n, self.max_batch)]
+        return np.concatenate(chunks)
 
     def imap_posterior(self, jobs):
         """Posterior ensembles for a sequence of :class:`PosteriorJob`, in order."""

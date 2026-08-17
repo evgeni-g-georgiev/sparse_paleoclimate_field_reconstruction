@@ -56,7 +56,7 @@ class SamplerPool:
                  cov: GuidanceCov, *,
                  n_workers: int = 4, gamma: float = 1.0, n_samples: int = 16,
                  n_steps: int = 64, sigma_switch: float | None = None,
-                 device: str | None = None):
+                 max_batch: int | None = None, device: str | None = None):
         if n_workers < 1:
             raise ValueError(f"n_workers must be >= 1; got {n_workers}")
         self.cov = cov
@@ -68,7 +68,7 @@ class SamplerPool:
         self.sd = float(torch.load(checkpoint_path, map_location="cpu")["sigma_data"])
 
         kwargs = {"gamma": gamma, "n_samples": n_samples, "n_steps": n_steps,
-                  "device": device}
+                  "max_batch": max_batch, "device": device}
         # spawn, not fork: a forked process cannot initialise CUDA.
         ctx = multiprocessing.get_context("spawn")
         self._pool = ctx.Pool(n_workers, initializer=_init_worker,
