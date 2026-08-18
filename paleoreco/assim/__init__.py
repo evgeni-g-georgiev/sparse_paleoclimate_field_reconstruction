@@ -17,6 +17,8 @@ Methods and drivers, reached by submodule path rather than re-exported:
 * :mod:`paleoreco.assim.threedvar`    - gain-form pixel 3DVar.
 * :mod:`paleoreco.assim.latent`       - latent-space 3DVar.
 * :mod:`paleoreco.assim.generative`   - guided posterior sampling from a score prior.
+* :mod:`paleoreco.assim.spectral`     - a score prior confined to a whitened leading
+  eigen-subspace of B, with the complement kept Gaussian and marginalised exactly.
 * :mod:`paleoreco.assim.sampler_pool` - the guided sampler across worker processes.
 * :mod:`paleoreco.assim.experiments`  - PPE and withholding lane runners.
 """
