@@ -281,7 +281,7 @@ def run_ppe_generative(
     gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 32,
     n_samples_select: int = 16, n_shapes: int = 5, n_select: int = 4,
     n_noise: int = 5, truth_stride: int = 10, sel_subsample_truths: int | None = 12,
-    sel_tol: float = SEL_TOL, seed: int = 0,
+    sel_tol: float = SEL_TOL, seed: int = 0, method: str = "generative",
     progress_every: int | None = None,
 ) -> pd.DataFrame:
     """Same-model PPE with a generative prior; guided sampling replaces the gain.
@@ -302,12 +302,17 @@ def run_ppe_generative(
     ``prior_ens_var`` is the sampled prior's per-cell variance, stored in the
     analysis npz for the prior-vs-posterior spread diagnostics.
     ``progress_every`` counts posterior draws.
+
+    ``method`` labels the rows, so a second generative prior writing the same
+    schema into its own directory appears in notebook 09 as its own row rather
+    than colliding with this one. It overrides a value in the row base without
+    changing the key order the tidy CSV is appended on.
     """
     S = _ppe_setup(cube, ages, lats, lons, valid, long, n_shapes=n_shapes,
                    n_noise=n_noise, truth_stride=truth_stride, seed=seed)
     sel_ti = _sel_truths(S["T"], sel_subsample_truths)
-    base = {**_GEN, "lane": LANE_PPE, "fold": -1, "b_scale": np.nan,
-            "background": "climatological"}
+    base = {**_GEN, "method": method, "lane": LANE_PPE, "fold": -1,
+            "b_scale": np.nan, "background": "climatological"}
 
     rows = _ppe_selection_rows(sampler, S, gamma_grid, sel_ti, n_select,
                                n_samples_select, {**base, "split": "selection"},
@@ -319,7 +324,8 @@ def run_ppe_generative(
                                     progress_every, "ppe test draws")
     rows += test_rows
 
-    config = {"lane": LANE_PPE, "space": "generative", "selected": {"b_scale": gamma_star},
+    config = {"lane": LANE_PPE, "space": "generative", "method": method,
+              "selected": {"b_scale": gamma_star},
               "gamma_grid": [float(g) for g in gamma_grid], "n_samples": n_samples,
               "n_samples_select": n_samples_select, "n_shapes": n_shapes, "n_select": n_select,
               "n_noise": n_noise, "n_truths": int(S["T"]), "truth_stride": truth_stride,
@@ -577,7 +583,7 @@ def run_withholding_generative(
     gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 32,
     n_samples_select: int = 16, k_folds: int = 5, fold_kind: str = "random",
     age_stride: int = 6, sel_tol: float = SEL_TOL, seed: int = 0,
-    progress_every: int | None = None,
+    method: str = "generative", progress_every: int | None = None,
 ) -> pd.DataFrame:
     """Nested-CV site withholding with a generative prior; age-subsampled for cost.
 
@@ -588,12 +594,13 @@ def run_withholding_generative(
     thinned by ``age_stride`` on both passes to bound the sampling cost; the stride
     is recorded in the config.
 
-    ``progress_every`` counts posterior draws.
+    ``progress_every`` counts posterior draws. ``method`` labels the rows, as in
+    :func:`run_ppe_generative`.
     """
     W = _withholding_setup(cube, ages, lats, lons, valid, long, k_folds=k_folds,
                            fold_kind=fold_kind, age_stride=age_stride, seed=seed)
     lane = W["lane"]
-    base = {**_GEN, "lane": lane, "fold": -1, "b_scale": np.nan,
+    base = {**_GEN, "method": method, "lane": lane, "fold": -1, "b_scale": np.nan,
             "background": "climatological"}
 
     rows = _withholding_selection_rows(sampler, W, gamma_grid, n_samples_select,
@@ -606,7 +613,8 @@ def run_withholding_generative(
         f"withholding test draws ({lane})")
     rows += test_rows
 
-    config = {"lane": lane, "space": "generative", "selected": {"b_scale": gamma_star},
+    config = {"lane": lane, "space": "generative", "method": method,
+              "selected": {"b_scale": gamma_star},
               "gamma_grid": [float(g) for g in gamma_grid], "n_samples": n_samples,
               "n_samples_select": n_samples_select, "k_folds": k_folds, "fold_kind": fold_kind,
               "age_stride": age_stride, "n_obs_ages": int(len(W["obs_ages"])), "seed": seed,
@@ -724,8 +732,14 @@ def _sel_rrmse(rows: list[dict], lane: str = LANE_PPE) -> pd.DataFrame:
 
 
 def _sampler_meta(sampler) -> dict:
-    """JSON-safe record of the sampler configuration."""
+    """JSON-safe record of the sampler configuration.
+
+    ``cond_cov`` records how the likelihood's conditional covariance was obtained;
+    a sampler that offers no choice is described as ``anchor``, which is what its
+    Gaussian annealing amounts to.
+    """
     return {"n_steps": sampler.n_steps, "sigma_data": sampler.sd,
+            "cond_cov": getattr(sampler, "cond_cov", "anchor"),
             "guidance_cov": dict(sampler.cov.meta)}
 
 
