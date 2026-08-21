@@ -1,10 +1,10 @@
 """Grid-tuning drivers: full-grid metrics, winner-only fields, and the selection rule.
 
 ``run_ppe_pixel_grid`` / ``run_withholding_pixel_grid`` score every (localization,
-shrinkage, alpha) config, jointly select the operating point with ``b_scale`` on the
-selection split, and persist only the winner's fields. These guard the full-grid metrics
-schema, the winner-only artifacts, and that notebook 09 re-derives the same winner via
-``select_best_config`` on the persisted CSV.
+shrinkage, alpha, highpass_window) config, jointly select the operating point with
+``b_scale`` on the selection split, and persist only the winner's fields. These guard the
+full-grid metrics schema, the winner-only artifacts, and that notebook 09 re-derives the
+same winner via ``select_best_config`` on the persisted CSV.
 """
 
 from __future__ import annotations
@@ -17,12 +17,16 @@ import pandas as pd
 
 from paleoreco.assim import experiments as ex
 
-TINY_GRID = dict(localization_grid=(None,), shrinkage_grid=(0.0, 0.5), alpha_grid=(1.0, 0.0))
+# The band-pass axis carries both settings so the fourth knob is exercised end to end;
+# the fixture's ages are 500 yr apart, so a 1500 yr window spans three or four states.
+TINY_GRID = dict(localization_grid=(None,), shrinkage_grid=(0.0, 0.5), alpha_grid=(1.0, 0.0),
+                 highpass_grid=(None, 1500.0))
+CONFIG_COLS = ["localization_km", "shrinkage_lambda", "alpha", "highpass_window"]
 
 
 def _n_configs(grid):
     return (len(grid["localization_grid"]) * len(grid["shrinkage_grid"])
-            * len(grid["alpha_grid"]))
+            * len(grid["alpha_grid"]) * len(grid["highpass_grid"]))
 
 
 def _selection_rows(tdv, lane):
@@ -43,9 +47,9 @@ def test_run_ppe_pixel_grid_full_grid_and_winner(
     tdv = df[df["method"] == "3dvar"]
 
     # New schema, full grid in metrics.csv.
-    assert {"localization_km", "shrinkage_lambda", "alpha"}.issubset(df.columns)
+    assert set(CONFIG_COLS).issubset(df.columns)
     assert "B_reg" not in df.columns
-    combos = tdv[["localization_km", "shrinkage_lambda", "alpha"]].drop_duplicates()
+    combos = tdv[CONFIG_COLS].drop_duplicates()
     assert len(combos) == _n_configs(TINY_GRID)
 
     # Winner-only field npz; config records a selected config drawn from the grid.
@@ -55,9 +59,10 @@ def test_run_ppe_pixel_grid_full_grid_and_winner(
     assert win["localization_km"] in TINY_GRID["localization_grid"]
     assert win["shrinkage_lambda"] in TINY_GRID["shrinkage_grid"]
     assert win["alpha"] in TINY_GRID["alpha_grid"]
+    assert win["highpass_window"] in TINY_GRID["highpass_grid"]
 
     # SSIM is reported for the winning config only (the RRMSE scan skips it).
-    ssim_combos = (tdv[tdv["metric"] == "ssim"][["localization_km", "shrinkage_lambda", "alpha"]]
+    ssim_combos = (tdv[tdv["metric"] == "ssim"][CONFIG_COLS]
                    .drop_duplicates())
     assert len(ssim_combos) == 1
 
@@ -86,7 +91,7 @@ def test_run_withholding_pixel_grid_full_grid_and_winner(
         k_folds=3, fold_kind="random", b_scales=(0.5, 1.0), seed=0, **TINY_GRID,
     )
     tdv = df[df["method"] == "3dvar"]
-    combos = tdv[["localization_km", "shrinkage_lambda", "alpha"]].drop_duplicates()
+    combos = tdv[CONFIG_COLS].drop_duplicates()
     assert len(combos) == _n_configs(TINY_GRID)
     assert os.path.exists(out / "withholding_random_predictions.npz")
 
@@ -103,16 +108,69 @@ def test_run_withholding_pixel_grid_full_grid_and_winner(
 def test_select_best_config_prefers_simpler_within_tolerance():
     # Near-tie: the raw-like config (all off, b=1) is within tol of the complex best.
     rows = pd.DataFrame([
-        {"localization_km": np.nan, "shrinkage_lambda": 0.0, "alpha": 1.0, "b_scale": 1.0, "value": 0.501},
-        {"localization_km": 12500.0, "shrinkage_lambda": 0.5, "alpha": 0.0, "b_scale": 5.0, "value": 0.500},
+        {"localization_km": np.nan, "shrinkage_lambda": 0.0, "alpha": 1.0,
+         "highpass_window": np.nan, "b_scale": 1.0, "value": 0.501},
+        {"localization_km": 12500.0, "shrinkage_lambda": 0.5, "alpha": 0.0,
+         "highpass_window": 6000.0, "b_scale": 5.0, "value": 0.500},
     ])
     assert ex.select_best_config(rows, sel_tol=0.01) == {
-        "localization_km": None, "shrinkage_lambda": 0.0, "alpha": 1.0, "b_scale": 1.0}
+        "localization_km": None, "shrinkage_lambda": 0.0, "alpha": 1.0,
+        "highpass_window": None, "b_scale": 1.0}
 
     # Clear winner outside tolerance is taken despite being complex.
     rows2 = pd.DataFrame([
-        {"localization_km": np.nan, "shrinkage_lambda": 0.0, "alpha": 1.0, "b_scale": 1.0, "value": 0.60},
-        {"localization_km": 12500.0, "shrinkage_lambda": 0.5, "alpha": 0.0, "b_scale": 5.0, "value": 0.50},
+        {"localization_km": np.nan, "shrinkage_lambda": 0.0, "alpha": 1.0,
+         "highpass_window": np.nan, "b_scale": 1.0, "value": 0.60},
+        {"localization_km": 12500.0, "shrinkage_lambda": 0.5, "alpha": 0.0,
+         "highpass_window": 6000.0, "b_scale": 5.0, "value": 0.50},
     ])
     win = ex.select_best_config(rows2, sel_tol=0.01)
     assert win["shrinkage_lambda"] == 0.5 and win["alpha"] == 0.0
+    assert win["highpass_window"] == 6000.0
+
+
+def test_select_best_config_reads_a_pre_bandpass_csv_as_filter_off():
+    """An archived run has no ``highpass_window`` column; it still selects."""
+    rows = pd.DataFrame([
+        {"localization_km": np.nan, "shrinkage_lambda": 0.0, "alpha": 1.0,
+         "b_scale": 1.0, "value": 0.50},
+    ])
+    assert ex.select_best_config(rows)["highpass_window"] is None
+
+
+def test_band_pass_is_a_distinguishable_knob(tmp_path, cube, ages, lats, lons, valid, obs_long):
+    """Turning the window on changes the skill rows, so the fourth axis is not inert."""
+    rows = []
+    for hp in (None, 1500.0):
+        df = ex.run_ppe(
+            cube, ages, lats, lons, valid, obs_long, str(tmp_path / f"hp{hp}"),
+            highpass_window=hp, b_scales=(1.0,), n_shapes=3, n_select=2, n_noise=1,
+            truth_stride=1, seed=0)
+        sel = df[(df["method"] == "3dvar") & (df["metric"] == "rrmse")
+                 & (df["channel"] == "pooled") & (df["do_event"] == "all")]
+        assert set(sel["highpass_window"].fillna(-1)) == {hp if hp is not None else -1}
+        rows.append(sel["value"].to_numpy())
+    assert not np.allclose(rows[0], rows[1])
+
+
+def test_append_csv_realigns_when_the_schema_grew(tmp_path):
+    """A directory holding pre-band-pass rows must not corrupt the ones appended to it."""
+    path = str(tmp_path / "metrics.csv")
+    old = pd.DataFrame([{"method": "3dvar", "b_scale": 1.0, "value": 0.5}])
+    old.to_csv(path, index=False)
+    ex._append_csv(path, [{"method": "3dvar", "b_scale": 2.0, "highpass_window": 6000.0,
+                           "value": 0.4}])
+    back = pd.read_csv(path)
+
+    assert list(back["value"]) == [0.5, 0.4]          # values stayed under "value"
+    assert pd.isna(back["highpass_window"].iloc[0])   # the old row predates the column
+    assert back["highpass_window"].iloc[1] == 6000.0
+
+
+def test_append_csv_still_appends_when_the_schema_matches(tmp_path):
+    path = str(tmp_path / "metrics.csv")
+    row = {"method": "3dvar", "b_scale": 1.0, "highpass_window": None, "value": 0.5}
+    ex._append_csv(path, [row])
+    ex._append_csv(path, [{**row, "b_scale": 2.0, "value": 0.4}])
+    back = pd.read_csv(path)
+    assert len(back) == 2 and list(back["value"]) == [0.5, 0.4]

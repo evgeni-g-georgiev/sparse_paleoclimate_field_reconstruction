@@ -124,17 +124,24 @@ def _native_calibration_rows(truth: np.ndarray, ens: np.ndarray, base: dict) -> 
 # Same-model pseudo-proxy lane.
 # ---------------------------------------------------------------------------
 def _ppe_setup(cube, ages, lats, lons, valid, long, *, n_shapes: int, n_noise: int,
-               truth_stride: int, seed: int) -> dict:
+               truth_stride: int, seed: int,
+               highpass_window: float | None = None) -> dict:
     """Truths, network geometries and pseudo-obs shared by every PPE operating point.
 
     One seeded rng draws the geometries and noise, consumed one draw at a time so
     the stream stays aligned with the classical lane and both draw the same network
     shapes per truth. The ``job`` closure carries the per-draw seed, so a job list
     reproduces however it executes.
+
+    ``highpass_window`` is the band-pass the generative prior is trained in. Nothing
+    here samples, so it reaches only ``prior_var``, the do-nothing reference CE and
+    CRPSS are scored against; pass the window the model was trained with so the
+    reference describes the same frame.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
     prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
-    prior = build_prior(cube, ages, lats, lons, prior_idx, valid)
+    prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
+                        highpass_window=highpass_window)
     safe_valid = prior.safe_valid
     shape = (len(VARS), len(lats), len(lons))
     safe_flat = np.broadcast_to(safe_valid, shape).ravel()
@@ -282,6 +289,7 @@ def run_ppe_generative(
     n_samples_select: int = 16, n_shapes: int = 5, n_select: int = 4,
     n_noise: int = 5, truth_stride: int = 10, sel_subsample_truths: int | None = 12,
     sel_tol: float = SEL_TOL, seed: int = 0, method: str = "generative",
+    highpass_window: float | None = None,
     progress_every: int | None = None,
 ) -> pd.DataFrame:
     """Same-model PPE with a generative prior; guided sampling replaces the gain.
@@ -307,9 +315,14 @@ def run_ppe_generative(
     schema into its own directory appears in notebook 09 as its own row rather
     than colliding with this one. It overrides a value in the row base without
     changing the key order the tidy CSV is appended on.
+
+    ``highpass_window`` states the band-pass the sampler's prior was built in. As with
+    the taper columns, the rows leave it nan - a generative row's covariance lives in the
+    sampler, not in the row - and the value is recorded in the config instead.
     """
     S = _ppe_setup(cube, ages, lats, lons, valid, long, n_shapes=n_shapes,
-                   n_noise=n_noise, truth_stride=truth_stride, seed=seed)
+                   n_noise=n_noise, truth_stride=truth_stride, seed=seed,
+                   highpass_window=highpass_window)
     sel_ti = _sel_truths(S["T"], sel_subsample_truths)
     base = {**_GEN, "method": method, "lane": LANE_PPE, "fold": -1,
             "b_scale": np.nan, "background": "climatological"}
@@ -330,7 +343,8 @@ def run_ppe_generative(
               "n_samples_select": n_samples_select, "n_shapes": n_shapes, "n_select": n_select,
               "n_noise": n_noise, "n_truths": int(S["T"]), "truth_stride": truth_stride,
               "sel_subsample_truths": sel_subsample_truths, "sel_tol": sel_tol,
-              "seed": seed, "sampler": _sampler_meta(sampler),
+              "seed": seed, "highpass_window": highpass_window,
+              "sampler": _sampler_meta(sampler),
               "prior_meta": S["prior"].meta}
     _write(out_dir, LANE_PPE, "analysis", rows, npz, config)
     return pd.DataFrame(rows)
@@ -351,7 +365,7 @@ def run_ppe_generative_hybrid(
     gamma_grid: tuple[float, ...] = HYBRID_GAMMA_GRID, n_samples: int = 32,
     n_samples_select: int = 16, n_shapes: int = 5, n_select: int = 4,
     n_noise: int = 5, truth_stride: int = 10, sel_subsample_truths: int | None = 12,
-    n_prior_var: int = 512, seed: int = 0,
+    n_prior_var: int = 512, seed: int = 0, highpass_window: float | None = None,
     progress_every: int | None = None,
 ) -> pd.DataFrame:
     """Same-model PPE for the hybrid denoiser, tuned over (amp, sigma_switch, gamma).
@@ -363,10 +377,12 @@ def run_ppe_generative_hybrid(
     :func:`run_ppe_generative`), the winner is the argmin of the debiased selection
     RRMSE, and only the winner runs the test split. ``prior_ens_var`` cannot be an
     argument here because it belongs to the winner, so ``n_prior_var`` unconditional
-    winner draws stand in for it.
+    winner draws stand in for it. ``highpass_window`` behaves as in
+    :func:`run_ppe_generative`.
     """
     S = _ppe_setup(cube, ages, lats, lons, valid, long, n_shapes=n_shapes,
-                   n_noise=n_noise, truth_stride=truth_stride, seed=seed)
+                   n_noise=n_noise, truth_stride=truth_stride, seed=seed,
+                   highpass_window=highpass_window)
     sel_ti = _sel_truths(S["T"], sel_subsample_truths)
     base = {**_HYB, "lane": LANE_PPE, "fold": -1, "b_scale": np.nan,
             "background": "climatological"}
@@ -405,7 +421,8 @@ def run_ppe_generative_hybrid(
               "n_shapes": n_shapes, "n_select": n_select, "n_noise": n_noise,
               "n_truths": int(S["T"]), "truth_stride": truth_stride,
               "sel_subsample_truths": sel_subsample_truths, "n_prior_var": n_prior_var,
-              "seed": seed, "sampler": sampler_meta, "prior_meta": S["prior"].meta}
+              "seed": seed, "highpass_window": highpass_window,
+              "sampler": sampler_meta, "prior_meta": S["prior"].meta}
     _write(out_dir, LANE_PPE, "analysis", rows, npz, config)
     return pd.DataFrame(rows)
 
@@ -414,11 +431,17 @@ def run_ppe_generative_hybrid(
 # Real-proxy withholding lane.
 # ---------------------------------------------------------------------------
 def _withholding_setup(cube, ages, lats, lons, valid, long, *, k_folds: int,
-                       fold_kind: str, age_stride: int, seed: int) -> dict:
-    """Prior, site folds and observation-split closures shared by every operating point."""
+                       fold_kind: str, age_stride: int, seed: int,
+                       highpass_window: float | None = None) -> dict:
+    """Prior, site folds and observation-split closures shared by every operating point.
+
+    ``highpass_window`` reaches ``diagB``, the do-nothing reference the withheld-site
+    CRPSS is scored against, as in :func:`_ppe_setup`.
+    """
     from paleoreco.assim.experiments import _site_folds
 
-    prior = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid)
+    prior = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid,
+                        highpass_window=highpass_window)
     safe_valid = prior.safe_valid
     shape = (len(VARS), len(lats), len(lons))
     safe_flat = np.broadcast_to(safe_valid, shape).ravel()
@@ -583,7 +606,8 @@ def run_withholding_generative(
     gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 32,
     n_samples_select: int = 16, k_folds: int = 5, fold_kind: str = "random",
     age_stride: int = 6, sel_tol: float = SEL_TOL, seed: int = 0,
-    method: str = "generative", progress_every: int | None = None,
+    method: str = "generative", highpass_window: float | None = None,
+    progress_every: int | None = None,
 ) -> pd.DataFrame:
     """Nested-CV site withholding with a generative prior; age-subsampled for cost.
 
@@ -594,11 +618,12 @@ def run_withholding_generative(
     thinned by ``age_stride`` on both passes to bound the sampling cost; the stride
     is recorded in the config.
 
-    ``progress_every`` counts posterior draws. ``method`` labels the rows, as in
-    :func:`run_ppe_generative`.
+    ``progress_every`` counts posterior draws. ``method`` and ``highpass_window`` behave
+    as in :func:`run_ppe_generative`.
     """
     W = _withholding_setup(cube, ages, lats, lons, valid, long, k_folds=k_folds,
-                           fold_kind=fold_kind, age_stride=age_stride, seed=seed)
+                           fold_kind=fold_kind, age_stride=age_stride, seed=seed,
+                           highpass_window=highpass_window)
     lane = W["lane"]
     base = {**_GEN, "method": method, "lane": lane, "fold": -1, "b_scale": np.nan,
             "background": "climatological"}
@@ -618,6 +643,7 @@ def run_withholding_generative(
               "gamma_grid": [float(g) for g in gamma_grid], "n_samples": n_samples,
               "n_samples_select": n_samples_select, "k_folds": k_folds, "fold_kind": fold_kind,
               "age_stride": age_stride, "n_obs_ages": int(len(W["obs_ages"])), "seed": seed,
+              "highpass_window": highpass_window,
               "sampler": _sampler_meta(sampler), "prior_meta": W["prior"].meta,
               "rep_var_full": {VARS[i]: float(v) for i, v in enumerate(predictions["rep_var_full"])}}
     _write(out_dir, lane, "predictions", rows, predictions, config)
@@ -631,7 +657,7 @@ def run_withholding_generative_hybrid(
     switch_grid: tuple[float, ...] = SWITCH_GRID,
     gamma_grid: tuple[float, ...] = HYBRID_GAMMA_GRID, n_samples: int = 32,
     n_samples_select: int = 16, k_folds: int = 5, fold_kind: str = "random",
-    age_stride: int = 6, seed: int = 0,
+    age_stride: int = 6, seed: int = 0, highpass_window: float | None = None,
     progress_every: int | None = None,
 ) -> pd.DataFrame:
     """Site withholding for the hybrid denoiser, tuned over (amp, sigma_switch, gamma).
@@ -640,10 +666,12 @@ def run_withholding_generative_hybrid(
     one fold partition and observation split, run sequentially through
     ``make_sampler`` (a context-manager factory, see
     :func:`run_ppe_generative_hybrid`), and the argmin of the debiased selection
-    RRMSE runs the test rotation.
+    RRMSE runs the test rotation. ``highpass_window`` behaves as in
+    :func:`run_ppe_generative`.
     """
     W = _withholding_setup(cube, ages, lats, lons, valid, long, k_folds=k_folds,
-                           fold_kind=fold_kind, age_stride=age_stride, seed=seed)
+                           fold_kind=fold_kind, age_stride=age_stride, seed=seed,
+                           highpass_window=highpass_window)
     lane = W["lane"]
     base = {**_HYB, "lane": lane, "fold": -1, "b_scale": np.nan,
             "background": "climatological"}
@@ -679,6 +707,7 @@ def run_withholding_generative_hybrid(
               "n_samples": n_samples, "n_samples_select": n_samples_select,
               "k_folds": k_folds, "fold_kind": fold_kind, "age_stride": age_stride,
               "n_obs_ages": int(len(W["obs_ages"])), "seed": seed,
+              "highpass_window": highpass_window,
               "sampler": sampler_meta, "prior_meta": W["prior"].meta,
               "rep_var_full": {VARS[i]: float(v) for i, v in enumerate(predictions["rep_var_full"])}}
     _write(out_dir, lane, "predictions", rows, predictions, config)

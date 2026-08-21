@@ -10,12 +10,12 @@ Two evaluation lanes, both method-agnostic through the :class:`Method` contract:
   ``b_scale`` on a held-out fold, report on a fresh fold.
 
 :func:`run_ppe_pixel_grid` and :func:`run_withholding_pixel_grid` wrap these over a
-coarse localization/shrinkage/coupling grid, jointly selecting the operating point with
-``b_scale`` on the held-out selection split and persisting only the winning config's
-fields.
+coarse localization/shrinkage/coupling/band-pass grid, jointly selecting the operating
+point with ``b_scale`` on the held-out selection split and persisting only the winning
+config's fields.
 
 Each writes a tidy long-format metrics CSV (one row per method/space/localization_km/
-shrinkage_lambda/alpha/lane/fold/b_scale/background/split/do_event/channel/metric), the
+shrinkage_lambda/alpha/highpass_window/lane/fold/b_scale/background/split/do_event/channel/metric), the
 analysis fields as npz, and a config.json. ``b_scale`` is the background-covariance
 amplitude the analysis used; ``split`` is ``selection`` (used to pick the operating
 point) or ``test`` (reported). The withholding lane uses ``R = diag(sse + rep_var)``,
@@ -27,8 +27,11 @@ counterparts.
 
 Every lane emits skill metrics (``ce``, ``corr``, ``rmse``, ``rrmse``, ``amplitude``,
 plus field-only ``ssim``) and calibration metrics (``crps``, ``crpss``, ``rcrv_bias``,
-``rcrv_dispersion``, ``coverage90``), scored against the prior ``N(0, b_scale diag B)``
-as the CRPSS reference so it matches CE's climatology baseline. Both lanes also carry
+``rcrv_dispersion``, ``coverage90``). The CRPSS reference is the do-nothing forecast
+``N(0, diag B)``, the probabilistic form of the climatology CE scores against. It does
+**not** carry ``b_scale``: that knob tunes the analysis, so letting it rescale the
+reference would grade each operating point against a different exam and make CRPSS
+incomparable across operating points and across methods. Both lanes also carry
 prior-free ``nearest``/``idw`` reference rows, tagged ``background="none"``, which is the
 context a bare CE cannot supply.
 """
@@ -66,14 +69,21 @@ B_SCALES = (0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
 LOCALIZATION_KM_GRID = (None, 7500.0, 12500.0)
 SHRINKAGE_GRID = (0.0, 0.25, 0.5)
 ALPHA_GRID = (0.0, 0.5, 1.0)
+# Band-pass window (yr) removed from the prior states before B is formed; ``None`` is
+# off, the raw states. Defaults to off so the library's behaviour is unchanged unless a
+# caller opts in.
+HIGHPASS_GRID = (None,)
 SEL_TOL = 0.0   # 0 = pure argmin of selection RRMSE; >0 prefers the simpler config within this relative band
 LANE_PPE = "ppe"
 # Metrics the RRMSE selection never reads, so a grid scan computes them for the winner only.
 _FULL_METRICS = frozenset({"ssim", "crps", "crpss", "rcrv_bias", "rcrv_dispersion",
                            "coverage90"})
 
-# Taper columns for prior-free (naive) rows, which carry no regularizer.
-_NAN_REG = {"localization_km": np.nan, "shrinkage_lambda": np.nan, "alpha": np.nan}
+# Taper columns for prior-free (naive) rows, which carry no regularizer. The key order
+# is the tidy CSV's column order for these fields, so every runner spells them the same
+# way by spreading this dict rather than writing them out.
+_NAN_REG = {"localization_km": np.nan, "shrinkage_lambda": np.nan, "alpha": np.nan,
+            "highpass_window": np.nan}
 
 
 # ---------------------------------------------------------------------------
@@ -339,9 +349,24 @@ def _ssim_rows(truth_anom: np.ndarray, recon_anom: np.ndarray, safe_valid: np.nd
 
 
 def _append_csv(path: str, rows: list[dict]) -> None:
-    """Append metric rows to the tidy CSV, writing the header once."""
+    """Append metric rows to the tidy CSV, writing the header once.
+
+    Appending is positional, so rows whose columns differ from the file's header would
+    land under the wrong names without raising. That happens whenever the schema gains a
+    column - ``highpass_window`` did - and a directory still holds rows from before it.
+    When the columns disagree the file is read, concatenated and rewritten under the
+    union instead, which keeps the old rows readable and correctly marks the fields they
+    predate as missing.
+    """
     df = pd.DataFrame(rows)
-    df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
+    if not os.path.exists(path):
+        df.to_csv(path, index=False)
+        return
+    header = pd.read_csv(path, nrows=0).columns
+    if list(header) == list(df.columns):
+        df.to_csv(path, mode="a", header=False, index=False)
+        return
+    pd.concat([pd.read_csv(path), df], ignore_index=True).to_csv(path, index=False)
 
 
 # ---------------------------------------------------------------------------
@@ -459,8 +484,13 @@ def _score_ppe_lane(
         if full_metrics:
             rows += _ssim_rows(truth_anoms, recon_test[bj], safe_valid, events, base)
             rows += _ssim_rows(truth_sel, recon_pool, safe_valid, events_sel, base_sel)
+            # The CRPSS reference is the do-nothing forecast N(0, diag B), which must not
+            # move with b_scale: b_scale tunes the analysis, and grading each operating
+            # point against a reference it rescaled would make the score incomparable
+            # across them and across methods. The generative runners use the same fixed
+            # reference, which is what puts the two lanes' CRPSS on one axis.
             rows += _field_calibration_rows(truth_anoms, recon_test[bj], post_test[bj],
-                                            kb * tv.diagB.reshape(shape), safe_valid,
+                                            tv.diagB.reshape(shape), safe_valid,
                                             events, base)
     for kind in naive_test:
         base = {"method": kind, "space": space, **_NAN_REG,
@@ -513,6 +543,7 @@ def run_ppe(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
     localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
+    highpass_window: float | None = None,
     make_method: MethodFactory | None = None, space: str = "pixel",
     b_scales: tuple[float, ...] = B_SCALES,
     n_shapes: int = 5, n_select: int = 4, n_noise: int = 20, truth_stride: int = 10,
@@ -526,17 +557,22 @@ def run_ppe(
     truths, each anomalised by the subsampled set's own mean so the inter-chunk offset
     cancels. Scoring and held-out selection follow :func:`_score_ppe_lane`; rows and
     files are tagged ``ppe``. :func:`run_ppe_pixel_grid` wraps this over the taper grid.
+
+    ``highpass_window`` reaches the pixel background through ``build_prior``. A latent
+    method carries its own ``B_z``, built by
+    :func:`~paleoreco.assim.compressors.latent_prior`, so for those the window here only
+    labels the rows and records the provenance - pass the same value to both.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
     prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
     prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
                         localization_km=localization_km, shrinkage_lambda=shrinkage_lambda,
-                        alpha=alpha)
+                        alpha=alpha, highpass_window=highpass_window)
     truth_cube = cube[truth_idx].astype(np.float64)
     truth_clim = truth_cube.mean(axis=0)
     truth_anoms = truth_cube - truth_clim
     reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
-                "alpha": alpha}
+                "alpha": alpha, "highpass_window": highpass_window}
     rows, npz_arrays, skill = _score_ppe_lane(
         truth_anoms, prior, long, lats, lons,
         lane=LANE_PPE, make_method=make_method, space=space, reg_cols=reg_cols,
@@ -779,10 +815,12 @@ def _score_withholding_lane(
             out += _withholding_rows(tp.actual, tp.pred[bj], tp.channel, base)
             # The truth is itself a measurement that also deviates from its grid cell, so
             # its error and representativeness variance join the posterior spread; the
-            # prior reference carries the same terms to stay comparable.
+            # prior reference carries the same terms to stay comparable. The reference's
+            # prior variance is unscaled for the reason given in _score_ppe_lane: b_scale
+            # tunes the analysis, not the forecast it is being credited against.
             out += _calibration_rows(tp.actual, tp.pred[bj],
                                      tp.post_var[bj] + tp.sse + tp.rep_var,
-                                     kb * tp.prior_var + tp.sse + tp.rep_var, groups, base)
+                                     tp.prior_var + tp.sse + tp.rep_var, groups, base)
         return out
 
     def _naive_rows(tp: _TargetPredictions) -> list[dict]:
@@ -869,6 +907,7 @@ def run_withholding(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
     localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
+    highpass_window: float | None = None,
     make_method: MethodFactory | None = None, space: str = "pixel",
     k_folds: int = 5, fold_kind: str = "random",
     b_scales: tuple[float, ...] = B_SCALES, seed: int = 0,
@@ -879,13 +918,13 @@ def run_withholding(
     ``long`` must carry per-site climatology ``my``; the prior uses all ages, as the
     held-out quantity is real proxies not model states. Scoring follows
     :func:`_score_withholding_lane`; :func:`run_withholding_pixel_grid` wraps this over
-    the taper grid.
+    the taper grid. ``highpass_window`` behaves as in :func:`run_ppe`.
     """
     prior = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid,
                         localization_km=localization_km, shrinkage_lambda=shrinkage_lambda,
-                        alpha=alpha)
+                        alpha=alpha, highpass_window=highpass_window)
     reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
-                "alpha": alpha}
+                "alpha": alpha, "highpass_window": highpass_window}
     lane, rows, predictions = _score_withholding_lane(
         prior, long, ages, lats, lons, make_method=make_method, space=space,
         reg_cols=reg_cols, k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales,
@@ -897,27 +936,35 @@ def run_withholding(
 
 
 # ---------------------------------------------------------------------------
-# Pixel regularizer tuning: joint (localization, shrinkage, alpha, b_scale) selection.
+# Pixel regularizer tuning: joint (localization, shrinkage, alpha, highpass, b_scale)
+# selection.
 # ---------------------------------------------------------------------------
 def select_best_config(sel_rows: pd.DataFrame, *, sel_tol: float = SEL_TOL) -> dict:
-    """Winner ``{localization_km, shrinkage_lambda, alpha, b_scale}`` on the selection split.
+    """Winner ``{localization_km, shrinkage_lambda, alpha, highpass_window, b_scale}``.
 
     ``sel_rows`` is pre-filtered to one (model, lane, split=selection, channel=pooled,
-    do_event=all, metric=rrmse) and carries the four config columns plus ``value``. Among
+    do_event=all, metric=rrmse) and carries the config columns plus ``value``. Among
     rows within ``sel_tol`` (relative) of the minimum RRMSE, picks the most raw-like by
     ``(n_active_knobs, |log10(b_scale)|, rrmse)`` where a knob is active when localization
-    is set, shrinkage > 0, or alpha < 1. This banks the coarse grid's noise headroom
-    rather than chasing a spuriously-complex argmin.
+    is set, shrinkage > 0, alpha < 1, or a band-pass window is set. This banks the coarse
+    grid's noise headroom rather than chasing a spuriously-complex argmin.
+
+    A CSV written before the band-pass knob existed carries no ``highpass_window`` column;
+    it is read as "off" so an archived run still selects.
     """
     df = sel_rows.dropna(subset=["value"])
     if df.empty:
         raise ValueError("no finite selection-split RRMSE to select from")
+    if "highpass_window" not in df.columns:
+        df = df.assign(highpass_window=np.nan)
     best = float(df["value"].min())
     band = df[df["value"] <= best * (1.0 + sel_tol)]
 
     def key(r):
         loc_active = 0 if pd.isna(r["localization_km"]) else 1
-        n_active = loc_active + int(float(r["shrinkage_lambda"]) > 0) + int(float(r["alpha"]) < 1.0)
+        hp_active = 0 if pd.isna(r["highpass_window"]) else 1
+        n_active = (loc_active + hp_active + int(float(r["shrinkage_lambda"]) > 0)
+                    + int(float(r["alpha"]) < 1.0))
         return (n_active, abs(np.log10(float(r["b_scale"]))), float(r["value"]))
 
     winner = min((r for _, r in band.iterrows()), key=key)
@@ -925,16 +972,19 @@ def select_best_config(sel_rows: pd.DataFrame, *, sel_tol: float = SEL_TOL) -> d
         "localization_km": None if pd.isna(winner["localization_km"]) else float(winner["localization_km"]),
         "shrinkage_lambda": float(winner["shrinkage_lambda"]),
         "alpha": float(winner["alpha"]),
+        "highpass_window": None if pd.isna(winner["highpass_window"]) else float(winner["highpass_window"]),
         "b_scale": float(winner["b_scale"]),
     }
 
 
-def _pixel_grid_configs(localization_grid, shrinkage_grid, alpha_grid):
-    """The (localization_km, shrinkage_lambda, alpha) grid points, and a JSON-safe record."""
-    configs = list(itertools.product(localization_grid, shrinkage_grid, alpha_grid))
+def _pixel_grid_configs(localization_grid, shrinkage_grid, alpha_grid, highpass_grid):
+    """The (localization_km, shrinkage_lambda, alpha, highpass_window) points, and a record."""
+    configs = list(itertools.product(localization_grid, shrinkage_grid, alpha_grid,
+                                     highpass_grid))
     record = {"localization_grid": [None if g is None else float(g) for g in localization_grid],
               "shrinkage_grid": [float(g) for g in shrinkage_grid],
-              "alpha_grid": [float(g) for g in alpha_grid]}
+              "alpha_grid": [float(g) for g in alpha_grid],
+              "highpass_grid": [None if g is None else float(g) for g in highpass_grid]}
     return configs, record
 
 
@@ -949,32 +999,37 @@ def run_ppe_pixel_grid(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
     localization_grid=LOCALIZATION_KM_GRID, shrinkage_grid=SHRINKAGE_GRID,
-    alpha_grid=ALPHA_GRID, b_scales: tuple[float, ...] = B_SCALES, sel_tol: float = SEL_TOL,
+    alpha_grid=ALPHA_GRID, highpass_grid=HIGHPASS_GRID,
+    b_scales: tuple[float, ...] = B_SCALES, sel_tol: float = SEL_TOL,
     n_shapes: int = 5, n_select: int = 4, n_noise: int = 20, truth_stride: int = 10,
     dist_edges_km: np.ndarray | None = None, seed: int = 0,
     progress_every: int | None = None,
 ) -> pd.DataFrame:
     """Same-model PPE tuned over the taper grid: full-grid metrics, winner-only fields.
 
-    Scores every ``(localization, shrinkage, alpha)`` config (SSIM and calibration skipped,
-    the RRMSE selection needs neither), jointly selects the operating point with ``b_scale``
-    on the selection split via :func:`select_best_config`, then re-runs the winner with the
-    full metric set to persist its analysis fields. metrics.csv holds the full grid's skill
-    rows plus the winner's SSIM and calibration; the npz holds only the winner.
+    Scores every ``(localization, shrinkage, alpha, highpass_window)`` config (SSIM and
+    calibration skipped, the RRMSE selection needs neither), jointly selects the operating
+    point with ``b_scale`` on the selection split via :func:`select_best_config`, then
+    re-runs the winner with the full metric set to persist its analysis fields. metrics.csv
+    holds the full grid's skill rows plus the winner's SSIM and calibration; the npz holds
+    only the winner.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
     prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
     truth_cube = cube[truth_idx].astype(np.float64)
     truth_clim = truth_cube.mean(axis=0)
     truth_anoms = truth_cube - truth_clim
-    configs, grid_record = _pixel_grid_configs(localization_grid, shrinkage_grid, alpha_grid)
+    configs, grid_record = _pixel_grid_configs(localization_grid, shrinkage_grid,
+                                               alpha_grid, highpass_grid)
 
     all_rows: list[dict] = []
     t0 = time.time()
-    for ci, (loc, lam, a) in enumerate(configs):
+    for ci, (loc, lam, a, hp) in enumerate(configs):
         prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
-                            localization_km=loc, shrinkage_lambda=lam, alpha=a)
-        reg_cols = {"localization_km": loc, "shrinkage_lambda": lam, "alpha": a}
+                            localization_km=loc, shrinkage_lambda=lam, alpha=a,
+                            highpass_window=hp)
+        reg_cols = {"localization_km": loc, "shrinkage_lambda": lam, "alpha": a,
+                    "highpass_window": hp}
         rows, _, _ = _score_ppe_lane(
             truth_anoms, prior, long, lats, lons,
             lane=LANE_PPE, make_method=None, space="pixel", reg_cols=reg_cols,
@@ -986,7 +1041,7 @@ def run_ppe_pixel_grid(
 
     win = select_best_config(_selection_rrmse(all_rows, LANE_PPE), sel_tol=sel_tol)
     reg_w = {"localization_km": win["localization_km"], "shrinkage_lambda": win["shrinkage_lambda"],
-             "alpha": win["alpha"]}
+             "alpha": win["alpha"], "highpass_window": win["highpass_window"]}
     prior_w = build_prior(cube, ages, lats, lons, prior_idx, valid, **reg_w)
     win_rows, npz_arrays, skill = _score_ppe_lane(
         truth_anoms, prior_w, long, lats, lons,
@@ -1011,7 +1066,8 @@ def run_withholding_pixel_grid(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
     localization_grid=LOCALIZATION_KM_GRID, shrinkage_grid=SHRINKAGE_GRID,
-    alpha_grid=ALPHA_GRID, k_folds: int = 5, fold_kind: str = "random",
+    alpha_grid=ALPHA_GRID, highpass_grid=HIGHPASS_GRID,
+    k_folds: int = 5, fold_kind: str = "random",
     b_scales: tuple[float, ...] = B_SCALES, sel_tol: float = SEL_TOL, seed: int = 0,
     progress_every: int | None = None,
 ) -> pd.DataFrame:
@@ -1021,16 +1077,23 @@ def run_withholding_pixel_grid(
     on the selection split, then re-runs the winner to persist its predictions npz. The
     prior-free reference rows do not depend on the taper, so they are kept from the winner
     pass alone rather than replicated once per config.
+
+    Unlike the PPE lane this one builds B from every age and scores real proxies inside
+    that same span, so there is no chronological transfer for a band-pass to repair. Keep
+    ``None`` in ``highpass_grid`` here, so the selection split can decline the filter.
     """
-    configs, grid_record = _pixel_grid_configs(localization_grid, shrinkage_grid, alpha_grid)
+    configs, grid_record = _pixel_grid_configs(localization_grid, shrinkage_grid,
+                                               alpha_grid, highpass_grid)
     lane = f"withholding_{fold_kind}"
 
     all_rows: list[dict] = []
     t0 = time.time()
-    for ci, (loc, lam, a) in enumerate(configs):
+    for ci, (loc, lam, a, hp) in enumerate(configs):
         prior = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid,
-                            localization_km=loc, shrinkage_lambda=lam, alpha=a)
-        reg_cols = {"localization_km": loc, "shrinkage_lambda": lam, "alpha": a}
+                            localization_km=loc, shrinkage_lambda=lam, alpha=a,
+                            highpass_window=hp)
+        reg_cols = {"localization_km": loc, "shrinkage_lambda": lam, "alpha": a,
+                    "highpass_window": hp}
         _, rows, _ = _score_withholding_lane(
             prior, long, ages, lats, lons, make_method=None, space="pixel",
             reg_cols=reg_cols, k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales,
@@ -1040,7 +1103,7 @@ def run_withholding_pixel_grid(
 
     win = select_best_config(_selection_rrmse(all_rows, lane), sel_tol=sel_tol)
     reg_w = {"localization_km": win["localization_km"], "shrinkage_lambda": win["shrinkage_lambda"],
-             "alpha": win["alpha"]}
+             "alpha": win["alpha"], "highpass_window": win["highpass_window"]}
     prior_w = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid, **reg_w)
     _, win_rows, predictions = _score_withholding_lane(
         prior_w, long, ages, lats, lons, make_method=None, space="pixel", reg_cols=reg_w,

@@ -103,3 +103,53 @@ def test_withholding_rep_var_is_leakage_clean(tmp_path, cube, ages, lats, lons, 
     # The per-fold estimate genuinely varies (so the subset check is not trivially the
     # single global value), which is what leakage-cleanliness requires.
     assert len({round(pf["mtco"], 9) for pf in per_fold}) > 1
+
+
+# ---------------------------------------------------------------------------
+# The CRPSS reference: fixed at N(0, diag B), shared by every runner.
+# ---------------------------------------------------------------------------
+def _crpss_ref(df, lane, b_scale):
+    """The reference CRPS a run implies, backed out of its own (crps, crpss) pair."""
+    sub = df[(df.lane == lane) & (df.split == "test") & (df.channel == "pooled")
+             & (df.do_event == "all") & (df.fold == -1) & (df.method == "3dvar")
+             & np.isclose(df.b_scale.to_numpy(dtype=float), b_scale)]
+    crps = float(sub[sub.metric == "crps"]["value"].iloc[0])
+    crpss = float(sub[sub.metric == "crpss"]["value"].iloc[0])
+    return crps / (1.0 - crpss)
+
+
+def test_crpss_reference_does_not_move_with_b_scale(
+    tmp_path, cube, ages, lats, lons, valid, obs_long
+):
+    """b_scale tunes the analysis; grading each operating point against a reference it
+    rescaled would make CRPSS incomparable across the sweep."""
+    df = ex.run_ppe(cube, ages, lats, lons, valid, obs_long, str(tmp_path / "p"),
+                    b_scales=(0.5, 5.0), n_shapes=3, n_select=2, n_noise=1,
+                    truth_stride=1, seed=0)
+    lo, hi = _crpss_ref(df, "ppe", 0.5), _crpss_ref(df, "ppe", 5.0)
+    assert np.isclose(lo, hi, rtol=1e-9), (
+        f"CRPSS reference moved with b_scale: {lo:.6f} at b=0.5 vs {hi:.6f} at b=5")
+
+
+def test_crpss_reference_matches_the_generative_runner(
+    tmp_path, cube, ages, lats, lons, valid, obs_long
+):
+    """The classical and generative lanes must grade against the same do-nothing
+    forecast, or their CRPSS columns cannot be read side by side in notebook 09."""
+    from paleoreco.assim.priors import build_prior
+    from paleoreco.data.splits import chronological_half_split
+    from paleoreco.eval import calibration as cal
+
+    df = ex.run_ppe(cube, ages, lats, lons, valid, obs_long, str(tmp_path / "p"),
+                    b_scales=(2.0,), n_shapes=3, n_select=2, n_noise=1,
+                    truth_stride=1, seed=0)
+    z = np.load(tmp_path / "p" / "ppe_analysis.npz")
+    sv = z["safe_valid"]
+    truth = z["truth_anom"][:, :, sv].ravel()
+    # What experiments_generative._ppe_setup uses: diag(B) of the untapered prior.
+    prior_idx, _ = chronological_half_split(np.asarray(ages, dtype=np.int64), stride=1)
+    diagB = np.diag(build_prior(cube, ages, lats, lons, prior_idx, valid).B)
+    ref = np.broadcast_to(diagB.reshape(z["prior_var"].shape)[:, sv][None],
+                          (len(z["truth_anom"]),) + diagB.reshape(z["prior_var"].shape)[:, sv].shape)
+    expected = float(cal.crps_gaussian(truth, np.zeros_like(truth), ref.ravel()).mean())
+    assert np.isclose(_crpss_ref(df, "ppe", 2.0), expected, rtol=1e-6)
