@@ -9,6 +9,7 @@ centre of the code cloud (zero for PCA).
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from paleoreco.assim.compressors import (
@@ -46,6 +47,28 @@ def test_latent_prior_is_psd_with_zero_centroid_for_pca(cube, valid):
     assert np.allclose(B_z, B_z.T)
     assert np.linalg.eigvalsh(B_z).min() > -1e-9
     assert np.allclose(z_clim, 0.0, atol=1e-5)
+
+
+def test_latent_prior_highpass_moves_bz_but_not_z_clim(cube, valid, ages):
+    """The latent band-pass filters the codes, so the tangent point stays put."""
+    cube_anom, safe = _anom(cube, valid)
+    idx = np.arange(len(cube))
+    pca = PCACompressor.from_pod_fit(pod_fit(cube_anom, idx, safe, max_k=6), k=6)
+    raw_B, raw_z = latent_prior(pca, cube_anom, idx)
+    hp_B, hp_z = latent_prior(pca, cube_anom, idx, ages=ages, highpass_window=1500.0)
+
+    assert not np.allclose(raw_B, hp_B)
+    assert np.trace(hp_B) < np.trace(raw_B)
+    assert np.allclose(raw_z, hp_z)
+    assert np.linalg.eigvalsh(hp_B).min() > -1e-9
+
+
+def test_latent_prior_highpass_requires_ages(cube, valid):
+    cube_anom, safe = _anom(cube, valid)
+    idx = np.arange(len(cube))
+    pca = PCACompressor.from_pod_fit(pod_fit(cube_anom, idx, safe, max_k=6), k=6)
+    with pytest.raises(ValueError, match="ages"):
+        latent_prior(pca, cube_anom, idx, highpass_window=1500.0)
 
 
 def test_neural_compressors_encode_decode_and_grad(cube, valid):

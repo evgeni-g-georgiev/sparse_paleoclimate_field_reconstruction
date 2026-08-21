@@ -18,6 +18,8 @@ from abc import ABC, abstractmethod
 import numpy as np
 import torch
 
+from paleoreco.data.cube import highpass_states
+
 
 class Compressor(ABC):
     """Encode/decode between the anomaly field and a ``latent_dim`` code."""
@@ -167,14 +169,28 @@ class VAECompressor(_NeuralCompressor):
 # Latent prior from the encoded prior ages.
 # ---------------------------------------------------------------------------
 def latent_prior(compressor: Compressor, cube_anom: np.ndarray,
-                 prior_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                 prior_idx: np.ndarray, *, ages: np.ndarray | None = None,
+                 highpass_window: float | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Latent background covariance ``B_z`` and climatological mean ``z_clim``.
 
     Encodes the prior ages once; ``B_z`` is the sample covariance of the codes and
     ``z_clim`` their mean. ``z_clim`` is the centre of the latent prior the cost
     measures against, so it is the climatological first guess (0 for PCA/VAE).
+
+    ``highpass_window`` is the latent counterpart of the pixel band-pass: it removes a
+    running mean along the age axis from the *codes*, so only ``B_z`` moves. Filtering
+    the codes rather than the fields leaves the compressor's basis alone, which matters
+    because the decoder still has to represent a full anomaly including its slow part,
+    and it leaves ``z_clim`` at the unfiltered mean, which the neural decoders are
+    linearised about.
     """
     codes = compressor.encode(cube_anom[np.asarray(prior_idx)])           # (N, d)
-    B_z = np.atleast_2d(np.cov(codes, rowvar=False, ddof=1))
     z_clim = codes.mean(axis=0)
+    if highpass_window is not None:
+        if ages is None:
+            raise ValueError("highpass_window needs ages to place each code on the "
+                             "age axis; pass ages=... alongside it")
+        codes = highpass_states(codes, np.asarray(ages)[np.asarray(prior_idx)],
+                                highpass_window)
+    B_z = np.atleast_2d(np.cov(codes, rowvar=False, ddof=1))
     return B_z, z_clim

@@ -109,7 +109,26 @@ def test_build_prior_defaults_are_raw_sample_covariance():
     prior = build_prior(cube, ages, lats, lons, idx, valid)
     assert np.allclose(prior.B, background_covariance(cube, idx))
     assert prior.meta == {"localization_km": None, "shrinkage_lambda": 0.0,
-                          "alpha": 1.0, "n_prior_ages": 8}
+                          "alpha": 1.0, "highpass_window": None, "n_prior_ages": 8}
+
+
+def test_build_prior_highpass_moves_b_but_not_the_anomaly_frame():
+    """The band-pass is a statement about B, not about what is reconstructed."""
+    cube = _sample_cube()
+    lats = np.linspace(-60, 60, 4).astype(np.float32)
+    lons = np.linspace(-180, 120, 5).astype(np.float32)
+    ages = (30_000 + 500 * np.arange(8)).astype(np.int64)
+    valid = np.ones((4, 5), bool)
+    idx = np.arange(8)
+
+    raw = build_prior(cube, ages, lats, lons, idx, valid)
+    hp = build_prior(cube, ages, lats, lons, idx, valid, highpass_window=1500.0)
+
+    assert not np.allclose(raw.B, hp.B)
+    assert np.trace(hp.B) < np.trace(raw.B)          # the slow component is gone
+    assert np.array_equal(raw.clim_mean, hp.clim_mean)
+    assert np.array_equal(raw.safe_valid, hp.safe_valid)
+    assert hp.meta["highpass_window"] == 1500.0
 
 
 def test_build_prior_alpha_zero_decouples_channels():

@@ -10,6 +10,7 @@ from paleoreco.assim.background import (
     background_state,
     background_variance,
 )
+from paleoreco.data.cube import highpass_states
 
 
 def test_background_covariance_matches_numpy(cube):
@@ -22,6 +23,28 @@ def test_background_covariance_matches_numpy(cube):
 def test_background_variance_is_diagonal(cube):
     B = background_covariance(cube, np.arange(cube.shape[0]))
     assert np.allclose(background_variance(B), np.diag(B))
+
+
+def test_background_covariance_highpass_matches_filtering_first(cube, ages):
+    """The band-pass branch is the covariance of the separately-filtered states."""
+    idx = np.arange(cube.shape[0])
+    B = background_covariance(cube, idx, ages=ages, highpass_window=1500.0)
+    X = highpass_states(cube[idx].reshape(len(idx), -1), np.asarray(ages)[idx], 1500.0)
+    assert np.allclose(B, np.cov(X, rowvar=False))   # both use ddof=1
+
+
+def test_background_covariance_highpass_uses_only_the_selected_states(cube, ages):
+    """A prior half must not borrow the running mean of the states held out from it."""
+    idx = np.arange(0, cube.shape[0], 2)
+    B = background_covariance(cube, idx, ages=ages, highpass_window=1500.0)
+    sub_ages = np.asarray(ages)[idx]
+    X = highpass_states(cube[idx].reshape(len(idx), -1), sub_ages, 1500.0)
+    assert np.allclose(B, np.cov(X, rowvar=False))
+
+
+def test_background_covariance_highpass_requires_ages(cube):
+    with pytest.raises(ValueError, match="ages"):
+        background_covariance(cube, np.arange(cube.shape[0]), highpass_window=1500.0)
 
 
 def test_background_state_per_age_vs_climatological(cube):

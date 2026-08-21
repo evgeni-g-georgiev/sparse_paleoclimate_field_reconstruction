@@ -54,6 +54,7 @@ def build_prior(
     localization_km: float | None = None,
     shrinkage_lambda: float = 0.0,
     alpha: float = 1.0,
+    highpass_window: float | None = None,
 ) -> Prior:
     """Build B and the climatology from ``prior_age_indices`` only.
 
@@ -62,20 +63,28 @@ def build_prior(
     :func:`regularization_mask`); the defaults leave B as the raw sample
     covariance. The climatology and mask come from the same prior ages so the
     anomaly frame is internally consistent.
+
+    ``highpass_window`` band-passes the prior states along the age axis before the
+    covariance is formed (:func:`~paleoreco.assim.background.background_covariance`).
+    It changes B alone: ``clim_mean`` and ``safe_valid`` still come from the unfiltered
+    states, so the anomaly frame the analysis works in is untouched and the filter is a
+    statement about what B describes rather than about what is reconstructed.
     """
     prior_age_indices = np.asarray(prior_age_indices, dtype=np.int64)
     stats = compute_zscore_stats(cube, prior_age_indices, valid)
     clim_mean = stats["mean"]
     safe_valid = stats["safe_valid"]
 
-    B = background_covariance(cube, prior_age_indices)
+    B = background_covariance(cube, prior_age_indices, ages=ages,
+                              highpass_window=highpass_window)
     mask = regularization_mask(lats, lons, localization_km=localization_km,
                                shrinkage_lambda=shrinkage_lambda, alpha=alpha)
     if mask is not None:
         B = B * mask
 
     meta = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
-            "alpha": alpha, "n_prior_ages": int(len(prior_age_indices))}
+            "alpha": alpha, "highpass_window": highpass_window,
+            "n_prior_ages": int(len(prior_age_indices))}
     return Prior(B=B, clim_mean=clim_mean, safe_valid=safe_valid,
                  ages=np.asarray(ages, dtype=np.int64)[prior_age_indices], meta=meta)
 
