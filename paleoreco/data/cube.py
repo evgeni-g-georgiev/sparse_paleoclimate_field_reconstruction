@@ -201,6 +201,58 @@ def apply_anomaly(cube: np.ndarray, stats: dict) -> np.ndarray:
     return (anom * mask).astype(np.float32)
 
 
+def highpass_states(
+    states: np.ndarray,
+    ages: np.ndarray,
+    window: float | None,
+) -> np.ndarray:
+    """Remove a running mean along the age axis; the fast component of each state.
+
+    The prior spans ten thousand years of a transient run, so its sample covariance
+    mixes the fast (D-O scale) variability with the slow drift of whichever window the
+    states were taken from. The slow part is estimated from a handful of effectively
+    independent samples and belongs to that window rather than to the climate, so it
+    does not transfer to another stretch of the record. Subtracting it leaves a
+    covariance describing the variability that does.
+
+    For each state at age ``t`` the mean of the states within ``+-window/2`` of ``t`` is
+    removed. The window is rectangular and simply shrinks at the ends of the record,
+    where fewer states are in range. ``window=None`` returns the input unchanged, which
+    is what every caller defaults to.
+
+    The running mean is taken over ``states`` alone, so passing only a prior half keeps
+    the filter from ever seeing a held-out state.
+
+    Parameters
+    ----------
+    states : (N, ...) array
+        One state per row; the leading axis is aligned with ``ages``.
+    ages : (N,) array
+        Age of each state, in the same units as ``window`` (yr BP here).
+    window : float or None
+        Width of the running mean. ``None`` disables the filter.
+
+    Returns
+    -------
+    (N, ...) float64 array in the same shape as ``states``.
+    """
+    x = np.asarray(states, dtype=np.float64)
+    if window is None:
+        return x
+    a = np.asarray(ages, dtype=np.float64)
+    if a.ndim != 1 or len(a) != len(x):
+        raise ValueError(f"ages must be one value per state; got {a.shape} for "
+                         f"{len(x)} states")
+    if window <= 0:
+        raise ValueError(f"window must be positive or None; got {window}")
+
+    out = np.empty_like(x)
+    half = window / 2.0
+    for i in range(len(x)):
+        out[i] = x[i] - x[np.abs(a - a[i]) <= half].mean(axis=0)
+    return out
+
+
 # ----------------------------------------------------------------------------
 # PyTorch dataset.
 # ----------------------------------------------------------------------------

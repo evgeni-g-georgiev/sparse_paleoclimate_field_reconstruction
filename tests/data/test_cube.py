@@ -13,6 +13,7 @@ from paleoreco.data import (
     apply_anomaly,
     build_prior_cube,
     compute_zscore_stats,
+    highpass_states,
 )
 
 
@@ -89,3 +90,46 @@ def test_dataset_returns_field_plus_mask(cube, valid):
     assert tuple(sample.shape) == (3, cube.shape[2], cube.shape[3])
     # Third channel is the binary mask.
     assert np.allclose(sample[2].numpy(), stats["safe_valid"].astype(np.float32))
+
+
+# ----------------------------------------------------------------------------
+# Band-pass along the age axis.
+# ----------------------------------------------------------------------------
+def test_highpass_window_none_is_the_identity(cube, ages):
+    out = highpass_states(cube, ages, None)
+    assert np.allclose(out, cube)
+    assert out.shape == cube.shape
+
+
+def test_highpass_removes_the_slow_part_and_keeps_the_fast_one(ages):
+    """A trend in age is removed; an alternation between consecutive states survives."""
+    n = len(ages)
+    trend = (np.arange(n, dtype=float) * 3.0)[:, None] * np.ones((1, 4))
+    fast = ((-1.0) ** np.arange(n))[:, None] * np.ones((1, 4))
+
+    # Judge the interior only: at the ends the window is one-sided, so a trend leaves a
+    # residual there by construction.
+    interior = slice(2, n - 2)
+    assert np.abs(highpass_states(trend, ages, 1500.0)[interior]).max() < 1e-10
+    kept = highpass_states(fast, ages, 1500.0)[interior]
+    assert np.abs(kept).min() > 0.5 * np.abs(fast[interior]).min()
+
+
+def test_highpass_uses_only_the_states_it_is_given(ages):
+    """Filtering a subset must not depend on the states left out of it."""
+    n = len(ages)
+    x = np.random.default_rng(0).normal(size=(n, 5))
+    keep = np.arange(0, n, 2)
+    from_subset = highpass_states(x[keep], np.asarray(ages)[keep], 2500.0)
+    perturbed = x.copy()
+    perturbed[1] += 100.0                       # a state outside ``keep``
+    assert np.allclose(from_subset,
+                       highpass_states(perturbed[keep], np.asarray(ages)[keep], 2500.0))
+
+
+def test_highpass_rejects_mismatched_ages_and_bad_windows(ages):
+    x = np.zeros((len(ages), 3))
+    with pytest.raises(ValueError, match="one value per state"):
+        highpass_states(x, ages[:-1], 1500.0)
+    with pytest.raises(ValueError, match="positive"):
+        highpass_states(x, ages, 0.0)

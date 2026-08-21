@@ -21,6 +21,7 @@ from .cube import (
     apply_anomaly,
     build_prior_cube,
     compute_zscore_stats,
+    highpass_states,
     verify_mask_constant_across_ages,
 )
 
@@ -28,6 +29,7 @@ __all__ = [
     "build_prior_cube",
     "compute_zscore_stats",
     "apply_anomaly",
+    "highpass_states",
     "PaleoFieldDataset",
     "verify_mask_constant_across_ages",
     "VARS",
