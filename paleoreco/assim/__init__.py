@@ -69,6 +69,18 @@ from paleoreco.assim.latent import (
     TangentLinearLatentVar,
     latent_var,
 )
+from paleoreco.assim.regimes import (
+    PARTITIONS,
+    RegimeMixture,
+    build_regime_mixture,
+    exact_posterior,
+    exact_posterior_mean,
+    exact_posterior_mean_sweep,
+    exact_posterior_sample,
+    partition_states,
+    prior_sample,
+)
+from paleoreco.assim.regime_sampler import RegimeSampler
 
 __all__ = [
     "attach_site_stats",
@@ -83,6 +95,16 @@ __all__ = [
     "SCORINGS",
     "score",
     "background_covariance",
+    "PARTITIONS",
+    "RegimeMixture",
+    "RegimeSampler",
+    "build_regime_mixture",
+    "exact_posterior",
+    "exact_posterior_mean",
+    "exact_posterior_mean_sweep",
+    "exact_posterior_sample",
+    "partition_states",
+    "prior_sample",
     "background_state",
     "background_variance",
     "innovation",

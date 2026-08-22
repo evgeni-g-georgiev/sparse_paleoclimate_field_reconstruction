@@ -61,6 +61,12 @@ _GEN = {"method": "generative", "space": "generative", **_NAN_REG}
 # in this one order; the nan placeholders pin where the overrides land.
 _HYB = {"method": "generative_hybrid", "space": "generative", **_NAN_REG,
         "hybrid_amp": np.nan, "hybrid_switch": np.nan}
+# The regime prior's own operating point: how many regimes, how far each component's
+# covariance is shrunk toward the pooled one, and how much of the learned residual score
+# is used. ``regime_temper = 0`` is the closed-form mixture, which is the floor.
+_REG = {"method": "generative_regime", "space": "generative", **_NAN_REG,
+        "regime_j": np.nan, "regime_rho": np.nan, "regime_temper": np.nan}
+REGIME_TEMPER_GRID = (0.0, 0.25, 0.5, 1.0)
 
 
 def _stream(sampler, jobs, label: str, progress_every: int | None):
@@ -427,6 +433,75 @@ def run_ppe_generative_hybrid(
     return pd.DataFrame(rows)
 
 
+def run_ppe_generative_regime(
+    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+    valid: np.ndarray, long, out_dir: str, *, make_sampler,
+    regime_grid, temper_grid: tuple[float, ...] = REGIME_TEMPER_GRID,
+    gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 32,
+    n_samples_select: int = 16, n_shapes: int = 5, n_select: int = 4,
+    n_noise: int = 5, truth_stride: int = 10, sel_subsample_truths: int | None = 12,
+    n_prior_var: int = 512, seed: int = 0, highpass_window: float | None = None,
+    progress_every: int | None = None,
+) -> pd.DataFrame:
+    """Same-model PPE for the regime prior, tuned over (J, rho, temper, b_scale).
+
+    ``regime_grid`` is a sequence of ``(n_regimes, rho)`` pairs and
+    ``make_sampler(n_regimes, rho, temper)`` returns a context manager yielding the sampler
+    for that combination, following :func:`run_ppe_generative_hybrid`. Every combo shares
+    one set of truths, geometries and pseudo-obs, the winner is the argmin of the debiased
+    selection RRMSE, and only the winner runs the test split.
+
+    ``temper`` scales the learned residual score; ``0`` is in the grid by default and makes
+    the prior the closed-form mixture.
+    """
+    S = _ppe_setup(cube, ages, lats, lons, valid, long, n_shapes=n_shapes,
+                   n_noise=n_noise, truth_stride=truth_stride, seed=seed,
+                   highpass_window=highpass_window)
+    sel_ti = _sel_truths(S["T"], sel_subsample_truths)
+    base = {**_REG, "lane": LANE_PPE, "fold": -1, "b_scale": np.nan,
+            "background": "climatological"}
+
+    rows: list[dict] = []
+    for (n_regimes, rho), temper in itertools.product(regime_grid, temper_grid):
+        cbase = {**base, "regime_j": float(n_regimes), "regime_rho": float(rho),
+                 "regime_temper": float(temper), "split": "selection"}
+        with make_sampler(n_regimes, rho, temper) as smp:
+            rows += _ppe_selection_rows(
+                smp, S, gamma_grid, sel_ti, n_select, n_samples_select, cbase,
+                progress_every,
+                f"regime selection draws (J={n_regimes}, rho={rho:g}, t={temper:g})")
+
+    sel = _sel_rrmse(rows)
+    win = sel.loc[sel["value"].idxmin()]
+    j_s, rho_s = int(win["regime_j"]), float(win["regime_rho"])
+    temper_s, gamma_s = float(win["regime_temper"]), float(win["b_scale"])
+
+    with make_sampler(j_s, rho_s, temper_s) as smp:
+        prior_ens_var = _prior_var(smp, n_prior_var, seed)
+        test_rows, npz = _ppe_test_pass(
+            smp, S, gamma_s, n_samples, n_select,
+            {**base, "regime_j": float(j_s), "regime_rho": rho_s,
+             "regime_temper": temper_s, "split": "test"},
+            prior_ens_var, progress_every, "regime test draws")
+        sampler_meta = _sampler_meta(smp)
+    rows += test_rows
+
+    config = {"lane": LANE_PPE, "space": "generative", "method": "generative_regime",
+              "selected": {"b_scale": gamma_s, "regime_j": j_s, "regime_rho": rho_s,
+                           "regime_temper": temper_s},
+              "regime_grid": [[int(j), float(r)] for j, r in regime_grid],
+              "temper_grid": [float(t) for t in temper_grid],
+              "gamma_grid": [float(g) for g in gamma_grid],
+              "n_samples": n_samples, "n_samples_select": n_samples_select,
+              "n_shapes": n_shapes, "n_select": n_select, "n_noise": n_noise,
+              "n_truths": int(S["T"]), "truth_stride": truth_stride,
+              "sel_subsample_truths": sel_subsample_truths, "n_prior_var": n_prior_var,
+              "seed": seed, "highpass_window": highpass_window,
+              "sampler": sampler_meta, "prior_meta": S["prior"].meta}
+    _write(out_dir, LANE_PPE, "analysis", rows, npz, config)
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------------------
 # Real-proxy withholding lane.
 # ---------------------------------------------------------------------------
@@ -710,6 +785,73 @@ def run_withholding_generative_hybrid(
               "highpass_window": highpass_window,
               "sampler": sampler_meta, "prior_meta": W["prior"].meta,
               "rep_var_full": {VARS[i]: float(v) for i, v in enumerate(predictions["rep_var_full"])}}
+    _write(out_dir, lane, "predictions", rows, predictions, config)
+    return pd.DataFrame(rows)
+
+
+def run_withholding_generative_regime(
+    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+    valid: np.ndarray, long, out_dir: str, *, make_sampler,
+    regime_grid, temper_grid: tuple[float, ...] = REGIME_TEMPER_GRID,
+    gamma_grid: tuple[float, ...] = GAMMA_GRID, n_samples: int = 32,
+    n_samples_select: int = 16, k_folds: int = 5, fold_kind: str = "random",
+    age_stride: int = 6, seed: int = 0, highpass_window: float | None = None,
+    progress_every: int | None = None,
+) -> pd.DataFrame:
+    """Site withholding for the regime prior, tuned over (J, rho, temper, b_scale).
+
+    The nested-CV protocol of :func:`run_withholding_generative`, with the operating point
+    of :func:`run_ppe_generative_regime`: all combos share one fold partition and
+    observation split, run sequentially through ``make_sampler(n_regimes, rho, temper)``,
+    and the argmin of the debiased selection RRMSE runs the test rotation.
+
+    The caller's factory decides which states the regimes are fitted on. This lane's prior
+    is the whole record rather than a chronological half.
+    """
+    W = _withholding_setup(cube, ages, lats, lons, valid, long, k_folds=k_folds,
+                           fold_kind=fold_kind, age_stride=age_stride, seed=seed,
+                           highpass_window=highpass_window)
+    lane = W["lane"]
+    base = {**_REG, "lane": lane, "fold": -1, "b_scale": np.nan,
+            "background": "climatological"}
+
+    rows: list[dict] = []
+    for (n_regimes, rho), temper in itertools.product(regime_grid, temper_grid):
+        cbase = {**base, "regime_j": float(n_regimes), "regime_rho": float(rho),
+                 "regime_temper": float(temper), "split": "selection"}
+        with make_sampler(n_regimes, rho, temper) as smp:
+            rows += _withholding_selection_rows(
+                smp, W, gamma_grid, n_samples_select, cbase, progress_every,
+                f"regime selection draws ({lane}, J={n_regimes}, rho={rho:g}, "
+                f"t={temper:g})")
+
+    sel = _sel_rrmse(rows, lane)
+    win = sel.loc[sel["value"].idxmin()]
+    j_s, rho_s = int(win["regime_j"]), float(win["regime_rho"])
+    temper_s, gamma_s = float(win["regime_temper"]), float(win["b_scale"])
+
+    with make_sampler(j_s, rho_s, temper_s) as smp:
+        test_rows, predictions = _withholding_test_pass(
+            smp, W, gamma_s, n_samples,
+            {**base, "regime_j": float(j_s), "regime_rho": rho_s,
+             "regime_temper": temper_s, "split": "test"},
+            progress_every, f"regime test draws ({lane})")
+        sampler_meta = _sampler_meta(smp)
+    rows += test_rows
+
+    config = {"lane": lane, "space": "generative", "method": "generative_regime",
+              "selected": {"b_scale": gamma_s, "regime_j": j_s, "regime_rho": rho_s,
+                           "regime_temper": temper_s},
+              "regime_grid": [[int(j), float(r)] for j, r in regime_grid],
+              "temper_grid": [float(t) for t in temper_grid],
+              "gamma_grid": [float(g) for g in gamma_grid],
+              "n_samples": n_samples, "n_samples_select": n_samples_select,
+              "k_folds": k_folds, "fold_kind": fold_kind, "age_stride": age_stride,
+              "n_obs_ages": int(len(W["obs_ages"])), "seed": seed,
+              "highpass_window": highpass_window,
+              "sampler": sampler_meta, "prior_meta": W["prior"].meta,
+              "rep_var_full": {VARS[i]: float(v)
+                               for i, v in enumerate(predictions["rep_var_full"])}}
     _write(out_dir, lane, "predictions", rows, predictions, config)
     return pd.DataFrame(rows)
 
