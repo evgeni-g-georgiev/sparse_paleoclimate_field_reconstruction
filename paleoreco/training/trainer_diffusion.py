@@ -63,18 +63,24 @@ class _EMA:
                 for k, v in self.shadow.items()}
 
 
-def _sample_sigma(n: int, device) -> torch.Tensor:
-    """Per-sample noise level ``ln(sigma) ~ N(P_mean, P_std^2)`` (EDM)."""
-    return torch.exp(P_MEAN + P_STD * torch.randn(n, device=device))
+def _sample_sigma(n: int, device, p_mean: float = P_MEAN,
+                  p_std: float = P_STD) -> torch.Tensor:
+    """Per-sample noise level ``ln(sigma) ~ N(p_mean, p_std^2)`` (EDM)."""
+    return torch.exp(p_mean + p_std * torch.randn(n, device=device))
 
 
-def edm_loss(model: torch.nn.Module, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def edm_loss(model: torch.nn.Module, x: torch.Tensor, mask: torch.Tensor, *,
+             p_mean: float = P_MEAN, p_std: float = P_STD) -> torch.Tensor:
     """EDM denoising loss over valid cells, weighted so every noise level counts equally.
 
     ``mask`` is the ``(H, W)`` valid mask; the noised input is zeroed on masked cells
     so the network always sees zero there, matching the anomaly frame.
+
+    ``p_mean`` / ``p_std`` set the noise levels training visits. The EDM defaults suit
+    unit-variance images; a field concentrating its variance in a few large-scale modes
+    needs them widened to reach the noise levels those modes are resolved at.
     """
-    sigma = _sample_sigma(x.shape[0], x.device)
+    sigma = _sample_sigma(x.shape[0], x.device, p_mean, p_std)
     noised = (x + sigma[:, None, None, None] * torch.randn_like(x)) * mask
     pred = model(noised, sigma)
     weight = (sigma ** 2 + model.sigma_data ** 2) / (sigma * model.sigma_data) ** 2
@@ -135,6 +141,8 @@ def train(
     scales: np.ndarray | None = None,
     checkpoint_extra: dict | None = None,
     ema_decay: float | None = 0.999,
+    p_mean: float = P_MEAN,
+    p_std: float = P_STD,
     seed: int = 0,
     verbose: bool = True,
     log_every: int = 50,
@@ -222,7 +230,7 @@ def train(
         running, n_batches = 0.0, 0
         for (batch,) in loader:
             batch = batch.to(device, non_blocking=True)
-            loss = edm_loss(model, batch, mask)
+            loss = edm_loss(model, batch, mask, p_mean=p_mean, p_std=p_std)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
