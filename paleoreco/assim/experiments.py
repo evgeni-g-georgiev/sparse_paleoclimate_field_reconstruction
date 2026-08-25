@@ -1,6 +1,6 @@
 """Experiment runners for data-assimilation reconstruction.
 
-Two evaluation lanes, both method-agnostic through the :class:`Method` contract:
+Three evaluation lanes, all method-agnostic through the :class:`Method` contract:
 
 * :func:`run_ppe` - same-model pseudo-proxy experiments: the prior cube is split
   chronologically, B and the climatology come from one half, and truths are drawn from
@@ -8,6 +8,11 @@ Two evaluation lanes, both method-agnostic through the :class:`Method` contract:
   selected on held-out shapes and scored on a disjoint one.
 * :func:`run_withholding` - nested cross-validation over proxy sites: select
   ``b_scale`` on a held-out fold, report on a fresh fold.
+* :func:`run_trajectory` - a consecutive run of states reconstructed with the real
+  network at each age, each observation carrying the state at its own sample's block
+  centre rather than at the analysis age. Scores skill by timescale, which the other
+  two lanes cannot: they grade one snapshot at a time, and the PPE lane deliberately
+  borrows network geometry without its climate time.
 
 :func:`run_ppe_pixel_grid` and :func:`run_withholding_pixel_grid` wrap these over a
 coarse localization/shrinkage/coupling grid, jointly selecting the operating point with
@@ -28,9 +33,11 @@ counterparts.
 Every lane emits skill metrics (``ce``, ``corr``, ``rmse``, ``rrmse``, ``amplitude``,
 plus field-only ``ssim``) and calibration metrics (``crps``, ``crpss``, ``rcrv_bias``,
 ``rcrv_dispersion``, ``coverage90``), scored against the prior ``N(0, b_scale diag B)``
-as the CRPSS reference so it matches CE's climatology baseline. Both lanes also carry
+as the CRPSS reference so it matches CE's climatology baseline. Every lane also carries
 prior-free ``nearest``/``idw`` reference rows, tagged ``background="none"``, which is the
-context a bare CE cannot supply.
+context a bare CE cannot supply. The trajectory lane adds timescale-resolved metrics,
+named ``{corr,ce,amp}_lp{window}`` for the low-pass series and ``..._bp{a}_{b}`` for a
+band, keeping the timescale in the metric name so the row schema is unchanged.
 """
 
 from __future__ import annotations
@@ -48,8 +55,12 @@ import pandas as pd
 from paleoreco.data import VARS
 from paleoreco.data.splits import chronological_half_split
 from paleoreco.assim.method import Method
-from paleoreco.assim.observations import observations_at_age, representativeness_variance
-from paleoreco.assim.innovation import obs_cell_index
+from paleoreco.assim.observations import (
+    observations_at_age,
+    representativeness_variance,
+    sample_block_centres,
+)
+from paleoreco.assim.innovation import nearest_age_index, obs_cell_index
 from paleoreco.assim.priors import Prior, build_prior, great_circle_km_between
 from paleoreco.assim.threedvar import ThreeDVar
 from paleoreco.eval import calibration, da
@@ -68,6 +79,16 @@ SHRINKAGE_GRID = (0.0, 0.25, 0.5)
 ALPHA_GRID = (0.0, 0.5, 1.0)
 SEL_TOL = 0.0   # 0 = pure argmin of selection RRMSE; >0 prefers the simpler config within this relative band
 LANE_PPE = "ppe"
+LANE_TRAJECTORY = "trajectory"
+
+# Timescales the trajectory lane resolves. Low-pass keeps everything slower than the
+# window, so it is cumulative and reads high wherever the slow components carry the
+# variance; a band subtracts one low-pass from another and is the honest per-timescale
+# view. Both are reported.
+# The widest band is bounded by the split: edge trimming costs a full window at each end,
+# so a band wider than the reported block leaves nothing to score.
+LOWPASS_WINDOWS = (25, 100, 250, 500, 1000, 2000)
+BANDS = ((25, 100), (100, 250), (250, 500), (500, 1000), (1000, 2000))
 # Metrics the RRMSE selection never reads, so a grid scan computes them for the winner only.
 _FULL_METRICS = frozenset({"ssim", "crps", "crpss", "rcrv_bias", "rcrv_dispersion",
                            "coverage90"})
@@ -80,7 +101,11 @@ _NAN_REG = {"localization_km": np.nan, "shrinkage_lambda": np.nan, "alpha": np.n
 # Observation geometry.
 # ---------------------------------------------------------------------------
 def _obs_geometry(o: dict, lats: np.ndarray, lons: np.ndarray, safe_flat: np.ndarray) -> dict:
-    """Gather indices, error variance, and site coords for usable observations."""
+    """Gather indices, error variance, and site coords for usable observations.
+
+    ``keep`` is the mask the other fields were filtered by, so a caller can carry an
+    extra column of ``o`` through the same filter without restating the rule.
+    """
     gather = obs_cell_index(o["lat"], o["lon"], o["channel"], lats, lons)
     keep = safe_flat[gather] & (o["sse"] > 0)
     return {
@@ -88,6 +113,7 @@ def _obs_geometry(o: dict, lats: np.ndarray, lons: np.ndarray, safe_flat: np.nda
         "sse": o["sse"][keep].astype(np.float64),
         "lat": o["lat"][keep],
         "lon": o["lon"][keep],
+        "keep": keep,
     }
 
 
@@ -338,6 +364,54 @@ def _ssim_rows(truth_anom: np.ndarray, recon_anom: np.ndarray, safe_valid: np.nd
     return rows
 
 
+def _timescale_metric_rows(truth_f: np.ndarray, recon_f: np.ndarray, safe_valid: np.ndarray,
+                           trim: int, suffix: str, base: dict) -> list[dict]:
+    """Median per-cell corr / CE / amplitude of one filtered truth-recon pair.
+
+    The median over cells rather than a pooled or regional statistic: after a wide
+    filter a regional index retains few independent points and its correlation swings
+    on the handful that remain.
+    """
+    n = len(truth_f)
+    if n - 2 * trim < 3:
+        return []
+    t = truth_f[trim:n - trim]
+    r = recon_f[trim:n - trim]
+    maps = {"corr": da.corr_map(t, r),
+            "ce": da.ce_map(t, r, np.zeros_like(t[0])),
+            "amp": da.amplitude_map(t, r)}
+    rows = []
+    for chan_name, c in [("pooled", None)] + [(name, i) for i, name in enumerate(VARS)]:
+        for metric, m in maps.items():
+            cells = m[:, safe_valid] if c is None else m[c, safe_valid]
+            rows.append({**base, "do_event": "all", "channel": chan_name,
+                         "metric": f"{metric}_{suffix}",
+                         "value": float(np.nanmedian(cells))})
+    return rows
+
+
+def _timescale_rows(truth_anom: np.ndarray, recon_anom: np.ndarray, safe_valid: np.ndarray,
+                    base: dict, *, step_yr: float, windows, bands) -> list[dict]:
+    """Skill by timescale for a consecutive run of states.
+
+    Emits ``{corr,ce,amp}_lp{window}`` from the low-pass series and ``..._bp{a}_{b}``
+    from the difference of two, which is the only view that separates skill at one
+    timescale from skill inherited off a slower component carrying most of the variance.
+    """
+    lp_t = {w: da.lowpass_time(truth_anom, w, step_yr) for w in set(windows) | {b for ab in bands for b in ab}}
+    lp_r = {w: da.lowpass_time(recon_anom, w, step_yr) for w in lp_t}
+
+    rows = []
+    for w in windows:
+        rows += _timescale_metric_rows(lp_t[w], lp_r[w], safe_valid,
+                                       da.timescale_trim(w, step_yr), f"lp{int(w)}", base)
+    for lo, hi in bands:
+        rows += _timescale_metric_rows(lp_t[lo] - lp_t[hi], lp_r[lo] - lp_r[hi], safe_valid,
+                                       da.timescale_trim(hi, step_yr),
+                                       f"bp{int(lo)}_{int(hi)}", base)
+    return rows
+
+
 def _append_csv(path: str, rows: list[dict]) -> None:
     """Append metric rows to the tidy CSV, writing the header once."""
     df = pd.DataFrame(rows)
@@ -568,6 +642,209 @@ def _ppe_config(lane, space, prior, n_truths, n_shapes, n_select, n_noise,
     if extra:
         cfg.update(extra)
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# Trajectory lane: a consecutive run of states, scored by timescale.
+# ---------------------------------------------------------------------------
+def _age_step(ages: np.ndarray) -> float:
+    """The single spacing of the age axis; the timescale filters assume it is uniform."""
+    steps = np.unique(np.diff(np.asarray(ages, dtype=np.int64)))
+    if len(steps) != 1:
+        raise ValueError(f"trajectory scoring needs a uniform age step; found {steps}")
+    return float(steps[0])
+
+
+def _trajectory_observations(long: pd.DataFrame, age: int, lats: np.ndarray, lons: np.ndarray,
+                             safe_flat: np.ndarray, min_obs: int) -> dict | None:
+    """Usable observations at one age, with each sample's own position on the age axis.
+
+    ``None`` when the network is too thin to assimilate, which the caller records so
+    the count of scored ages is auditable.
+    """
+    o = observations_at_age(long, int(age))
+    if not len(o.get("age", [])):
+        return None
+    geom = _obs_geometry(o, lats, lons, safe_flat)
+    if len(geom["gather"]) < min_obs:
+        return None
+    geom["centre"] = o["centre"][geom["keep"]]
+    return geom
+
+
+def run_trajectory(
+    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+    valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
+    localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
+    make_method: MethodFactory | None = None, space: str = "pixel",
+    b_scales: tuple[float, ...] = B_SCALES,
+    lowpass_windows: tuple[int, ...] = LOWPASS_WINDOWS,
+    bands: tuple[tuple[int, int], ...] = BANDS,
+    min_obs: int = 10, sel_tol: float = SEL_TOL, seed: int = 0,
+    progress_every: int | None = None,
+) -> pd.DataFrame:
+    """Reconstruct a consecutive run of states and score skill by timescale.
+
+    The older half of the age axis builds B and the climatology; every state of the
+    younger half is a truth, so the analyses form a time series rather than a set of
+    independent snapshots. At each age the observation network is the real one at that
+    age, and each pseudo-observation carries the truth at its own sample's block centre:
+    a sample describes its own moment, not the moment being assimilated. The
+    ``3dvar_ceiling`` rows repeat the run with observations taken at the analysis age,
+    which bounds what the staleness costs.
+
+    One noise draw per age, shared by both variants. Averaging draws as the PPE lane
+    does would smooth the reconstructed series and flatter exactly the high-frequency
+    skill the band metrics exist to measure, and sharing the draw leaves observation
+    timing as the only difference between the two variants.
+
+    The tapers are inputs, not a grid: they answer a spatial question the PPE lane
+    already settles, and re-gridding them over a 400-state run is not affordable. Only
+    ``b_scale`` is swept, selected on the earlier half of the run by pooled RRMSE, the
+    same criterion the other lanes use, and reported on the later half. Timescale
+    metrics are therefore never optimised against.
+    """
+    ages_i = np.asarray(ages, dtype=np.int64)
+    step_yr = _age_step(ages_i)
+    prior_idx, truth_idx = chronological_half_split(ages_i, stride=1)
+    prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
+                        localization_km=localization_km, shrinkage_lambda=shrinkage_lambda,
+                        alpha=alpha)
+    reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
+                "alpha": alpha}
+
+    shape = (len(VARS), len(lats), len(lons))
+    safe_valid = prior.safe_valid
+    safe_flat = np.broadcast_to(safe_valid, shape).ravel()
+    tv = ThreeDVar(prior.B, shape) if make_method is None else make_method(prior, shape)
+    b_scales = tuple(float(b) for b in b_scales)
+    n_b = len(b_scales)
+    zero_bg = np.zeros(int(np.prod(shape)))
+
+    truth_cube = cube[truth_idx].astype(np.float64)
+    truth_clim = truth_cube.mean(axis=0)
+    truth_anoms = truth_cube - truth_clim
+    # A block centre near the chunk boundary can land in the older half, so observations
+    # are read from the whole run. Centring on the truth climatology keeps one anomaly
+    # frame; B still sees prior ages only, so nothing about the truth half leaks into it.
+    all_anoms = cube.reshape(len(ages_i), -1).astype(np.float64) - truth_clim.ravel()
+    long = sample_block_centres(long)
+
+    rng = np.random.default_rng(seed)
+    covered, skipped = [], []
+    recon = {"3dvar": [], "3dvar_ceiling": []}
+    naive = {"nearest": [], "idw": []}
+    post, obs_n = [], []
+    t0 = time.time()
+    for ti, age in enumerate(ages_i[truth_idx]):
+        geom = _trajectory_observations(long, int(age), lats, lons, safe_flat, min_obs)
+        if geom is None:
+            skipped.append(int(age))
+            continue
+        g, sse = geom["gather"], geom["sse"]
+        noise = rng.normal(0.0, np.sqrt(sse))
+        src = nearest_age_index(geom["centre"], ages_i)
+        y = {"3dvar": all_anoms[src, g] + noise,
+             "3dvar_ceiling": truth_anoms[ti].ravel()[g] + noise}
+
+        gain = tv.prepare_sweep(g, sse, b_scales)
+        for method, yv in y.items():
+            res = tv.apply_sweep(gain, yv, zero_bg)
+            recon[method].append(np.stack([r.mean_anom for r in res]))
+        post.append(tv.post_var_sweep(gain).reshape(n_b, *shape))
+        naive_geom = _naive_geometry(lats, lons, geom, len(VARS))
+        for kind in naive:
+            naive[kind].append(_naive_apply(kind, naive_geom, y["3dvar"], shape))
+        covered.append(ti)
+        obs_n.append(len(g))
+        if progress_every and (len(covered) % progress_every == 0):
+            _report_progress("trajectory age", ti + 1, len(truth_idx), t0)
+
+    if len(covered) < 4:
+        raise ValueError(f"only {len(covered)} ages had a usable network; nothing to score")
+
+    covered = np.asarray(covered)
+    truth_run = truth_anoms[covered]
+    recon = {k: np.stack(v, axis=1) for k, v in recon.items()}   # (n_b, n_covered, C, H, W)
+    naive = {k: np.stack(v) for k, v in naive.items()}
+    post = np.stack(post, axis=1)
+    mid = len(covered) // 2
+    blocks = [("selection", slice(0, mid)), ("test", slice(mid, len(covered)))]
+
+    rows: list[dict] = []
+    for bj, kb in enumerate(b_scales):
+        for method in recon:
+            for split, sl in blocks:
+                base = {"method": method, "space": space, **reg_cols,
+                        "lane": LANE_TRAJECTORY, "fold": -1, "b_scale": kb,
+                        "background": "climatological", "split": split}
+                events = np.zeros(len(truth_run[sl]), dtype=np.int64)
+                rows += _skill_rows(truth_run[sl], recon[method][bj, sl], safe_valid, events, base)
+                rows += _ssim_rows(truth_run[sl], recon[method][bj, sl], safe_valid, events, base)
+                rows += _timescale_rows(truth_run[sl], recon[method][bj, sl], safe_valid, base,
+                                        step_yr=step_yr, windows=lowpass_windows, bands=bands)
+                if method == "3dvar":
+                    rows += _field_calibration_rows(
+                        truth_run[sl], recon[method][bj, sl], post[bj, sl],
+                        kb * tv.diagB.reshape(shape), safe_valid, events, base)
+    for kind, field in naive.items():
+        for split, sl in blocks:
+            base = {"method": kind, "space": space, **_NAN_REG,
+                    "lane": LANE_TRAJECTORY, "fold": -1, "b_scale": 1.0,
+                    "background": "none", "split": split}
+            events = np.zeros(len(truth_run[sl]), dtype=np.int64)
+            rows += _skill_rows(truth_run[sl], field[sl], safe_valid, events, base)
+            rows += _ssim_rows(truth_run[sl], field[sl], safe_valid, events, base)
+            rows += _timescale_rows(truth_run[sl], field[sl], safe_valid, base,
+                                    step_yr=step_yr, windows=lowpass_windows, bands=bands)
+
+    win = select_best_config(_selection_rrmse(rows, LANE_TRAJECTORY), sel_tol=sel_tol)
+    bw = int(np.argmin(np.abs(np.asarray(b_scales) - win["b_scale"])))
+    covered_ages = ages_i[truth_idx][covered]
+    # Fields for the winner only, float32: the whole sweep over a 400-state run is two
+    # orders of magnitude larger than the PPE lane's and nothing reads the losing scales.
+    npz_arrays = {
+        "truth_anom": truth_run.astype(np.float32), "truth_clim": truth_clim,
+        "clim_mean": prior.clim_mean.astype(np.float64), "safe_valid": safe_valid,
+        "lats": lats, "lons": lons, "ages": covered_ages,
+        "b_scales": np.asarray(b_scales), "selected_b_scale": np.asarray(b_scales[bw]),
+        "split_index": np.asarray(mid), "step_yr": np.asarray(step_yr),
+        "recon_realistic": recon["3dvar"][bw].astype(np.float32),
+        "recon_ceiling": recon["3dvar_ceiling"][bw].astype(np.float32),
+        "naive_nearest": naive["nearest"].astype(np.float32),
+        "naive_idw": naive["idw"].astype(np.float32),
+        "post_var": post[bw].astype(np.float32),
+        "prior_var": tv.diagB.reshape(shape),
+        "obs_n": np.asarray(obs_n), "skipped_ages": np.asarray(skipped, dtype=np.int64),
+    }
+    config = _ppe_config(
+        LANE_TRAJECTORY, space, prior, len(covered), n_shapes=None, n_select=None,
+        n_noise=1, b_scales=b_scales, seed=seed, reg_cols=reg_cols,
+        split_meta=_chronological_split_meta(ages_i, prior_idx, truth_idx, 1),
+        extra={"selected": win, "sel_tol": sel_tol,
+               "lowpass_windows": [int(w) for w in lowpass_windows],
+               "bands": [[int(a), int(b)] for a, b in bands],
+               "step_yr": step_yr, "min_obs": min_obs,
+               "n_covered_ages": len(covered), "n_skipped_ages": len(skipped),
+               "skipped_ages": skipped,
+               "selection_ages": [int(covered_ages[0]), int(covered_ages[mid - 1])],
+               "test_ages": [int(covered_ages[mid]), int(covered_ages[-1])]})
+    _write_trajectory_artifacts(out_dir, LANE_TRAJECTORY, rows, npz_arrays, config)
+    return pd.DataFrame(rows)
+
+
+def _write_trajectory_artifacts(out_dir: str, lane: str, rows: list[dict],
+                                npz_arrays: dict, config: dict) -> None:
+    """Persist a scored trajectory lane: metrics CSV (appended), analysis npz, config.
+
+    No skill-vs-distance npz: the lane keeps one network per age rather than a repeated
+    geometry, so the distance curve the PPE lane builds has no counterpart here.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    _append_csv(os.path.join(out_dir, "metrics.csv"), rows)
+    np.savez_compressed(os.path.join(out_dir, f"{lane}_analysis.npz"), **npz_arrays)
+    with open(os.path.join(out_dir, f"{lane}_config.json"), "w") as f:
+        json.dump(config, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
