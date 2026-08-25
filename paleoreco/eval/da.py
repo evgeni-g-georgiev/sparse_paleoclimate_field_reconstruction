@@ -13,6 +13,9 @@ as a function of distance to the nearest observation. Field reconstructions also
 a masked structural similarity (SSIM) over the valid grid, and a prior-to-posterior
 uncertainty reduction from the variance diagonals.
 
+Where the stack of truths is a consecutive time series, the same per-cell maps applied
+to low-pass filtered inputs resolve skill by timescale.
+
 Whether the stated uncertainty matches these errors is :mod:`paleoreco.eval.calibration`.
 """
 
@@ -86,6 +89,49 @@ def ce_map(truth_stack: np.ndarray, recon_stack: np.ndarray, ref: np.ndarray) ->
 def rmse_map(truth_stack: np.ndarray, recon_stack: np.ndarray) -> np.ndarray:
     """Per-cell RMSE across the leading (truth) axis."""
     return np.sqrt(np.mean((truth_stack - recon_stack) ** 2, axis=0))
+
+
+def corr_map(truth_stack: np.ndarray, recon_stack: np.ndarray) -> np.ndarray:
+    """Per-cell Pearson correlation across the leading (truth) axis."""
+    t = truth_stack - truth_stack.mean(axis=0)
+    r = recon_stack - recon_stack.mean(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.sum(t * r, axis=0) / np.sqrt(np.sum(t ** 2, axis=0) * np.sum(r ** 2, axis=0))
+
+
+def amplitude_map(truth_stack: np.ndarray, recon_stack: np.ndarray) -> np.ndarray:
+    """Per-cell ``std(recon) / std(truth)`` across the leading (truth) axis."""
+    sd = truth_stack.std(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(sd == 0.0, np.nan, recon_stack.std(axis=0) / sd)
+
+
+# ---------------------------------------------------------------------------
+# Temporal filtering, for skill resolved by timescale.
+# ---------------------------------------------------------------------------
+def lowpass_time(stack: np.ndarray, window_yr: float, step_yr: float) -> np.ndarray:
+    """Centred moving average of ``window_yr`` along the leading (time) axis.
+
+    Keeps variability slower than the window. A band is the difference of two of
+    these, which is what separates skill at one timescale from skill inherited
+    from a slower component that carries most of the variance.
+    """
+    k = max(1, int(round(window_yr / step_yr)))
+    x = np.asarray(stack, dtype=float)
+    if k <= 1:
+        return x
+    kernel = np.ones(k) / k
+    return np.apply_along_axis(lambda v: np.convolve(v, kernel, "same"), 0, x)
+
+
+def timescale_trim(window_yr: float, step_yr: float) -> int:
+    """Samples to drop from each end after :func:`lowpass_time`.
+
+    The convolution zero-pads, so the first and last window of the filtered series
+    is pulled towards zero and would score as spurious error.
+    """
+    k = max(1, int(round(window_yr / step_yr)))
+    return 0 if k <= 1 else k
 
 
 # ---------------------------------------------------------------------------
