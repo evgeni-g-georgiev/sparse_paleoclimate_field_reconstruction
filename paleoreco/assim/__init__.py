@@ -26,6 +26,7 @@ from paleoreco.assim.observations import (
     observation_site_stats,
     observations_at_age,
     representativeness_variance,
+    sample_block_centres,
 )
 from paleoreco.assim.scoring import (
     ANOMALY,
@@ -73,6 +74,7 @@ __all__ = [
     "observation_site_stats",
     "observations_at_age",
     "representativeness_variance",
+    "sample_block_centres",
     "ANOMALY",
     "NORMALISED",
     "RAW",

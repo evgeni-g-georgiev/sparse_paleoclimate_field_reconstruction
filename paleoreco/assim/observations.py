@@ -5,7 +5,8 @@ row per ``(site, age)`` with both temperature channels. This module melts it
 to long format (one row per ``(site, channel, age)``) and exposes the pieces
 data assimilation needs: the per-site climatology used for anomaly/normalised
 scoring, the representativeness variance of the network from co-cell proxy
-pairs, and the set of observations active at a single age.
+pairs, each sample's own position on the age axis, and the set of observations
+active at a single age.
 """
 
 from __future__ import annotations
@@ -25,9 +26,15 @@ def load_observations(obs_csv: str) -> pd.DataFrame:
     """Long-format proxy table, one row per ``(site, channel, age)``.
 
     Columns: ``site``, ``sample``, ``channel``, ``age``, ``age_mean``, ``y``,
-    ``sse``, ``lat``, ``lon``. A physical sample appears at every age in its
-    dating window with identical ``y``/``sse``; ``sample`` and ``age_mean`` are
-    carried so :func:`collapse_to_samples` can undo that replication.
+    ``sse``, ``lat``, ``lon``. A physical sample appears at every age in the
+    contiguous block the ``age`` chronology assigns it, with identical
+    ``y``/``sse``; ``sample`` and ``age_mean`` are carried so
+    :func:`collapse_to_samples` can undo that replication.
+
+    ``age`` and ``age_mean`` are different chronologies for the same samples:
+    ``age`` is the scale Liu et al. adjusted by dynamic time warping and is what
+    the assimilation runs on, ``age_mean`` the original age-model estimate it
+    superseded.
     """
     df = pd.read_csv(obs_csv)
     parts = []
@@ -61,6 +68,20 @@ def collapse_to_samples(long: pd.DataFrame) -> pd.DataFrame:
         .drop(columns="_d")
         .reset_index(drop=True)
     )
+
+
+def sample_block_centres(long: pd.DataFrame) -> pd.DataFrame:
+    """``long`` with a ``centre`` column: the midpoint of each sample's age block.
+
+    A sample carries one measurement but is replicated across every age in its
+    block, so at most of those ages it describes a climate state some way off in
+    time. The midpoint is the sample's own position on the age axis, which is what
+    an observation operator needs in order to fetch the state the sample actually
+    reports on.
+    """
+    block = long.groupby(["site", "sample"])["age"].agg(["min", "max"])
+    centre = ((block["min"] + block["max"]) / 2.0).rename("centre").reset_index()
+    return long.merge(centre, on=["site", "sample"], how="left")
 
 
 def observation_site_stats(long: pd.DataFrame) -> pd.DataFrame:
