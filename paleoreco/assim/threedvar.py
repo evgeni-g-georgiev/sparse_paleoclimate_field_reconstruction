@@ -111,12 +111,15 @@ class ThreeDVar(Method):
     # B-amplitude sweep: one eigendecomposition reused across every b_scale.
     # ------------------------------------------------------------------
     def prepare_sweep(
-        self, gather: np.ndarray, r_diag: np.ndarray, b_scales: np.ndarray
+        self, gather: np.ndarray, r_diag: np.ndarray, b_scales: np.ndarray,
+        *, age: float | None = None
     ) -> _SweepGain:
         """Factorize the gain once for a network, reusable across all ``b_scales``.
 
         ``r_diag`` is the fixed observation-error variance per observation (R's
-        diagonal); scaling B by ``b_scale`` does not touch it.
+        diagonal); scaling B by ``b_scale`` does not touch it. ``age`` is accepted and
+        ignored: a fixed background covariance is the same at every age, so the drivers
+        can pass it without knowing which estimator they hold.
         """
         g = np.asarray(gather)
         r = np.asarray(r_diag, dtype=np.float64)

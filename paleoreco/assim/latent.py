@@ -96,7 +96,8 @@ class _LatentVar(Method):
         return field * self.safe_valid
 
     def prepare_sweep(self, gather: np.ndarray, r_diag: np.ndarray,
-                      b_scales: np.ndarray) -> _LatentSweepGain:
+                      b_scales: np.ndarray, *, age: float | None = None) -> _LatentSweepGain:
+        """``age`` is accepted and ignored: a fixed latent covariance is age-independent."""
         g = np.asarray(gather)
         r = np.asarray(r_diag, dtype=np.float64)
         b_scales = np.asarray(b_scales, dtype=np.float64)
