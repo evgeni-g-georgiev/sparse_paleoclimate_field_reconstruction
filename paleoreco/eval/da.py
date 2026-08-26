@@ -16,10 +16,15 @@ uncertainty reduction from the variance diagonals.
 Where the stack of truths is a consecutive time series, the same per-cell maps applied
 to low-pass filtered inputs resolve skill by timescale.
 
+Differences between two methods come with a paired block bootstrap, since the gaps at
+stake are small next to how much the score moves from one age to the next.
+
 Whether the stated uncertainty matches these errors is :mod:`paleoreco.eval.calibration`.
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -132,6 +137,37 @@ def timescale_trim(window_yr: float, step_yr: float) -> int:
     """
     k = max(1, int(round(window_yr / step_yr)))
     return 0 if k <= 1 else k
+
+
+# ---------------------------------------------------------------------------
+# Uncertainty on a difference between two methods.
+# ---------------------------------------------------------------------------
+def paired_block_bootstrap(
+    difference: Callable[[np.ndarray], float], n_units: int, *,
+    block: int = 1, n_boot: int = 1000, seed: int = 0, ci: float = 0.95,
+) -> tuple[float, float, float]:
+    """Point estimate and percentile interval on a paired difference.
+
+    ``difference`` maps a resampled set of unit indices to the quantity being compared,
+    so both methods are always read off the same units and the variation they share
+    cancels instead of swamping a small gap.
+
+    Units are drawn in contiguous blocks. Adjacent states of a run are strongly
+    correlated, and low-pass filtering makes them more so, so drawing them one at a time
+    would treat the run as far more independent than it is and return an interval too
+    narrow to believe. ``block=1`` is the plain resample, which is what already-clustered
+    units such as sites want.
+    """
+    rng = np.random.default_rng(seed)
+    block = max(1, min(int(block), n_units))
+    n_blocks = int(np.ceil(n_units / block))
+    offsets = np.arange(block)
+    draws = np.empty(n_boot)
+    for i in range(n_boot):
+        starts = rng.integers(0, n_units - block + 1, size=n_blocks)
+        draws[i] = difference((starts[:, None] + offsets[None, :]).ravel()[:n_units])
+    lo, hi = np.nanpercentile(draws, [50.0 * (1.0 - ci), 50.0 * (1.0 + ci)])
+    return float(difference(np.arange(n_units))), float(lo), float(hi)
 
 
 # ---------------------------------------------------------------------------
