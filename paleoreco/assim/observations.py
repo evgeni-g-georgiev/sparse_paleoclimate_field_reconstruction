@@ -5,7 +5,8 @@ row per ``(site, age)`` with both temperature channels. This module melts it
 to long format (one row per ``(site, channel, age)``) and exposes the pieces
 data assimilation needs: the per-site climatology used for anomaly/normalised
 scoring, the representativeness variance of the network from co-cell proxy
-pairs, each sample's own position on the age axis, and the set of observations
+pairs, each sample's own position on the age axis, the error that position
+implies when the sample is used at some other age, and the set of observations
 active at a single age.
 """
 
@@ -20,6 +21,14 @@ _OBS_COLS: dict[str, tuple[str, str]] = {
     "mtco": ("mtco", "sse_mtco"),
     "mtwa": ("mtwa", "sse_mtwa"),
 }
+
+# How a sample's distance in time from the analysis age enters the update: ignored,
+# charged as extra observation error, or also corrected for the attenuation a lagged
+# state carries.
+TEMPORAL_OFF = "off"
+TEMPORAL_ADD = "add"
+TEMPORAL_DEFLATE = "deflate"
+TEMPORAL_MODES = (TEMPORAL_OFF, TEMPORAL_ADD, TEMPORAL_DEFLATE)
 
 
 def load_observations(obs_csv: str) -> pd.DataFrame:
@@ -148,6 +157,58 @@ def representativeness_variance(
         rep = (0.5 * sum_d2[keep].sum() - 0.5 * sum_sse_pair[keep].sum()) / denom
         out[channel] = max(float(rep), 0.0)
     return out
+
+
+def temporal_terms(
+    S: np.ndarray, var: np.ndarray, gather: np.ndarray, lag_yr: np.ndarray,
+    step_yr: float, *, floor: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Lag correlation and unexplained variance at each observation's cell and lag.
+
+    ``rho = 1 - S / (2 var)`` is how much of the analysis-age state a sample sitting
+    ``lag_yr`` away still carries. It is floored rather than allowed negative: past
+    the floor the two moments share no signal, and a negative correlation would read
+    the observation backwards instead of setting it aside. The residual variance uses
+    the floored value, so a fully decorrelated sample carries the whole climatological
+    variance as noise.
+
+    A block centre is a midpoint, so it lands on a half step for about half the
+    network. The lag index rounds half away from zero; ``np.rint`` rounds half to
+    even, which would send a half-step lag of 0.5 to zero and leave those samples
+    uncorrected.
+    """
+    lag = np.floor(np.abs(np.asarray(lag_yr, dtype=np.float64)) / step_yr + 0.5)
+    lag = np.clip(lag.astype(np.int64), 0, len(S) - 1)
+    g = np.asarray(gather)
+    v = var[g]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rho = np.clip(1.0 - S[lag, g] / (2.0 * v), floor, 1.0)
+    return rho, v * (1.0 - rho ** 2)
+
+
+def apply_temporal_error(
+    y_anom: np.ndarray, sse: np.ndarray, rho: np.ndarray, resid_var: np.ndarray,
+    mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Observation and error variance corrected for the sample's distance in time.
+
+    A sample used away from its own moment reports a state that is both noisier and,
+    since a lagged state regresses toward the mean, smaller in magnitude than the one
+    being solved for. ``TEMPORAL_ADD`` answers only the noise, the conventional
+    representativeness inflation. ``TEMPORAL_DEFLATE`` also undoes the attenuation so
+    the observation states its claim at full size, and R carries the cost: it grows as
+    ``1 / rho^2`` while the observation grows as ``1 / rho``, so the gain collapses and
+    a hopelessly stale sample switches itself off.
+    """
+    y = np.asarray(y_anom, dtype=np.float64)
+    r = np.asarray(sse, dtype=np.float64)
+    if mode == TEMPORAL_OFF:
+        return y, r
+    if mode == TEMPORAL_ADD:
+        return y, r + resid_var
+    if mode == TEMPORAL_DEFLATE:
+        return y / rho, (r + resid_var) / rho ** 2
+    raise ValueError(f"unknown temporal mode {mode!r}; expected one of {TEMPORAL_MODES}")
 
 
 def observations_at_age(long: pd.DataFrame, age: int) -> dict[str, np.ndarray]:
