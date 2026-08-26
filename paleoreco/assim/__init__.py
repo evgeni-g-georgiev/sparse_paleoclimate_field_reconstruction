@@ -9,6 +9,8 @@ Array-level building blocks:
 * :mod:`paleoreco.assim.innovation`   - H on the grid, innovations, standardisation.
 * :mod:`paleoreco.assim.joint`        - pairwise whitened innovations for the 2D test.
 * :mod:`paleoreco.assim.compressors`  - encode/decode contract for latent assimilation.
+* :mod:`paleoreco.assim.ensrf`        - ensemble square-root gains for one covariance.
+* :mod:`paleoreco.assim.analog`       - choosing which prior states form an ensemble.
 
 Methods and drivers, reached by submodule path rather than re-exported:
 
@@ -16,7 +18,8 @@ Methods and drivers, reached by submodule path rather than re-exported:
 * :mod:`paleoreco.assim.priors`       - the Prior container and its tapers.
 * :mod:`paleoreco.assim.threedvar`    - gain-form pixel 3DVar.
 * :mod:`paleoreco.assim.latent`       - latent-space 3DVar.
-* :mod:`paleoreco.assim.experiments`  - PPE and withholding lane runners.
+* :mod:`paleoreco.assim.hgaoenkf`     - hybrid gain analog offline EnKF.
+* :mod:`paleoreco.assim.experiments`  - PPE, trajectory and withholding lane runners.
 """
 
 from paleoreco.assim.observations import (
