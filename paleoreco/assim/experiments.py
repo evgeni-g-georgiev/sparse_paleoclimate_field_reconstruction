@@ -30,6 +30,15 @@ synthetic observations sample the exact grid cell. Scoring is in anomaly space; 
 RMSE, and correlation are shift-invariant so the anomaly-space values equal their degC
 counterparts.
 
+The withholding and trajectory lanes also carry the temporal twin of ``rep_var``: a
+sample is replicated across every age in its block, so at most of them it reports on a
+state some way off in time. ``TEMPORAL_METHODS`` names one method label per treatment of
+that, from leaving it alone through charging it as extra observation error to also
+correcting the attenuation a lagged state carries, so the treatments sit side by side in
+one schema and any two are paired over the same ages. The PPE lane stays out of it: it
+borrows network geometry without its climate time, so a sample's distance from the
+analysis age measures nothing there.
+
 Every lane emits skill metrics (``ce``, ``corr``, ``rmse``, ``rrmse``, ``amplitude``,
 plus field-only ``ssim``) and calibration metrics (``crps``, ``crpss``, ``rcrv_bias``,
 ``rcrv_dispersion``, ``coverage90``), scored against the prior ``N(0, b_scale diag B)``
@@ -54,11 +63,17 @@ import pandas as pd
 
 from paleoreco.data import VARS
 from paleoreco.data.splits import chronological_half_split
+from paleoreco.assim.background import temporal_structure_function
 from paleoreco.assim.method import Method
 from paleoreco.assim.observations import (
+    TEMPORAL_ADD,
+    TEMPORAL_DEFLATE,
+    TEMPORAL_OFF,
+    apply_temporal_error,
     observations_at_age,
     representativeness_variance,
     sample_block_centres,
+    temporal_terms,
 )
 from paleoreco.assim.innovation import nearest_age_index, obs_cell_index
 from paleoreco.assim.priors import Prior, build_prior, great_circle_km_between
@@ -80,6 +95,20 @@ ALPHA_GRID = (0.0, 0.5, 1.0)
 SEL_TOL = 0.0   # 0 = pure argmin of selection RRMSE; >0 prefers the simpler config within this relative band
 LANE_PPE = "ppe"
 LANE_TRAJECTORY = "trajectory"
+
+# How an observation's distance in time from the analysis age is treated, one method
+# label per treatment so the three sit side by side in the shared row schema and every
+# comparison between them is paired over the same ages. ``METHOD_CEILING`` is not a
+# treatment: it replaces the observations with ones taken at the analysis age, which
+# bounds what the staleness costs.
+METHOD_BASE = "3dvar"
+METHOD_CEILING = "3dvar_ceiling"
+TEMPORAL_METHODS = {
+    METHOD_BASE: TEMPORAL_OFF,
+    "3dvar_temporal_add": TEMPORAL_ADD,
+    "3dvar_temporal_deflate": TEMPORAL_DEFLATE,
+}
+TRAJECTORY_METHODS = tuple(TEMPORAL_METHODS) + (METHOD_CEILING,)
 
 # Timescales the trajectory lane resolves. Low-pass keeps everything slower than the
 # window, so it is cumulative and reads high wherever the slow components carry the
@@ -655,6 +684,16 @@ def _age_step(ages: np.ndarray) -> float:
     return float(steps[0])
 
 
+def _max_block_lag(long: pd.DataFrame, step_yr: float) -> int:
+    """Widest gap in age steps between an age and its own sample's block centre.
+
+    Sizes the structure function to the network that will use it, so no observation
+    has to fall back on a clipped lag.
+    """
+    lag = (long["age"] - long["centre"]).abs().to_numpy(dtype=np.float64)
+    return int(np.floor(lag.max() / step_yr + 0.5)) if len(lag) else 0
+
+
 def _trajectory_observations(long: pd.DataFrame, age: int, lats: np.ndarray, lons: np.ndarray,
                              safe_flat: np.ndarray, min_obs: int) -> dict | None:
     """Usable observations at one age, with each sample's own position on the age axis.
@@ -693,10 +732,15 @@ def run_trajectory(
     ``3dvar_ceiling`` rows repeat the run with observations taken at the analysis age,
     which bounds what the staleness costs.
 
-    One noise draw per age, shared by both variants. Averaging draws as the PPE lane
+    Between those two sit the temporal variants, which answer the staleness rather than
+    remove it: one charges it as extra observation error, the other also corrects the
+    attenuation a lagged state carries. Their structure function comes from the prior
+    ages alone, so the truth half never informs the operator that reconstructs it.
+
+    One noise draw per age, shared by every variant. Averaging draws as the PPE lane
     does would smooth the reconstructed series and flatter exactly the high-frequency
-    skill the band metrics exist to measure, and sharing the draw leaves observation
-    timing as the only difference between the two variants.
+    skill the band metrics exist to measure, and sharing the draw leaves the treatment
+    of observation timing as the only difference between the variants.
 
     The tapers are inputs, not a grid: they answer a spatial question the PPE lane
     already settles, and re-gridding them over a 400-state run is not affordable. Only
@@ -729,12 +773,15 @@ def run_trajectory(
     # frame; B still sees prior ages only, so nothing about the truth half leaks into it.
     all_anoms = cube.reshape(len(ages_i), -1).astype(np.float64) - truth_clim.ravel()
     long = sample_block_centres(long)
+    S, prior_var_cell = temporal_structure_function(
+        cube, prior_idx, max_lag=_max_block_lag(long, step_yr))
 
     rng = np.random.default_rng(seed)
     covered, skipped = [], []
-    recon = {"3dvar": [], "3dvar_ceiling": []}
+    recon = {m: [] for m in TRAJECTORY_METHODS}
     naive = {"nearest": [], "idw": []}
-    post, obs_n = [], []
+    post = {m: [] for m in TRAJECTORY_METHODS if m != METHOD_CEILING}
+    obs_n = []
     t0 = time.time()
     for ti, age in enumerate(ages_i[truth_idx]):
         geom = _trajectory_observations(long, int(age), lats, lons, safe_flat, min_obs)
@@ -744,17 +791,29 @@ def run_trajectory(
         g, sse = geom["gather"], geom["sse"]
         noise = rng.normal(0.0, np.sqrt(sse))
         src = nearest_age_index(geom["centre"], ages_i)
-        y = {"3dvar": all_anoms[src, g] + noise,
-             "3dvar_ceiling": truth_anoms[ti].ravel()[g] + noise}
+        stale = all_anoms[src, g] + noise
+        # The lag is read off the age the observation was actually drawn from, not off
+        # the raw block centre, so the correction answers the staleness this lane built
+        # rather than a rounding of it.
+        rho, resid = temporal_terms(S, prior_var_cell, g,
+                                    np.abs(ages_i[src] - age), step_yr)
 
-        gain = tv.prepare_sweep(g, sse, b_scales)
-        for method, yv in y.items():
+        obs = {}
+        for method, mode in TEMPORAL_METHODS.items():
+            yv, r = apply_temporal_error(stale, sse, rho, resid, mode)
+            obs[method] = (yv, tv.prepare_sweep(g, r, b_scales))
+        # Observations at the analysis age carry no staleness, so the ceiling reuses the
+        # uncorrected gain. Sharing the object is safe: a _SweepGain is never mutated.
+        obs[METHOD_CEILING] = (truth_anoms[ti].ravel()[g] + noise, obs[METHOD_BASE][1])
+
+        for method, (yv, gain) in obs.items():
             res = tv.apply_sweep(gain, yv, zero_bg)
             recon[method].append(np.stack([r.mean_anom for r in res]))
-        post.append(tv.post_var_sweep(gain).reshape(n_b, *shape))
+            if method in post:
+                post[method].append(tv.post_var_sweep(gain).reshape(n_b, *shape))
         naive_geom = _naive_geometry(lats, lons, geom, len(VARS))
         for kind in naive:
-            naive[kind].append(_naive_apply(kind, naive_geom, y["3dvar"], shape))
+            naive[kind].append(_naive_apply(kind, naive_geom, obs[METHOD_BASE][0], shape))
         covered.append(ti)
         obs_n.append(len(g))
         if progress_every and (len(covered) % progress_every == 0):
@@ -767,7 +826,7 @@ def run_trajectory(
     truth_run = truth_anoms[covered]
     recon = {k: np.stack(v, axis=1) for k, v in recon.items()}   # (n_b, n_covered, C, H, W)
     naive = {k: np.stack(v) for k, v in naive.items()}
-    post = np.stack(post, axis=1)
+    post = {k: np.stack(v, axis=1) for k, v in post.items()}
     mid = len(covered) // 2
     blocks = [("selection", slice(0, mid)), ("test", slice(mid, len(covered)))]
 
@@ -783,9 +842,9 @@ def run_trajectory(
                 rows += _ssim_rows(truth_run[sl], recon[method][bj, sl], safe_valid, events, base)
                 rows += _timescale_rows(truth_run[sl], recon[method][bj, sl], safe_valid, base,
                                         step_yr=step_yr, windows=lowpass_windows, bands=bands)
-                if method == "3dvar":
+                if method in post:
                     rows += _field_calibration_rows(
-                        truth_run[sl], recon[method][bj, sl], post[bj, sl],
+                        truth_run[sl], recon[method][bj, sl], post[method][bj, sl],
                         kb * tv.diagB.reshape(shape), safe_valid, events, base)
     for kind, field in naive.items():
         for split, sl in blocks:
@@ -809,19 +868,29 @@ def run_trajectory(
         "lats": lats, "lons": lons, "ages": covered_ages,
         "b_scales": np.asarray(b_scales), "selected_b_scale": np.asarray(b_scales[bw]),
         "split_index": np.asarray(mid), "step_yr": np.asarray(step_yr),
-        "recon_realistic": recon["3dvar"][bw].astype(np.float32),
-        "recon_ceiling": recon["3dvar_ceiling"][bw].astype(np.float32),
+        "recon_realistic": recon[METHOD_BASE][bw].astype(np.float32),
+        "recon_ceiling": recon[METHOD_CEILING][bw].astype(np.float32),
         "naive_nearest": naive["nearest"].astype(np.float32),
         "naive_idw": naive["idw"].astype(np.float32),
-        "post_var": post[bw].astype(np.float32),
+        "post_var": post[METHOD_BASE][bw].astype(np.float32),
         "prior_var": tv.diagB.reshape(shape),
         "obs_n": np.asarray(obs_n), "skipped_ages": np.asarray(skipped, dtype=np.int64),
     }
+    # The corrected variants ride alongside under their own keys, at the same b_scale as
+    # the baseline so a paired difference over ages is what a reader gets by subtracting.
+    for method in TEMPORAL_METHODS:
+        if method == METHOD_BASE:
+            continue
+        npz_arrays[f"recon_{method}"] = recon[method][bw].astype(np.float32)
+        npz_arrays[f"post_var_{method}"] = post[method][bw].astype(np.float32)
     config = _ppe_config(
         LANE_TRAJECTORY, space, prior, len(covered), n_shapes=None, n_select=None,
         n_noise=1, b_scales=b_scales, seed=seed, reg_cols=reg_cols,
         split_meta=_chronological_split_meta(ages_i, prior_idx, truth_idx, 1),
         extra={"selected": win, "sel_tol": sel_tol,
+               "selected_b_scale_by_method": _b_scale_by_method(rows, LANE_TRAJECTORY,
+                                                                sel_tol),
+               "max_block_lag_steps": _max_block_lag(long, step_yr),
                "lowpass_windows": [int(w) for w in lowpass_windows],
                "bands": [[int(a), int(b)] for a, b in bands],
                "step_yr": step_yr, "min_obs": min_obs,
@@ -896,23 +965,30 @@ def _obs_channel_groups(channel: np.ndarray) -> list:
 class _TargetPredictions:
     """Withheld-site predictions for one assim/target split, pooled over ages.
 
-    ``pred`` and ``post_var`` are ``(n_b, N)``, one row per ``b_scale``; the rest are
-    ``(N,)``. ``prior_var`` is the background variance at each target cell, which is the
-    CRPSS reference; ``distance_km`` is how far the site sits from the nearest
-    assimilated one, the axis that separates interpolation from extrapolation. ``rep_var``
-    is the per-channel representativeness variance carried to the target sites so the
-    predictive spread can include the proxy's deviation from its cell mean.
+    ``pred`` and ``post_var`` map a method label to an ``(n_b, N)`` array, one row per
+    ``b_scale``; the rest are ``(N,)`` and shared, because they describe the withheld
+    observation rather than the analysis that predicts it. ``prior_var`` is the
+    background variance at each target cell, which is the CRPSS reference;
+    ``distance_km`` is how far the site sits from the nearest assimilated one, the axis
+    that separates interpolation from extrapolation. ``rep_var`` is the per-channel
+    representativeness variance carried to the target sites so the predictive spread can
+    include the proxy's deviation from its cell mean, and ``resid_var`` is its temporal
+    twin: what the withheld sample's own distance in time leaves unexplained. ``site``
+    is the cluster a resampling scheme has to respect, since a sample repeats across
+    every age in its block.
     """
 
     actual: np.ndarray
     channel: np.ndarray
     sse: np.ndarray
-    pred: np.ndarray
-    post_var: np.ndarray
+    pred: dict
+    post_var: dict
     prior_var: np.ndarray
     naive: dict
     distance_km: np.ndarray
     rep_var: np.ndarray
+    resid_var: np.ndarray
+    site: np.ndarray
 
     def __len__(self) -> int:
         return len(self.actual)
@@ -923,17 +999,32 @@ def _predict_targets(
     lats: np.ndarray, lons: np.ndarray, safe_flat: np.ndarray, clim_flat: np.ndarray,
     assim_sites: set, target_sites: set, b_scales: tuple[float, ...],
     n_b: int, n_cells: int, rep_lookup: np.ndarray,
+    S: np.ndarray, prior_var_cell: np.ndarray, step_yr: float,
+    methods: tuple[str, ...],
 ) -> _TargetPredictions:
     """Assimilate the assim-set sites age by age, predict the target-set sites.
 
-    Climatological background (zero anomaly), ``R = diag(sse + rep_var)`` where
-    ``rep_lookup`` holds the per-channel representativeness variance. Observations enter
+    Climatological background (zero anomaly), ``R = diag(sse + rep_var)`` before the
+    temporal term, where ``rep_lookup`` holds the per-channel representativeness
+    variance. Observations enter
     in anomaly space ``y - my`` so the proxy-vs-model offset cancels. A withheld
     observation is scored only when its own age also carries an assimilated one, so an age
     holding just one side of the split contributes nothing.
+
+    One analysis per temporal method, each with its own R and so its own factorization.
+    The withheld observation is attenuated by its own distance in time exactly as the
+    assimilated ones are, so predicting it means applying that attenuation rather than
+    undoing it: the prediction carries ``rho``, and ``actual`` is left alone. That factor
+    is a property of the withheld sample, not of the analysis, so it applies to every
+    method including the uncorrected one; scoring one attenuated and another not would
+    settle the comparison by the scoring rule. The prior-free baselines keep the raw
+    observations, since they predict an observation from observations and already sit on
+    the attenuated scale.
     """
     bg_zero = np.zeros(len(clim_flat))
-    actual, channel, sse, pred, post_var, prior_var, dist, rep = [], [], [], [], [], [], [], []
+    actual, channel, sse, prior_var, dist, rep, resid, site = [], [], [], [], [], [], [], []
+    pred = {m: [] for m in methods}
+    post_var = {m: [] for m in methods}
     naive = {"nearest": [], "idw": []}
     for age in obs_ages:
         o = observations_at_age(long, int(age))
@@ -946,16 +1037,26 @@ def _predict_targets(
         y_anom = (o["y"][kept] - o["my"][kept]).astype(np.float64)
         gk, gw = gather[kept], gather[wkeep]
         r_kept = o["sse"][kept].astype(np.float64) + rep_lookup[gk // n_cells]
-        gain = tv.prepare_sweep(gk, r_kept, b_scales)
-        res = tv.apply_sweep(gain, y_anom, bg_zero)
+        lag = np.abs(o["age"] - o["centre"])
+        rho_k, resid_k = temporal_terms(S, prior_var_cell, gk, lag[kept], step_yr)
+        rho_w, resid_w = temporal_terms(S, prior_var_cell, gw, lag[wkeep], step_yr)
+
+        for method in methods:
+            yv, r = apply_temporal_error(y_anom, r_kept, rho_k, resid_k,
+                                         TEMPORAL_METHODS[method])
+            res = tv.apply_sweep(tv.prepare_sweep(gk, r, b_scales), yv, bg_zero)
+            pred[method].append(
+                np.stack([rho_w * res[bj].predict_obs(gw) for bj in range(n_b)]))
+            post_var[method].append(
+                np.stack([rho_w ** 2 * res[bj].predict_obs_var(gw) for bj in range(n_b)]))
 
         actual.append((o["y"][wkeep] - o["my"][wkeep]).astype(np.float64))
         channel.append(gw // n_cells)
         sse.append(o["sse"][wkeep].astype(np.float64))
         rep.append(rep_lookup[gw // n_cells])
-        pred.append(np.stack([res[bj].predict_obs(gw) for bj in range(n_b)]))
-        post_var.append(np.stack([res[bj].predict_obs_var(gw) for bj in range(n_b)]))
-        prior_var.append(tv.diagB[gw])
+        resid.append(resid_w)
+        site.append(o["site"][wkeep])
+        prior_var.append(rho_w ** 2 * tv.diagB[gw])
         nv, d = _naive_obs_predictions(
             {"lat": o["lat"][kept], "lon": o["lon"][kept], "y": y_anom,
              "chan": gk // n_cells},
@@ -966,17 +1067,21 @@ def _predict_targets(
         dist.append(d)
 
     if not actual:
-        empty = np.array([])
-        return _TargetPredictions(empty, empty, empty, np.zeros((n_b, 0)),
-                                  np.zeros((n_b, 0)), empty,
-                                  {k: empty for k in naive}, empty, empty)
+        def empty():
+            return np.array([])
+        return _TargetPredictions(
+            empty(), empty(), empty(), {m: np.zeros((n_b, 0)) for m in pred},
+            {m: np.zeros((n_b, 0)) for m in post_var}, empty(),
+            {k: empty() for k in naive}, empty(), empty(), empty(), empty())
     return _TargetPredictions(
         actual=np.concatenate(actual), channel=np.concatenate(channel),
-        sse=np.concatenate(sse), pred=np.concatenate(pred, axis=1),
-        post_var=np.concatenate(post_var, axis=1),
+        sse=np.concatenate(sse),
+        pred={m: np.concatenate(v, axis=1) for m, v in pred.items()},
+        post_var={m: np.concatenate(v, axis=1) for m, v in post_var.items()},
         prior_var=np.concatenate(prior_var),
         naive={k: np.concatenate(v) for k, v in naive.items()},
-        distance_km=np.concatenate(dist), rep_var=np.concatenate(rep))
+        distance_km=np.concatenate(dist), rep_var=np.concatenate(rep),
+        resid_var=np.concatenate(resid), site=np.concatenate(site))
 
 
 def _concat_targets(parts: list[_TargetPredictions]) -> _TargetPredictions:
@@ -985,18 +1090,23 @@ def _concat_targets(parts: list[_TargetPredictions]) -> _TargetPredictions:
         actual=np.concatenate([p.actual for p in parts]),
         channel=np.concatenate([p.channel for p in parts]),
         sse=np.concatenate([p.sse for p in parts]),
-        pred=np.concatenate([p.pred for p in parts], axis=1),
-        post_var=np.concatenate([p.post_var for p in parts], axis=1),
+        pred={m: np.concatenate([p.pred[m] for p in parts], axis=1) for m in parts[0].pred},
+        post_var={m: np.concatenate([p.post_var[m] for p in parts], axis=1)
+                  for m in parts[0].post_var},
         prior_var=np.concatenate([p.prior_var for p in parts]),
         naive={k: np.concatenate([p.naive[k] for p in parts]) for k in parts[0].naive},
         distance_km=np.concatenate([p.distance_km for p in parts]),
-        rep_var=np.concatenate([p.rep_var for p in parts]))
+        rep_var=np.concatenate([p.rep_var for p in parts]),
+        resid_var=np.concatenate([p.resid_var for p in parts]),
+        site=np.concatenate([p.site for p in parts]))
 
 
 def _score_withholding_lane(
     prior: Prior, long: pd.DataFrame, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
-    *, make_method: MethodFactory | None, space: str, reg_cols: dict,
+    *, cube: np.ndarray, prior_age_indices: np.ndarray,
+    make_method: MethodFactory | None, space: str, reg_cols: dict,
     k_folds: int, fold_kind: str, b_scales: tuple[float, ...], seed: int,
+    methods: tuple[str, ...] = tuple(TEMPORAL_METHODS),
     progress_every: int | None = None,
 ) -> tuple[str, list[dict], dict]:
     """Nested-CV site withholding for one built prior (no file writes).
@@ -1010,10 +1120,12 @@ def _score_withholding_lane(
     fold serves as a val target in one rotation and a test target in another, so for a
     single global operating point a mild dependence remains; the reported test predictions
     are never scored during selection. Observations enter in anomaly space ``y - my``;
-    ``R = diag(sse + rep_var)`` with the representativeness variance estimated per fold
-    from the assimilated sites alone, so a withheld site never informs the update or the
-    spread that scores it; the background is climatological. ``space``/``reg_cols`` tag the
-    rows.
+    ``R = diag(sse + rep_var)`` before the temporal term, with the representativeness
+    variance estimated per fold from the assimilated sites alone, so a withheld site never
+    informs the update or the spread that scores it; the background is climatological.
+    ``methods`` chooses which treatments of observation staleness to score, so a grid scan
+    can spend its passes on the taper and leave the comparison between treatments to the
+    winner. ``space``/``reg_cols`` tag the rows.
 
     Alongside the skill rows each ``b_scale`` carries calibration scored against the
     proxy, whose own error and representativeness variance join the posterior spread since
@@ -1036,6 +1148,14 @@ def _score_withholding_lane(
     all_sites = set(long["site"].unique().tolist())
     lane = f"withholding_{fold_kind}"
 
+    # Each sample's own position on the age axis, and the structure function that says
+    # what sitting away from it costs. The ages are the ones the background was built
+    # from, so the correction and B describe the same prior.
+    long = sample_block_centres(long)
+    step_yr = _age_step(np.asarray(ages, dtype=np.int64))
+    S, prior_var_cell = temporal_structure_function(
+        cube, prior_age_indices, max_lag=_max_block_lag(long, step_yr))
+
     # Estimate rep_var per fold from the assimilated sites only; the flattened cell index
     # of every row is fixed, so build it once and slice it by site set per fold.
     cell_all = obs_cell_index(long["lat"].to_numpy(), long["lon"].to_numpy(),
@@ -1046,20 +1166,23 @@ def _score_withholding_lane(
         return np.array([rv.get(v, 0.0) for v in VARS])
 
     def _rows(tp: _TargetPredictions, fold: int, split: str) -> list[dict]:
-        """Skill and calibration rows over the b_scale sweep for one prediction set."""
+        """Skill and calibration rows over the b_scale sweep for every temporal method."""
         out = []
         groups = _obs_channel_groups(tp.channel)
-        for bj, kb in enumerate(b_scales):
-            base = {"method": "3dvar", "space": space, **reg_cols, "lane": lane,
-                    "fold": fold, "b_scale": kb, "background": "climatological",
-                    "split": split}
-            out += _withholding_rows(tp.actual, tp.pred[bj], tp.channel, base)
-            # The truth is itself a measurement that also deviates from its grid cell, so
-            # its error and representativeness variance join the posterior spread; the
-            # prior reference carries the same terms to stay comparable.
-            out += _calibration_rows(tp.actual, tp.pred[bj],
-                                     tp.post_var[bj] + tp.sse + tp.rep_var,
-                                     kb * tp.prior_var + tp.sse + tp.rep_var, groups, base)
+        # The truth is itself a measurement that deviates from its grid cell and from the
+        # analysis age, so its error, representativeness variance and temporal residual
+        # all join the posterior spread; the prior reference carries the same terms to
+        # stay comparable, and only the background half of it scales with b_scale.
+        obs_var = tp.sse + tp.rep_var + tp.resid_var
+        for method in tp.pred:
+            for bj, kb in enumerate(b_scales):
+                base = {"method": method, "space": space, **reg_cols, "lane": lane,
+                        "fold": fold, "b_scale": kb, "background": "climatological",
+                        "split": split}
+                out += _withholding_rows(tp.actual, tp.pred[method][bj], tp.channel, base)
+                out += _calibration_rows(tp.actual, tp.pred[method][bj],
+                                         tp.post_var[method][bj] + obs_var,
+                                         kb * tp.prior_var + obs_var, groups, base)
         return out
 
     def _naive_rows(tp: _TargetPredictions) -> list[dict]:
@@ -1080,7 +1203,8 @@ def _score_withholding_lane(
         assim = all_sites - fold_sets[(i + 1) % k_folds] - fold_sets[i]
         tp = _predict_targets(tv, long, obs_ages, lats, lons, safe_flat,
                               clim_flat, assim, fold_sets[(i + 1) % k_folds],
-                              b_scales, n_b, n_cells, _rep_lookup(assim))
+                              b_scales, n_b, n_cells, _rep_lookup(assim),
+                              S, prior_var_cell, step_yr, methods)
         if len(tp):
             sel.append(tp)
         if progress_every and (i + 1) % progress_every == 0:
@@ -1095,7 +1219,8 @@ def _score_withholding_lane(
         assim = all_sites - fold_sets[i]
         tp = _predict_targets(tv, long, obs_ages, lats, lons, safe_flat,
                               clim_flat, assim, fold_sets[i],
-                              b_scales, n_b, n_cells, _rep_lookup(assim))
+                              b_scales, n_b, n_cells, _rep_lookup(assim),
+                              S, prior_var_cell, step_yr, methods)
         if not len(tp):
             continue
         rows += _rows(tp, i, "test")
@@ -1109,10 +1234,19 @@ def _score_withholding_lane(
         rows += _rows(tp, -1, "test")
         rows += _naive_rows(tp)
         predictions.update({
-            "actual": tp.actual, "channel": tp.channel, "climatological_pred": tp.pred,
-            "post_var_pred": tp.post_var, "prior_var_pred": tp.prior_var,
+            "actual": tp.actual, "channel": tp.channel, "site": tp.site,
+            "climatological_pred": tp.pred[METHOD_BASE],
+            "post_var_pred": tp.post_var[METHOD_BASE], "prior_var_pred": tp.prior_var,
             "sse": tp.sse, "distance_km": tp.distance_km, "rep_var": tp.rep_var,
+            "resid_var": tp.resid_var,
             "naive_nearest": tp.naive["nearest"], "naive_idw": tp.naive["idw"]})
+        # The corrected variants ride alongside under their own keys; the uncorrected one
+        # keeps the bare names so anything reading the lane's predictions still finds it.
+        for method in tp.pred:
+            if method == METHOD_BASE:
+                continue
+            predictions[f"climatological_pred_{method}"] = tp.pred[method]
+            predictions[f"post_var_pred_{method}"] = tp.post_var[method]
     return lane, rows, predictions
 
 
@@ -1158,13 +1292,15 @@ def run_withholding(
     :func:`_score_withholding_lane`; :func:`run_withholding_pixel_grid` wraps this over
     the taper grid.
     """
-    prior = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid,
+    prior_idx = np.arange(len(ages))
+    prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
                         localization_km=localization_km, shrinkage_lambda=shrinkage_lambda,
                         alpha=alpha)
     reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
                 "alpha": alpha}
     lane, rows, predictions = _score_withholding_lane(
-        prior, long, ages, lats, lons, make_method=make_method, space=space,
+        prior, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
+        make_method=make_method, space=space,
         reg_cols=reg_cols, k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales,
         seed=seed, progress_every=progress_every)
     config = _withholding_config(lane, space, prior, k_folds, fold_kind, b_scales, seed,
@@ -1215,11 +1351,26 @@ def _pixel_grid_configs(localization_grid, shrinkage_grid, alpha_grid):
     return configs, record
 
 
-def _selection_rrmse(rows: list[dict], lane: str) -> pd.DataFrame:
-    """Pooled selection-split RRMSE rows for the 3dvar method, the surface tuned over."""
+def _selection_rrmse(rows: list[dict], lane: str, method: str = METHOD_BASE) -> pd.DataFrame:
+    """Pooled selection-split RRMSE rows for one method, the surface tuned over."""
     M = pd.DataFrame(rows)
-    return M[(M.method == "3dvar") & (M.lane == lane) & (M.split == "selection")
+    return M[(M.method == method) & (M.lane == lane) & (M.split == "selection")
              & (M.channel == "pooled") & (M.do_event == "all") & (M.metric == "rrmse")]
+
+
+def _b_scale_by_method(rows: list[dict], lane: str, sel_tol: float) -> dict[str, float]:
+    """Each temporal variant's own selection-split ``b_scale``.
+
+    Inflating R shifts the background-to-observation balance the analysis wants, so a
+    variant is reported at the amplitude its own selection split prefers rather than at
+    the uncorrected one's.
+    """
+    out = {}
+    for method in TEMPORAL_METHODS:
+        sel = _selection_rrmse(rows, lane, method)
+        if len(sel):
+            out[method] = float(select_best_config(sel, sel_tol=sel_tol)["b_scale"])
+    return out
 
 
 def run_ppe_pixel_grid(
@@ -1304,26 +1455,34 @@ def run_withholding_pixel_grid(
 
     all_rows: list[dict] = []
     t0 = time.time()
+    prior_idx = np.arange(len(ages))
     for ci, (loc, lam, a) in enumerate(configs):
-        prior = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid,
+        prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
                             localization_km=loc, shrinkage_lambda=lam, alpha=a)
         reg_cols = {"localization_km": loc, "shrinkage_lambda": lam, "alpha": a}
         _, rows, _ = _score_withholding_lane(
-            prior, long, ages, lats, lons, make_method=None, space="pixel",
+            prior, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
+            make_method=None, space="pixel",
             reg_cols=reg_cols, k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales,
-            seed=seed)
-        all_rows += [r for r in rows if r["method"] == "3dvar"]   # naive added once, from winner
+            seed=seed, methods=(METHOD_BASE,))
+        # The grid answers a spatial question, so it runs the uncorrected method alone and
+        # the winner pass adds the temporal comparison; the prior-free rows come from
+        # there too, since they depend on neither the taper nor b_scale.
+        all_rows += [r for r in rows if r["method"] == METHOD_BASE]
         _report_progress(f"pixel-grid config ({lane})", ci + 1, len(configs), t0)
 
     win = select_best_config(_selection_rrmse(all_rows, lane), sel_tol=sel_tol)
     reg_w = {"localization_km": win["localization_km"], "shrinkage_lambda": win["shrinkage_lambda"],
              "alpha": win["alpha"]}
-    prior_w = build_prior(cube, ages, lats, lons, np.arange(len(ages)), valid, **reg_w)
+    prior_w = build_prior(cube, ages, lats, lons, prior_idx, valid, **reg_w)
     _, win_rows, predictions = _score_withholding_lane(
-        prior_w, long, ages, lats, lons, make_method=None, space="pixel", reg_cols=reg_w,
+        prior_w, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
+        make_method=None, space="pixel", reg_cols=reg_w,
         k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales, seed=seed,
         progress_every=progress_every)
-    all_rows += [r for r in win_rows if r["method"] != "3dvar"]
+    # The winner pass adds the temporal variants and the prior-free rows; the baseline's
+    # own rows are already in from the grid pass at this same config.
+    all_rows += [r for r in win_rows if r["method"] != METHOD_BASE]
 
     config = _withholding_config(lane, "pixel", prior_w, k_folds, fold_kind, b_scales, seed,
                                  reg_w, extra={"selected": win, "sel_tol": sel_tol,

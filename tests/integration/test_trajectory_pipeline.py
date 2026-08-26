@@ -80,7 +80,7 @@ def test_run_trajectory_schema_and_artifacts(tmp_path, run_cube, run_ages, lats,
     assert (df["lane"] == ex.LANE_TRAJECTORY).all()
     assert (df["fold"] == -1).all()
     assert set(df["split"]) == {"selection", "test"}
-    assert set(df["method"]) == {"3dvar", "3dvar_ceiling", "nearest", "idw"}
+    assert set(df["method"]) == set(ex.TRAJECTORY_METHODS) | {"nearest", "idw"}
     assert set(df["do_event"]) == {"all"}
 
     for name in ("metrics.csv", "trajectory_analysis.npz", "trajectory_config.json"):
@@ -90,6 +90,9 @@ def test_run_trajectory_schema_and_artifacts(tmp_path, run_cube, run_ages, lats,
     assert cfg["step_yr"] == STEP
     assert cfg["n_covered_ages"] + cfg["n_skipped_ages"] == len(run_ages) // 2
     assert set(cfg["selected"]) == {"localization_km", "shrinkage_lambda", "alpha", "b_scale"}
+    # Each variant carries its own b_scale, since inflating R moves the balance the
+    # analysis wants between background and observations.
+    assert set(cfg["selected_b_scale_by_method"]) == set(ex.TEMPORAL_METHODS)
 
 
 def test_run_trajectory_emits_both_timescale_families(tmp_path, run_cube, run_ages, lats,
@@ -144,3 +147,37 @@ def test_posterior_var_within_prior(tmp_path, run_cube, run_ages, lats, lons, va
     assert z["recon_realistic"].shape == z["truth_anom"].shape
     assert z["recon_ceiling"].shape == z["truth_anom"].shape
     assert len(z["ages"]) == z["truth_anom"].shape[0]
+
+
+def test_ceiling_is_never_temporally_corrected(tmp_path, run_cube, run_ages, lats, lons,
+                                               valid, run_obs):
+    """The ceiling must stay the uncorrected upper bound on every variant.
+
+    It reuses the baseline gain by reference, so a correction leaking into it would be
+    silent: the lane would still run and simply stop bounding anything.
+    """
+    df = _run(tmp_path, run_cube, run_ages, lats, lons, valid, run_obs)
+    sub = df[(df.split == "test") & (df.channel == "pooled") & (df.metric == "rrmse")]
+    ceiling = sub[sub.method == "3dvar_ceiling"].set_index("b_scale")["value"]
+    for method in ex.TEMPORAL_METHODS:
+        other = sub[sub.method == method].set_index("b_scale")["value"]
+        assert (ceiling <= other + 1e-9).all(), (method, ceiling, other)
+
+
+def test_temporal_variants_persist_fields_and_calibration(tmp_path, run_cube, run_ages,
+                                                          lats, lons, valid, run_obs):
+    """Each variant carries its own posterior variance, not the uncorrected one's.
+
+    Inflating R changes the gain, so a shared ``post_var`` would report the baseline's
+    spread against the variant's mean and quietly mis-state its calibration.
+    """
+    df = _run(tmp_path, run_cube, run_ages, lats, lons, valid, run_obs)
+    z = np.load(tmp_path / "trajectory_analysis.npz")
+
+    for method in ex.TEMPORAL_METHODS:
+        if method == ex.METHOD_BASE:
+            continue
+        assert z[f"recon_{method}"].shape == z["truth_anom"].shape
+        assert not np.allclose(z[f"post_var_{method}"], z["post_var"])
+        cal = df[(df.method == method) & (df.metric == "coverage90")]
+        assert len(cal) and np.isfinite(cal["value"]).all()
