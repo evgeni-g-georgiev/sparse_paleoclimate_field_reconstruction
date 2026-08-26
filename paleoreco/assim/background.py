@@ -1,10 +1,11 @@
-"""Background state and background-error covariance from the Prior cube.
+"""Background state, error covariance, and temporal structure from the Prior cube.
 
 The state vector is one snapshot ``cube[k]`` of shape ``(2, n_lat, n_lon)``
 flattened in C order to length ``D = 2 * n_lat * n_lon``; channel ``mtco`` fills
 the first ``n_lat * n_lon`` entries, ``mtwa`` the rest. B is the sample
 covariance of the Prior's own anomalies, so the background inherits the model's
-spatial covariance structure.
+spatial covariance structure. The structure function is the same statistic along
+the age axis instead of the spatial one.
 """
 
 from __future__ import annotations
@@ -45,3 +46,30 @@ def background_covariance(cube: np.ndarray, age_indices: np.ndarray) -> np.ndarr
 def background_variance(cov: np.ndarray) -> np.ndarray:
     """Per-cell background variance, the diagonal of B the marginal test needs."""
     return np.diag(cov).copy()
+
+
+def temporal_structure_function(
+    cube: np.ndarray, age_indices: np.ndarray, *, max_lag: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """``S[lag, cell]`` and per-cell variance over the given ages.
+
+    ``S`` is the mean squared change across ``lag`` age steps, so ``1 - S / (2 var)``
+    is the cell's lag correlation: how much of a state survives that many years. An
+    observation whose sample sits away from the analysis age reports on a state that
+    far off, and that correlation is what says how much it still knows.
+
+    Both come from the same ages so the ratio is consistent, and the variance uses
+    ``ddof=1`` to match :func:`background_covariance`'s diagonal. Pass the same ages
+    the background was built from: on a lane whose truth is a model state, later ages
+    would leak that truth into the operator that reconstructs it.
+    """
+    idx = np.asarray(age_indices, dtype=np.int64)
+    X = cube[idx].reshape(len(idx), -1).astype(np.float64)
+    X -= X.mean(axis=0, keepdims=True)
+    var = X.var(axis=0, ddof=1)
+
+    n_lag = max(min(int(max_lag), len(idx) - 1), 0)
+    S = np.zeros((n_lag + 1, X.shape[1]))
+    for lag in range(1, n_lag + 1):
+        S[lag] = ((X[lag:] - X[:-lag]) ** 2).mean(axis=0)
+    return S, var
