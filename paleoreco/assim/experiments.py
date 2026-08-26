@@ -17,11 +17,18 @@ Three evaluation lanes, all method-agnostic through the :class:`Method` contract
 :func:`run_ppe_pixel_grid` and :func:`run_withholding_pixel_grid` wrap these over a
 coarse localization/shrinkage/coupling grid, jointly selecting the operating point with
 ``b_scale`` on the held-out selection split and persisting only the winning config's
-fields.
+fields. :func:`run_hgaoenkf_ppe_grid` and :func:`run_hgaoenkf_withholding_grid` do the
+same over the analog ensemble size and hybrid weight, at a taper those grids already
+settled, and :func:`run_hgaoenkf_withholding_variants` scores how the ensemble is chosen.
+
+A row's ``method`` composes the estimator with its treatment of observation staleness
+(:func:`method_label`), so several estimators share one schema without colliding and every
+row says which pair of choices produced it. ``analog_k`` and ``hybrid_w`` carry the analog
+parameters and are NaN for an estimator that draws no ensemble.
 
 Each writes a tidy long-format metrics CSV (one row per method/space/localization_km/
-shrinkage_lambda/alpha/lane/fold/b_scale/background/split/do_event/channel/metric), the
-analysis fields as npz, and a config.json. ``b_scale`` is the background-covariance
+shrinkage_lambda/alpha/analog_k/hybrid_w/lane/fold/b_scale/background/split/do_event/
+channel/metric), the analysis fields as npz, and a config.json. ``b_scale`` is the background-covariance
 amplitude the analysis used; ``split`` is ``selection`` (used to pick the operating
 point) or ``test`` (reported). The withholding lane uses ``R = diag(sse + rep_var)``,
 adding the per-channel representativeness variance so a point proxy is not trusted to
@@ -32,12 +39,13 @@ counterparts.
 
 The withholding and trajectory lanes also carry the temporal twin of ``rep_var``: a
 sample is replicated across every age in its block, so at most of them it reports on a
-state some way off in time. ``TEMPORAL_METHODS`` names one method label per treatment of
-that, from leaving it alone through charging it as extra observation error to also
-correcting the attenuation a lagged state carries, so the treatments sit side by side in
-one schema and any two are paired over the same ages. The PPE lane stays out of it: it
-borrows network geometry without its climate time, so a sample's distance from the
-analysis age measures nothing there.
+state some way off in time. ``temporal_modes`` chooses which treatments of that to score,
+from leaving it alone through charging it as extra observation error to also correcting the
+attenuation a lagged state carries, so the treatments sit side by side in one schema and
+any two are paired over the same ages. A lane comparing estimators holds the treatment
+fixed instead, which keeps the difference between them the estimator. The PPE lane stays
+out of it: it borrows network geometry without its climate time, so a sample's distance
+from the analysis age measures nothing there.
 
 Every lane emits skill metrics (``ce``, ``corr``, ``rmse``, ``rrmse``, ``amplitude``,
 plus field-only ``ssim``) and calibration metrics (``crps``, ``crpss``, ``rcrv_bias``,
@@ -68,6 +76,7 @@ from paleoreco.assim.method import Method
 from paleoreco.assim.observations import (
     TEMPORAL_ADD,
     TEMPORAL_DEFLATE,
+    TEMPORAL_MODES,
     TEMPORAL_OFF,
     apply_temporal_error,
     observations_at_age,
@@ -75,6 +84,8 @@ from paleoreco.assim.observations import (
     sample_block_centres,
     temporal_terms,
 )
+from paleoreco.assim.analog import ANALOG_MISFIT, ANALOG_WINDOW
+from paleoreco.assim.hgaoenkf import make_hgaoenkf
 from paleoreco.assim.innovation import nearest_age_index, obs_cell_index
 from paleoreco.assim.priors import Prior, build_prior, great_circle_km_between
 from paleoreco.assim.threedvar import ThreeDVar
@@ -93,21 +104,45 @@ LOCALIZATION_KM_GRID = (None, 7500.0, 12500.0)
 SHRINKAGE_GRID = (0.0, 0.25, 0.5)
 ALPHA_GRID = (0.0, 0.5, 1.0)
 SEL_TOL = 0.0   # 0 = pure argmin of selection RRMSE; >0 prefers the simpler config within this relative band
+# Analog-ensemble tuning grid: how many prior states form the ensemble, and how much of
+# the gain their covariance carries against the static one.
+K_GRID = (20, 40, 60, 100)
+HYBRID_W_GRID = (0.25, 0.5, 0.75)
+# Width of the band around the analysis age dropped from the analog pool, and the widths
+# a sensitivity pass sweeps. Only bites where the prior spans the age being reconstructed.
+EXCLUDE_YR = 1000.0
+EXCLUDE_YR_GRID = (0.0, 500.0, 1000.0, 2000.0)
 LANE_PPE = "ppe"
 LANE_TRAJECTORY = "trajectory"
 
-# How an observation's distance in time from the analysis age is treated, one method
-# label per treatment so the three sit side by side in the shared row schema and every
-# comparison between them is paired over the same ages. ``METHOD_CEILING`` is not a
-# treatment: it replaces the observations with ones taken at the analysis age, which
-# bounds what the staleness costs.
-METHOD_BASE = "3dvar"
-METHOD_CEILING = "3dvar_ceiling"
-TEMPORAL_METHODS = {
-    METHOD_BASE: TEMPORAL_OFF,
-    "3dvar_temporal_add": TEMPORAL_ADD,
-    "3dvar_temporal_deflate": TEMPORAL_DEFLATE,
-}
+# Which estimator produced a row. The method label composes it with the treatment of
+# observation staleness, so two estimators can share the metrics CSV without colliding and
+# every row still says which pair of choices it came from.
+ESTIMATOR_3DVAR = "3dvar"
+ESTIMATOR_HGAOENKF = "hgaoenkf"
+_TEMPORAL_SUFFIX = {TEMPORAL_OFF: "", TEMPORAL_ADD: "_temporal_add",
+                    TEMPORAL_DEFLATE: "_temporal_deflate"}
+
+
+def method_label(estimator: str, mode: str = TEMPORAL_OFF) -> str:
+    """The metrics-CSV ``method`` for one (estimator, staleness treatment) pair."""
+    return f"{estimator}{_TEMPORAL_SUFFIX[mode]}"
+
+
+def ceiling_label(estimator: str) -> str:
+    """The label for a run with observations taken at the analysis age.
+
+    Not a treatment of staleness but the bound on what it costs, so it sits outside
+    :func:`method_label`'s composition.
+    """
+    return f"{estimator}_ceiling"
+
+
+# One method label per treatment, so the three sit side by side in the shared row schema
+# and every comparison between them is paired over the same ages.
+METHOD_BASE = method_label(ESTIMATOR_3DVAR)
+METHOD_CEILING = ceiling_label(ESTIMATOR_3DVAR)
+TEMPORAL_METHODS = {method_label(ESTIMATOR_3DVAR, mode): mode for mode in TEMPORAL_MODES}
 TRAJECTORY_METHODS = tuple(TEMPORAL_METHODS) + (METHOD_CEILING,)
 
 # Timescales the trajectory lane resolves. Low-pass keeps everything slower than the
@@ -124,6 +159,13 @@ _FULL_METRICS = frozenset({"ssim", "crps", "crpss", "rcrv_bias", "rcrv_dispersio
 
 # Taper columns for prior-free (naive) rows, which carry no regularizer.
 _NAN_REG = {"localization_km": np.nan, "shrinkage_lambda": np.nan, "alpha": np.nan}
+# Analog-ensemble columns for rows from an estimator that draws no analog ensemble.
+_NAN_ANALOG = {"analog_k": np.nan, "hybrid_w": np.nan}
+
+
+def analog_cols(k: int, hybrid_w: float) -> dict:
+    """The two analog columns for a row, as :func:`_NAN_REG` does for the taper."""
+    return {"analog_k": float(k), "hybrid_w": float(hybrid_w)}
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +507,7 @@ def _score_ppe_lane(
     b_scales: tuple[float, ...], n_shapes: int, n_select: int, n_noise: int,
     dist_edges_km: np.ndarray | None, seed: int, full_metrics: bool = True,
     npz_extra: dict | None = None, progress_every: int | None = None,
+    estimator: str = ESTIMATOR_3DVAR, method_cols: dict | None = None,
 ) -> tuple[list[dict], dict, dict]:
     """Score a built prior against a stack of truth anomalies (no file writes).
 
@@ -478,8 +521,10 @@ def _score_ppe_lane(
     test shape. R is ``diag(sse)``; each pseudo-obs is the truth at its nearest cell plus
     ``N(0, sse)`` noise, averaged over ``n_noise`` draws. Single climatological
     background. ``make_method`` selects the estimator (default pixel :class:`ThreeDVar`);
-    ``space``/``reg_cols`` tag the rows. ``full_metrics=False`` skips the field SSIM and
-    calibration rows (neither feeds the RRMSE selection), the free saving the grid scan takes.
+    ``space``/``reg_cols`` tag the rows, as do ``estimator`` (which names the rows' method)
+    and ``method_cols`` (the analog columns, absent for a static-covariance estimator).
+    ``full_metrics=False`` skips the field SSIM and calibration rows (neither feeds the
+    RRMSE selection), the free saving the grid scan takes.
 
     Calibration is scored on the test shape only, where the posterior variance is kept,
     and against the noise-free truth so the predictive variance is the posterior alone.
@@ -492,6 +537,7 @@ def _score_ppe_lane(
     b_scales = tuple(float(b) for b in b_scales)
     n_b = len(b_scales)
     npz_extra = npz_extra or {}
+    method_cols = method_cols or _NAN_ANALOG
 
     clim_mean = prior.clim_mean.astype(np.float64)
     safe_valid = prior.safe_valid
@@ -523,12 +569,14 @@ def _score_ppe_lane(
             naive_geom = _naive_geometry(lats, lons, geom, len(VARS))
 
             sum_recon = np.zeros((n_b, *shape))
+            sum_post = np.zeros((n_b, *shape))
             sum_naive = {kind: np.zeros(shape) for kind in naive_test}
             for _ in range(n_noise):
                 y = truth_at_obs + rng.normal(0.0, np.sqrt(geom["sse"]))
                 res = tv.apply_sweep(gain, y, zero_bg)
                 for bj in range(n_b):
                     sum_recon[bj] += res[bj].mean_anom
+                    sum_post[bj] += res[bj].posterior_var
                 for kind in sum_naive:
                     sum_naive[kind] += _naive_apply(kind, naive_geom, y, shape)
             sum_recon /= n_noise
@@ -537,7 +585,9 @@ def _score_ppe_lane(
                 recon_sel[si, :, ti] = sum_recon
             else:
                 recon_test[:, ti] = sum_recon
-                post_test[:, ti] = tv.post_var_sweep(gain).reshape(n_b, *shape)  # value-free
+                # Read off the analyses rather than asked for separately: an estimator
+                # whose covariance depends on the observations has no value-free spread.
+                post_test[:, ti] = sum_post / n_noise
                 for kind in naive_test:
                     naive_test[kind][ti] = sum_naive[kind] / n_noise
                 dist_test.append(da.nearest_obs_distance(lats, lons, geom["lat"], geom["lon"]))
@@ -552,7 +602,7 @@ def _score_ppe_lane(
 
     rows = []
     for bj, kb in enumerate(b_scales):
-        base = {"method": "3dvar", "space": space, **reg_cols,
+        base = {"method": method_label(estimator), "space": space, **reg_cols, **method_cols,
                 "lane": lane, "fold": -1, "b_scale": kb,
                 "background": "climatological", "split": "test"}
         rows += _skill_rows(truth_anoms, recon_test[bj], safe_valid, events, base)
@@ -566,7 +616,7 @@ def _score_ppe_lane(
                                             kb * tv.diagB.reshape(shape), safe_valid,
                                             events, base)
     for kind in naive_test:
-        base = {"method": kind, "space": space, **_NAN_REG,
+        base = {"method": kind, "space": space, **_NAN_REG, **_NAN_ANALOG,
                 "lane": lane, "fold": -1, "b_scale": 1.0,
                 "background": "none", "split": "test"}
         rows += _skill_rows(truth_anoms, naive_test[kind], safe_valid, events, base)
@@ -621,6 +671,7 @@ def run_ppe(
     n_shapes: int = 5, n_select: int = 4, n_noise: int = 20, truth_stride: int = 10,
     dist_edges_km: np.ndarray | None = None, seed: int = 0,
     progress_every: int | None = None,
+    estimator: str = ESTIMATOR_3DVAR, method_cols: dict | None = None,
 ) -> pd.DataFrame:
     """Same-model PPE for one taper config: truths are a held-out chronological chunk.
 
@@ -645,7 +696,7 @@ def run_ppe(
         lane=LANE_PPE, make_method=make_method, space=space, reg_cols=reg_cols,
         b_scales=b_scales, n_shapes=n_shapes, n_select=n_select, n_noise=n_noise,
         dist_edges_km=dist_edges_km, seed=seed, npz_extra={"truth_clim": truth_clim},
-        progress_every=progress_every)
+        progress_every=progress_every, estimator=estimator, method_cols=method_cols)
     config = _ppe_config(LANE_PPE, space, prior, len(truth_anoms), n_shapes, n_select,
                          n_noise, b_scales, seed, reg_cols,
                          _chronological_split_meta(ages_i, prior_idx, truth_idx, truth_stride))
@@ -721,6 +772,8 @@ def run_trajectory(
     bands: tuple[tuple[int, int], ...] = BANDS,
     min_obs: int = 10, sel_tol: float = SEL_TOL, seed: int = 0,
     progress_every: int | None = None,
+    estimator: str = ESTIMATOR_3DVAR, method_cols: dict | None = None,
+    temporal_modes: tuple[str, ...] = TEMPORAL_MODES,
 ) -> pd.DataFrame:
     """Reconstruct a consecutive run of states and score skill by timescale.
 
@@ -728,14 +781,16 @@ def run_trajectory(
     younger half is a truth, so the analyses form a time series rather than a set of
     independent snapshots. At each age the observation network is the real one at that
     age, and each pseudo-observation carries the truth at its own sample's block centre:
-    a sample describes its own moment, not the moment being assimilated. The
-    ``3dvar_ceiling`` rows repeat the run with observations taken at the analysis age,
-    which bounds what the staleness costs.
+    a sample describes its own moment, not the moment being assimilated. The ceiling rows
+    repeat the run with observations taken at the analysis age, which bounds what the
+    staleness costs.
 
     Between those two sit the temporal variants, which answer the staleness rather than
     remove it: one charges it as extra observation error, the other also corrects the
     attenuation a lagged state carries. Their structure function comes from the prior
     ages alone, so the truth half never informs the operator that reconstructs it.
+    ``temporal_modes`` chooses which of them to run, so a lane comparing estimators can
+    hold the treatment fixed at one rather than re-deciding it per estimator.
 
     One noise draw per age, shared by every variant. Averaging draws as the PPE lane
     does would smooth the reconstructed series and flatter exactly the high-frequency
@@ -776,11 +831,17 @@ def run_trajectory(
     S, prior_var_cell = temporal_structure_function(
         cube, prior_idx, max_lag=_max_block_lag(long, step_yr))
 
+    method_cols = method_cols or _NAN_ANALOG
+    labels = {method_label(estimator, mode): mode for mode in temporal_modes}
+    base_label = next(iter(labels))
+    ceiling = ceiling_label(estimator)
+
     rng = np.random.default_rng(seed)
     covered, skipped = [], []
-    recon = {m: [] for m in TRAJECTORY_METHODS}
+    recon = {m: [] for m in (*labels, ceiling)}
     naive = {"nearest": [], "idw": []}
-    post = {m: [] for m in TRAJECTORY_METHODS if m != METHOD_CEILING}
+    post = {m: [] for m in labels}
+    analog_index = []
     obs_n = []
     t0 = time.time()
     for ti, age in enumerate(ages_i[truth_idx]):
@@ -799,21 +860,26 @@ def run_trajectory(
                                     np.abs(ages_i[src] - age), step_yr)
 
         obs = {}
-        for method, mode in TEMPORAL_METHODS.items():
+        for method, mode in labels.items():
             yv, r = apply_temporal_error(stale, sse, rho, resid, mode)
             obs[method] = (yv, tv.prepare_sweep(g, r, b_scales))
-        # Observations at the analysis age carry no staleness, so the ceiling reuses the
-        # uncorrected gain. Sharing the object is safe: a _SweepGain is never mutated.
-        obs[METHOD_CEILING] = (truth_anoms[ti].ravel()[g] + noise, obs[METHOD_BASE][1])
+        # Observations at the analysis age carry no staleness, so the ceiling assimilates
+        # them under the uncorrected R.
+        obs[ceiling] = (truth_anoms[ti].ravel()[g] + noise, tv.prepare_sweep(g, sse, b_scales))
 
         for method, (yv, gain) in obs.items():
             res = tv.apply_sweep(gain, yv, zero_bg)
             recon[method].append(np.stack([r.mean_anom for r in res]))
             if method in post:
-                post[method].append(tv.post_var_sweep(gain).reshape(n_b, *shape))
+                post[method].append(np.stack([r.posterior_var for r in res]))
+        # Which prior states the analysis drew on, where the estimator chooses them. The
+        # set turns over between neighbouring ages, which is a high-frequency source a
+        # fixed-covariance analysis does not have, so the band metrics need it alongside.
+        if hasattr(tv, "select"):
+            analog_index.append(tv.select(obs[base_label][1], obs[base_label][0]))
         naive_geom = _naive_geometry(lats, lons, geom, len(VARS))
         for kind in naive:
-            naive[kind].append(_naive_apply(kind, naive_geom, obs[METHOD_BASE][0], shape))
+            naive[kind].append(_naive_apply(kind, naive_geom, obs[base_label][0], shape))
         covered.append(ti)
         obs_n.append(len(g))
         if progress_every and (len(covered) % progress_every == 0):
@@ -834,7 +900,7 @@ def run_trajectory(
     for bj, kb in enumerate(b_scales):
         for method in recon:
             for split, sl in blocks:
-                base = {"method": method, "space": space, **reg_cols,
+                base = {"method": method, "space": space, **reg_cols, **method_cols,
                         "lane": LANE_TRAJECTORY, "fold": -1, "b_scale": kb,
                         "background": "climatological", "split": split}
                 events = np.zeros(len(truth_run[sl]), dtype=np.int64)
@@ -848,7 +914,7 @@ def run_trajectory(
                         kb * tv.diagB.reshape(shape), safe_valid, events, base)
     for kind, field in naive.items():
         for split, sl in blocks:
-            base = {"method": kind, "space": space, **_NAN_REG,
+            base = {"method": kind, "space": space, **_NAN_REG, **_NAN_ANALOG,
                     "lane": LANE_TRAJECTORY, "fold": -1, "b_scale": 1.0,
                     "background": "none", "split": split}
             events = np.zeros(len(truth_run[sl]), dtype=np.int64)
@@ -857,7 +923,8 @@ def run_trajectory(
             rows += _timescale_rows(truth_run[sl], field[sl], safe_valid, base,
                                     step_yr=step_yr, windows=lowpass_windows, bands=bands)
 
-    win = select_best_config(_selection_rrmse(rows, LANE_TRAJECTORY), sel_tol=sel_tol)
+    win = select_best_config(_selection_rrmse(rows, LANE_TRAJECTORY, base_label),
+                             sel_tol=sel_tol)
     bw = int(np.argmin(np.abs(np.asarray(b_scales) - win["b_scale"])))
     covered_ages = ages_i[truth_idx][covered]
     # Fields for the winner only, float32: the whole sweep over a 400-state run is two
@@ -868,18 +935,20 @@ def run_trajectory(
         "lats": lats, "lons": lons, "ages": covered_ages,
         "b_scales": np.asarray(b_scales), "selected_b_scale": np.asarray(b_scales[bw]),
         "split_index": np.asarray(mid), "step_yr": np.asarray(step_yr),
-        "recon_realistic": recon[METHOD_BASE][bw].astype(np.float32),
-        "recon_ceiling": recon[METHOD_CEILING][bw].astype(np.float32),
+        "recon_realistic": recon[base_label][bw].astype(np.float32),
+        "recon_ceiling": recon[ceiling][bw].astype(np.float32),
         "naive_nearest": naive["nearest"].astype(np.float32),
         "naive_idw": naive["idw"].astype(np.float32),
-        "post_var": post[METHOD_BASE][bw].astype(np.float32),
+        "post_var": post[base_label][bw].astype(np.float32),
         "prior_var": tv.diagB.reshape(shape),
         "obs_n": np.asarray(obs_n), "skipped_ages": np.asarray(skipped, dtype=np.int64),
     }
+    if analog_index:
+        npz_arrays["analog_index"] = np.stack(analog_index)
     # The corrected variants ride alongside under their own keys, at the same b_scale as
     # the baseline so a paired difference over ages is what a reader gets by subtracting.
-    for method in TEMPORAL_METHODS:
-        if method == METHOD_BASE:
+    for method in labels:
+        if method == base_label:
             continue
         npz_arrays[f"recon_{method}"] = recon[method][bw].astype(np.float32)
         npz_arrays[f"post_var_{method}"] = post[method][bw].astype(np.float32)
@@ -887,9 +956,9 @@ def run_trajectory(
         LANE_TRAJECTORY, space, prior, len(covered), n_shapes=None, n_select=None,
         n_noise=1, b_scales=b_scales, seed=seed, reg_cols=reg_cols,
         split_meta=_chronological_split_meta(ages_i, prior_idx, truth_idx, 1),
-        extra={"selected": win, "sel_tol": sel_tol,
+        extra={"selected": win, "sel_tol": sel_tol, "estimator": estimator,
                "selected_b_scale_by_method": _b_scale_by_method(rows, LANE_TRAJECTORY,
-                                                                sel_tol),
+                                                                sel_tol, tuple(labels)),
                "max_block_lag_steps": _max_block_lag(long, step_yr),
                "lowpass_windows": [int(w) for w in lowpass_windows],
                "bands": [[int(a), int(b)] for a, b in bands],
@@ -1000,7 +1069,7 @@ def _predict_targets(
     assim_sites: set, target_sites: set, b_scales: tuple[float, ...],
     n_b: int, n_cells: int, rep_lookup: np.ndarray,
     S: np.ndarray, prior_var_cell: np.ndarray, step_yr: float,
-    methods: tuple[str, ...],
+    labels: dict[str, str],
 ) -> _TargetPredictions:
     """Assimilate the assim-set sites age by age, predict the target-set sites.
 
@@ -1023,8 +1092,8 @@ def _predict_targets(
     """
     bg_zero = np.zeros(len(clim_flat))
     actual, channel, sse, prior_var, dist, rep, resid, site = [], [], [], [], [], [], [], []
-    pred = {m: [] for m in methods}
-    post_var = {m: [] for m in methods}
+    pred = {m: [] for m in labels}
+    post_var = {m: [] for m in labels}
     naive = {"nearest": [], "idw": []}
     for age in obs_ages:
         o = observations_at_age(long, int(age))
@@ -1041,10 +1110,11 @@ def _predict_targets(
         rho_k, resid_k = temporal_terms(S, prior_var_cell, gk, lag[kept], step_yr)
         rho_w, resid_w = temporal_terms(S, prior_var_cell, gw, lag[wkeep], step_yr)
 
-        for method in methods:
-            yv, r = apply_temporal_error(y_anom, r_kept, rho_k, resid_k,
-                                         TEMPORAL_METHODS[method])
-            res = tv.apply_sweep(tv.prepare_sweep(gk, r, b_scales), yv, bg_zero)
+        for method, mode in labels.items():
+            yv, r = apply_temporal_error(y_anom, r_kept, rho_k, resid_k, mode)
+            # The age reaches the estimator here because this lane's prior spans it, so an
+            # analog step could otherwise select the simulation's own state at the target.
+            res = tv.apply_sweep(tv.prepare_sweep(gk, r, b_scales, age=int(age)), yv, bg_zero)
             pred[method].append(
                 np.stack([rho_w * res[bj].predict_obs(gw) for bj in range(n_b)]))
             post_var[method].append(
@@ -1106,8 +1176,9 @@ def _score_withholding_lane(
     *, cube: np.ndarray, prior_age_indices: np.ndarray,
     make_method: MethodFactory | None, space: str, reg_cols: dict,
     k_folds: int, fold_kind: str, b_scales: tuple[float, ...], seed: int,
-    methods: tuple[str, ...] = tuple(TEMPORAL_METHODS),
+    temporal_modes: tuple[str, ...] = TEMPORAL_MODES,
     progress_every: int | None = None,
+    estimator: str = ESTIMATOR_3DVAR, method_cols: dict | None = None,
 ) -> tuple[str, list[dict], dict]:
     """Nested-CV site withholding for one built prior (no file writes).
 
@@ -1123,9 +1194,10 @@ def _score_withholding_lane(
     ``R = diag(sse + rep_var)`` before the temporal term, with the representativeness
     variance estimated per fold from the assimilated sites alone, so a withheld site never
     informs the update or the spread that scores it; the background is climatological.
-    ``methods`` chooses which treatments of observation staleness to score, so a grid scan
-    can spend its passes on the taper and leave the comparison between treatments to the
-    winner. ``space``/``reg_cols`` tag the rows.
+    ``temporal_modes`` chooses which treatments of observation staleness to score, so a
+    grid scan can spend its passes on the taper and leave the comparison between
+    treatments to the winner. ``space``/``reg_cols``/``estimator``/``method_cols`` tag the
+    rows.
 
     Alongside the skill rows each ``b_scale`` carries calibration scored against the
     proxy, whose own error and representativeness variance join the posterior spread since
@@ -1147,6 +1219,9 @@ def _score_withholding_lane(
     fold_sets = [set(f.tolist()) for f in _site_folds(long, k_folds, fold_kind, seed)]
     all_sites = set(long["site"].unique().tolist())
     lane = f"withholding_{fold_kind}"
+    method_cols = method_cols or _NAN_ANALOG
+    labels = {method_label(estimator, mode): mode for mode in temporal_modes}
+    base_label = next(iter(labels))
 
     # Each sample's own position on the age axis, and the structure function that says
     # what sitting away from it costs. The ages are the ones the background was built
@@ -1176,9 +1251,9 @@ def _score_withholding_lane(
         obs_var = tp.sse + tp.rep_var + tp.resid_var
         for method in tp.pred:
             for bj, kb in enumerate(b_scales):
-                base = {"method": method, "space": space, **reg_cols, "lane": lane,
-                        "fold": fold, "b_scale": kb, "background": "climatological",
-                        "split": split}
+                base = {"method": method, "space": space, **reg_cols, **method_cols,
+                        "lane": lane, "fold": fold, "b_scale": kb,
+                        "background": "climatological", "split": split}
                 out += _withholding_rows(tp.actual, tp.pred[method][bj], tp.channel, base)
                 out += _calibration_rows(tp.actual, tp.pred[method][bj],
                                          tp.post_var[method][bj] + obs_var,
@@ -1190,8 +1265,8 @@ def _score_withholding_lane(
         out = []
         for kind, pred in tp.naive.items():
             out += _withholding_rows(tp.actual, pred, tp.channel, {
-                "method": kind, "space": space, **_NAN_REG, "lane": lane, "fold": -1,
-                "b_scale": 1.0, "background": "none", "split": "test"})
+                "method": kind, "space": space, **_NAN_REG, **_NAN_ANALOG, "lane": lane,
+                "fold": -1, "b_scale": 1.0, "background": "none", "split": "test"})
         return out
 
     rows = []
@@ -1204,7 +1279,7 @@ def _score_withholding_lane(
         tp = _predict_targets(tv, long, obs_ages, lats, lons, safe_flat,
                               clim_flat, assim, fold_sets[(i + 1) % k_folds],
                               b_scales, n_b, n_cells, _rep_lookup(assim),
-                              S, prior_var_cell, step_yr, methods)
+                              S, prior_var_cell, step_yr, labels)
         if len(tp):
             sel.append(tp)
         if progress_every and (i + 1) % progress_every == 0:
@@ -1220,7 +1295,7 @@ def _score_withholding_lane(
         tp = _predict_targets(tv, long, obs_ages, lats, lons, safe_flat,
                               clim_flat, assim, fold_sets[i],
                               b_scales, n_b, n_cells, _rep_lookup(assim),
-                              S, prior_var_cell, step_yr, methods)
+                              S, prior_var_cell, step_yr, labels)
         if not len(tp):
             continue
         rows += _rows(tp, i, "test")
@@ -1235,15 +1310,15 @@ def _score_withholding_lane(
         rows += _naive_rows(tp)
         predictions.update({
             "actual": tp.actual, "channel": tp.channel, "site": tp.site,
-            "climatological_pred": tp.pred[METHOD_BASE],
-            "post_var_pred": tp.post_var[METHOD_BASE], "prior_var_pred": tp.prior_var,
+            "climatological_pred": tp.pred[base_label],
+            "post_var_pred": tp.post_var[base_label], "prior_var_pred": tp.prior_var,
             "sse": tp.sse, "distance_km": tp.distance_km, "rep_var": tp.rep_var,
             "resid_var": tp.resid_var,
             "naive_nearest": tp.naive["nearest"], "naive_idw": tp.naive["idw"]})
         # The corrected variants ride alongside under their own keys; the uncorrected one
         # keeps the bare names so anything reading the lane's predictions still finds it.
         for method in tp.pred:
-            if method == METHOD_BASE:
+            if method == base_label:
                 continue
             predictions[f"climatological_pred_{method}"] = tp.pred[method]
             predictions[f"post_var_pred_{method}"] = tp.post_var[method]
@@ -1284,6 +1359,8 @@ def run_withholding(
     k_folds: int = 5, fold_kind: str = "random",
     b_scales: tuple[float, ...] = B_SCALES, seed: int = 0,
     progress_every: int | None = None,
+    estimator: str = ESTIMATOR_3DVAR, method_cols: dict | None = None,
+    temporal_modes: tuple[str, ...] = TEMPORAL_MODES,
 ) -> pd.DataFrame:
     """Nested-CV site withholding for one taper config.
 
@@ -1302,7 +1379,8 @@ def run_withholding(
         prior, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
         make_method=make_method, space=space,
         reg_cols=reg_cols, k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales,
-        seed=seed, progress_every=progress_every)
+        seed=seed, progress_every=progress_every, estimator=estimator,
+        method_cols=method_cols, temporal_modes=temporal_modes)
     config = _withholding_config(lane, space, prior, k_folds, fold_kind, b_scales, seed,
                                  reg_cols, extra={"rep_var_full": _rep_var_full(predictions)})
     _write_withholding_artifacts(out_dir, lane, rows, predictions, config)
@@ -1342,6 +1420,22 @@ def select_best_config(sel_rows: pd.DataFrame, *, sel_tol: float = SEL_TOL) -> d
     }
 
 
+def select_analog_config(sel_rows: pd.DataFrame) -> dict:
+    """Winner ``{analog_k, hybrid_w, b_scale}`` on the selection split.
+
+    A plain argmin, unlike :func:`select_best_config`, whose tie-break prefers the config
+    closest to a raw sample covariance. Neither the ensemble size nor the hybrid weight has
+    a "simpler" end to lean toward: both bracket the static analysis, one at a full-pool
+    ensemble and the other at zero weight.
+    """
+    df = sel_rows.dropna(subset=["value"])
+    if df.empty:
+        raise ValueError("no finite selection-split RRMSE to select from")
+    win = df.loc[df["value"].idxmin()]
+    return {"analog_k": int(win["analog_k"]), "hybrid_w": float(win["hybrid_w"]),
+            "b_scale": float(win["b_scale"])}
+
+
 def _pixel_grid_configs(localization_grid, shrinkage_grid, alpha_grid):
     """The (localization_km, shrinkage_lambda, alpha) grid points, and a JSON-safe record."""
     configs = list(itertools.product(localization_grid, shrinkage_grid, alpha_grid))
@@ -1358,7 +1452,8 @@ def _selection_rrmse(rows: list[dict], lane: str, method: str = METHOD_BASE) -> 
              & (M.channel == "pooled") & (M.do_event == "all") & (M.metric == "rrmse")]
 
 
-def _b_scale_by_method(rows: list[dict], lane: str, sel_tol: float) -> dict[str, float]:
+def _b_scale_by_method(rows: list[dict], lane: str, sel_tol: float,
+                       methods: tuple[str, ...] = tuple(TEMPORAL_METHODS)) -> dict[str, float]:
     """Each temporal variant's own selection-split ``b_scale``.
 
     Inflating R shifts the background-to-observation balance the analysis wants, so a
@@ -1366,7 +1461,7 @@ def _b_scale_by_method(rows: list[dict], lane: str, sel_tol: float) -> dict[str,
     the uncorrected one's.
     """
     out = {}
-    for method in TEMPORAL_METHODS:
+    for method in methods:
         sel = _selection_rrmse(rows, lane, method)
         if len(sel):
             out[method] = float(select_best_config(sel, sel_tol=sel_tol)["b_scale"])
@@ -1464,7 +1559,7 @@ def run_withholding_pixel_grid(
             prior, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
             make_method=None, space="pixel",
             reg_cols=reg_cols, k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales,
-            seed=seed, methods=(METHOD_BASE,))
+            seed=seed, temporal_modes=(TEMPORAL_OFF,))
         # The grid answers a spatial question, so it runs the uncorrected method alone and
         # the winner pass adds the temporal comparison; the prior-free rows come from
         # there too, since they depend on neither the taper nor b_scale.
@@ -1489,4 +1584,211 @@ def run_withholding_pixel_grid(
                                                "rep_var_full": _rep_var_full(predictions),
                                                **grid_record})
     _write_withholding_artifacts(out_dir, lane, all_rows, predictions, config)
+    return pd.DataFrame(all_rows)
+
+
+# ---------------------------------------------------------------------------
+# Analog-ensemble tuning: (k, hybrid_w, b_scale) at an inherited taper.
+# ---------------------------------------------------------------------------
+def _analog_grid_configs(k_grid, hybrid_w_grid):
+    """The ``(k, hybrid_w)`` grid points, and a JSON-safe record of the axes."""
+    configs = list(itertools.product(k_grid, hybrid_w_grid))
+    record = {"k_grid": [int(k) for k in k_grid],
+              "hybrid_w_grid": [float(w) for w in hybrid_w_grid]}
+    return configs, record
+
+
+def run_hgaoenkf_ppe_grid(
+    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+    valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
+    localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
+    k_grid=K_GRID, hybrid_w_grid=HYBRID_W_GRID,
+    b_scales: tuple[float, ...] = B_SCALES,
+    n_shapes: int = 5, n_select: int = 4, n_noise: int = 20, truth_stride: int = 10,
+    dist_edges_km: np.ndarray | None = None, seed: int = 0,
+    progress_every: int | None = None,
+) -> pd.DataFrame:
+    """Same-model PPE tuned over the analog grid: full-grid metrics, winner-only fields.
+
+    The taper is an input rather than an axis. It answers a spatial question about the
+    static covariance that the pixel grid settles once, and holding it fixed is also what
+    keeps the comparison against 3DVar a comparison of estimators rather than of two
+    differently regularized covariances.
+    """
+    ages_i = np.asarray(ages, dtype=np.int64)
+    prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
+    prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
+                        localization_km=localization_km,
+                        shrinkage_lambda=shrinkage_lambda, alpha=alpha)
+    truth_cube = cube[truth_idx].astype(np.float64)
+    truth_clim = truth_cube.mean(axis=0)
+    truth_anoms = truth_cube - truth_clim
+    reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
+                "alpha": alpha}
+    label = method_label(ESTIMATOR_HGAOENKF)
+    configs, grid_record = _analog_grid_configs(k_grid, hybrid_w_grid)
+
+    def score(k, w, full_metrics, progress=None):
+        return _score_ppe_lane(
+            truth_anoms, prior, long, lats, lons,
+            lane=LANE_PPE, space="pixel", reg_cols=reg_cols,
+            make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=w),
+            estimator=ESTIMATOR_HGAOENKF, method_cols=analog_cols(k, w),
+            b_scales=b_scales, n_shapes=n_shapes, n_select=n_select, n_noise=n_noise,
+            dist_edges_km=dist_edges_km, seed=seed, full_metrics=full_metrics,
+            npz_extra={"truth_clim": truth_clim}, progress_every=progress)
+
+    all_rows: list[dict] = []
+    t0 = time.time()
+    for ci, (k, w) in enumerate(configs):
+        rows, _, _ = score(k, w, full_metrics=False)
+        all_rows += [r for r in rows if r["method"] == label]
+        _report_progress("analog-grid config", ci + 1, len(configs), t0)
+
+    win = select_analog_config(_selection_rrmse(all_rows, LANE_PPE, label))
+    win_rows, npz_arrays, skill = score(win["analog_k"], win["hybrid_w"],
+                                        full_metrics=True, progress=progress_every)
+    all_rows += [r for r in win_rows if r["method"] == label and r["metric"] in _FULL_METRICS]
+    all_rows += [r for r in win_rows if r["method"] != label]
+
+    config = _ppe_config(
+        LANE_PPE, "pixel", prior, len(truth_anoms), n_shapes, n_select, n_noise,
+        b_scales, seed, reg_cols,
+        _chronological_split_meta(ages_i, prior_idx, truth_idx, truth_stride),
+        extra={"estimator": ESTIMATOR_HGAOENKF, "selected": win, **grid_record})
+    _write_ppe_artifacts(out_dir, LANE_PPE, all_rows, npz_arrays, skill, config)
+    return pd.DataFrame(all_rows)
+
+
+def run_hgaoenkf_withholding_grid(
+    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+    valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
+    localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
+    k_grid=K_GRID, hybrid_w_grid=HYBRID_W_GRID, exclude_yr: float = EXCLUDE_YR,
+    temporal_mode: str = TEMPORAL_DEFLATE,
+    k_folds: int = 5, fold_kind: str = "random",
+    b_scales: tuple[float, ...] = B_SCALES, seed: int = 0,
+    progress_every: int | None = None,
+) -> pd.DataFrame:
+    """Withholding lane tuned over the analog grid: full-grid metrics, winner-only predictions.
+
+    This lane's prior spans every age including the one being reconstructed, so
+    ``exclude_yr`` drops a band around the target from the analog pool. Without it the
+    analog step can select the simulation's own state there, which both degenerates the
+    method into a per-age background and inherits whatever alignment the proxy chronology
+    was given against that simulation.
+
+    ``temporal_mode`` is fixed rather than swept: which treatment of observation staleness
+    to use is settled on the 3DVar lanes, and varying it here would confound the analog
+    parameters with it.
+    """
+    prior_idx = np.arange(len(ages))
+    prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
+                        localization_km=localization_km,
+                        shrinkage_lambda=shrinkage_lambda, alpha=alpha)
+    reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
+                "alpha": alpha}
+    label = method_label(ESTIMATOR_HGAOENKF, temporal_mode)
+    configs, grid_record = _analog_grid_configs(k_grid, hybrid_w_grid)
+
+    def score(k, w, progress=None):
+        return _score_withholding_lane(
+            prior, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
+            space="pixel", reg_cols=reg_cols,
+            make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=w,
+                                      exclude_yr=exclude_yr),
+            estimator=ESTIMATOR_HGAOENKF, method_cols=analog_cols(k, w),
+            temporal_modes=(temporal_mode,), k_folds=k_folds, fold_kind=fold_kind,
+            b_scales=b_scales, seed=seed, progress_every=progress)
+
+    all_rows: list[dict] = []
+    t0 = time.time()
+    for ci, (k, w) in enumerate(configs):
+        lane, rows, _ = score(k, w)
+        all_rows += [r for r in rows if r["method"] == label]
+        _report_progress(f"analog-grid config ({lane})", ci + 1, len(configs), t0)
+
+    win = select_analog_config(_selection_rrmse(all_rows, lane, label))
+    _, win_rows, predictions = score(win["analog_k"], win["hybrid_w"], progress=progress_every)
+    # The winner's own skill rows are already in from the grid pass at this same config;
+    # what the re-run adds is the prior-free references and the predictions npz.
+    all_rows += [r for r in win_rows if r["method"] != label]
+
+    config = _withholding_config(
+        lane, "pixel", prior, k_folds, fold_kind, b_scales, seed, reg_cols,
+        extra={"estimator": ESTIMATOR_HGAOENKF, "selected": win, "exclude_yr": exclude_yr,
+               "temporal_mode": temporal_mode, "rep_var_full": _rep_var_full(predictions),
+               **grid_record})
+    _write_withholding_artifacts(out_dir, lane, all_rows, predictions, config)
+    return pd.DataFrame(all_rows)
+
+
+def analog_variant_estimator(rule: str, exclude_yr: float) -> str:
+    """Estimator tag for one ablation of how the analog ensemble is chosen.
+
+    The selection rule and the exclusion width are modelling choices rather than tuned
+    parameters, so they name the estimator and compose into the method label the same way
+    a treatment of staleness does, instead of adding columns to the shared row schema.
+    """
+    return f"{ESTIMATOR_HGAOENKF}_{rule}_excl{int(exclude_yr)}"
+
+
+def run_hgaoenkf_withholding_variants(
+    cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+    valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
+    k: int, hybrid_w: float,
+    localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
+    misfit_exclude=EXCLUDE_YR_GRID, window_exclude=(0.0, EXCLUDE_YR),
+    temporal_mode: str = TEMPORAL_DEFLATE,
+    k_folds: int = 5, fold_kind: str = "random",
+    b_scales: tuple[float, ...] = B_SCALES, seed: int = 0,
+    progress_every: int | None = None,
+) -> pd.DataFrame:
+    """Score how the analog ensemble is chosen, at a fixed ``(k, hybrid_w)``.
+
+    Two axes, both left out of the tuning grid because neither is a knob to optimise.
+    Sweeping the exclusion width says how much of the skill comes from the analog step
+    being allowed to select the simulation's own neighbourhood of the target age. Swapping
+    the misfit rule for nearness in time gives the running-window prior of Osman et al.
+    (2021) and Erb et al. (2022), which separates whether what matters is the epoch or the
+    climate regime; it is meaningful only on a lane whose prior spans the target ages.
+
+    Rows land in their own directory under estimator-tagged method labels, so the
+    head-to-head comparison is not cluttered by variants that are not candidates for it.
+    """
+    prior_idx = np.arange(len(ages))
+    prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
+                        localization_km=localization_km,
+                        shrinkage_lambda=shrinkage_lambda, alpha=alpha)
+    reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
+                "alpha": alpha}
+    variants = ([(ANALOG_MISFIT, w) for w in misfit_exclude]
+                + [(ANALOG_WINDOW, w) for w in window_exclude])
+
+    all_rows: list[dict] = []
+    t0 = time.time()
+    for vi, (rule, exclude_yr) in enumerate(variants):
+        lane, rows, _ = _score_withholding_lane(
+            prior, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
+            space="pixel", reg_cols=reg_cols,
+            make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=hybrid_w,
+                                      selection=rule, exclude_yr=exclude_yr),
+            estimator=analog_variant_estimator(rule, exclude_yr),
+            method_cols=analog_cols(k, hybrid_w), temporal_modes=(temporal_mode,),
+            k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales, seed=seed)
+        # The prior-free references do not depend on any of this, and the grid pass has
+        # already written them.
+        all_rows += [r for r in rows if r["background"] != "none"]
+        _report_progress("analog variant", vi + 1, len(variants), t0)
+
+    os.makedirs(out_dir, exist_ok=True)
+    _append_csv(os.path.join(out_dir, "metrics.csv"), all_rows)
+    config = {"lane": lane, "space": "pixel", **reg_cols, "analog_k": int(k),
+              "hybrid_w": float(hybrid_w), "temporal_mode": temporal_mode,
+              "misfit_exclude_yr": [float(w) for w in misfit_exclude],
+              "window_exclude_yr": [float(w) for w in window_exclude],
+              "k_folds": k_folds, "fold_kind": fold_kind, "seed": seed,
+              "b_scales": [float(b) for b in b_scales], "prior_meta": prior.meta}
+    with open(os.path.join(out_dir, f"{lane}_variants_config.json"), "w") as fh:
+        json.dump(config, fh, indent=2)
     return pd.DataFrame(all_rows)

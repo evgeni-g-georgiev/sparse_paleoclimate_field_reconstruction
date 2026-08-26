@@ -14,7 +14,7 @@ import pandas as pd
 
 from paleoreco.assim import experiments as ex
 from paleoreco.assim.innovation import obs_cell_index
-from paleoreco.assim.observations import representativeness_variance
+from paleoreco.assim.observations import TEMPORAL_OFF, representativeness_variance
 from paleoreco.assim.priors import build_prior
 from paleoreco.data import VARS
 
@@ -149,7 +149,7 @@ def test_running_the_variants_changes_neither_the_baseline_nor_the_naive_rows(
               k_folds=3, fold_kind="random", b_scales=(0.5, 1.0), seed=0)
 
     _, base_rows, _ = ex._score_withholding_lane(
-        prior, obs_long, ages, lats, lons, methods=(ex.METHOD_BASE,), **kw)
+        prior, obs_long, ages, lats, lons, temporal_modes=(TEMPORAL_OFF,), **kw)
     _, all_rows, _ = ex._score_withholding_lane(
         prior, obs_long, ages, lats, lons, **kw)
 

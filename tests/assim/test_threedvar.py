@@ -87,3 +87,20 @@ def test_sweep_at_unit_scale_matches_plain_analysis(setup):
     assert np.allclose(sweep[unit].mean_anom, plain.mean_anom)
     assert np.allclose(post_var[unit], plain.posterior_var.ravel())
     assert np.allclose(sweep[unit].posterior_var.ravel(), plain.posterior_var.ravel())
+
+
+def test_result_posterior_var_matches_the_value_free_sweep(setup):
+    """The lanes read spread off the analyses rather than asking for it separately.
+
+    A fixed covariance makes the two identical, which is what keeps every stored 3DVar
+    result comparable with one produced by an estimator whose spread depends on the
+    observations and so has no value-free form.
+    """
+    shape, D, B, gather, sse, x_b, y = setup
+    tv = ThreeDVar(B, shape)
+    b_scales = np.array([0.25, 1.0, 5.0])
+    gain = tv.prepare_sweep(gather, sse, b_scales)
+    sweep = tv.apply_sweep(gain, y, x_b)
+    post_var = tv.post_var_sweep(gain)
+    for bj in range(len(b_scales)):
+        assert np.array_equal(sweep[bj].posterior_var.ravel(), post_var[bj])
