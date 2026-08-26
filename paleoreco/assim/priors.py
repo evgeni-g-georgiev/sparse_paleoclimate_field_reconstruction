@@ -189,6 +189,47 @@ def regularization_mask(
     return mask
 
 
+def taper_obs_blocks(
+    lats: np.ndarray, lons: np.ndarray, gather: np.ndarray, *,
+    localization_km: float | None, shrinkage_lambda: float, alpha: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """The ``[:, gather]`` and ``[gather, gather]`` blocks of :func:`regularization_mask`.
+
+    A covariance rebuilt per assimilation is only ever needed as ``P H^T`` and
+    ``H P H^T``, so tapering it needs those two blocks rather than the ``(D, D)``
+    mask; building the full mask per analysis costs about a second and 17 million
+    entries. Returns ``None`` when no taper is active, matching
+    :func:`regularization_mask`.
+    """
+    if localization_km is None and shrinkage_lambda == 0.0 and alpha == 1.0:
+        return None
+    n_lat, n_lon = len(lats), len(lons)
+    n_cells = n_lat * n_lon
+    g = np.asarray(gather, dtype=np.int64)
+    obs_cell, obs_chan = g % n_cells, g // n_cells
+
+    block = None
+    if localization_km is not None:
+        lat_cell = np.repeat(lats, n_lon)
+        lon_cell = np.tile(lons, n_lat)
+        dist = great_circle_km_between(lat_cell, lon_cell,
+                                       np.asarray(lats)[obs_cell // n_lon],
+                                       np.asarray(lons)[obs_cell % n_lon])
+        # Every column of the full localization taper repeats its spatial block across
+        # both channels, so an observation's column is the same whichever channel it is in.
+        spatial = gaspari_cohn(dist, localization_km)
+        block = np.vstack([spatial, spatial])
+    if alpha != 1.0:
+        state_chan = np.arange(2 * n_cells) // n_cells
+        c = np.where(state_chan[:, None] == obs_chan[None, :], 1.0, alpha)
+        block = c if block is None else block * c
+    if shrinkage_lambda != 0.0:
+        s = np.full((2 * n_cells, len(g)), 1.0 - shrinkage_lambda)
+        s[g, np.arange(len(g))] = 1.0
+        block = s if block is None else block * s
+    return block, block[g]
+
+
 # ---------------------------------------------------------------------------
 # Persistence.
 # ---------------------------------------------------------------------------

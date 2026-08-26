@@ -13,6 +13,7 @@ from paleoreco.assim.priors import (
     localization_taper,
     regularization_mask,
     shrinkage_taper,
+    taper_obs_blocks,
 )
 
 _R = 6371.0
@@ -124,3 +125,36 @@ def test_build_prior_alpha_zero_decouples_channels():
     assert np.allclose(prior.B[n:, :n], 0.0)
     assert np.allclose(prior.B, prior.B.T)               # stays symmetric
     assert np.linalg.eigvalsh(prior.B).min() > -1e-6     # stays PSD
+
+
+@pytest.mark.parametrize("taper", [
+    dict(localization_km=9000.0, shrinkage_lambda=0.0, alpha=1.0),
+    dict(localization_km=None, shrinkage_lambda=0.4, alpha=1.0),
+    dict(localization_km=None, shrinkage_lambda=0.0, alpha=0.25),
+    dict(localization_km=9000.0, shrinkage_lambda=0.4, alpha=0.25),
+])
+def test_taper_obs_blocks_match_the_full_mask(taper):
+    """The reduced blocks must equal the corresponding slices of the (D, D) mask.
+
+    They are what a per-analysis covariance is tapered with, so any drift between the
+    two regularizes the analog and static covariances differently and silently.
+    """
+    lats = np.linspace(-60, 60, 4).astype(np.float32)
+    lons = np.linspace(-180, 120, 5).astype(np.float32)
+    # Two observations in one cell and a cross-channel pair, so the shrinkage diagonal
+    # and the coupling block are both exercised on repeated indices.
+    gather = np.array([0, 7, 7, 20 + 3, 20 + 7])
+
+    full = regularization_mask(lats, lons, **taper)
+    blocks = taper_obs_blocks(lats, lons, gather, **taper)
+    assert blocks is not None
+    t_dm, t_mm = blocks
+    assert np.allclose(t_dm, full[:, gather])
+    assert np.allclose(t_mm, full[np.ix_(gather, gather)])
+
+
+def test_taper_obs_blocks_none_when_no_taper_active():
+    lats = np.linspace(-60, 60, 4).astype(np.float32)
+    lons = np.linspace(-180, 120, 5).astype(np.float32)
+    assert taper_obs_blocks(lats, lons, np.array([0, 3]), localization_km=None,
+                            shrinkage_lambda=0.0, alpha=1.0) is None
