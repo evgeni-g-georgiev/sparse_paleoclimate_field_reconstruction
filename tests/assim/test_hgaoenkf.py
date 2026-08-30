@@ -1,9 +1,10 @@
 """Tests for the hybrid gain analog offline EnKF (paleoreco.assim.hgaoenkf).
 
-Two algebraic identities carry most of the weight, because both say the blend is wired up
+Three algebraic identities carry most of the weight, because each says a piece is wired up
 rather than merely running: ``hybrid_w = 0`` must reproduce the static-covariance analysis,
-and an analog ensemble as large as the pool must do the same whatever the weight, since
-then the analog covariance is the static one and the analog mean is zero.
+an analog ensemble as large as the pool must do the same whatever the weight and whatever
+the selection rule, and the evidence rule at zero background scale must reproduce the
+misfit rule exactly.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from paleoreco.assim.analog import ANALOG_WINDOW
+from paleoreco.assim.analog import ANALOG_EVIDENCE, ANALOG_MISFIT, ANALOG_WINDOW
 from paleoreco.assim.background import background_covariance
 from paleoreco.assim.hgaoenkf import HGAOEnKF, make_hgaoenkf
 from paleoreco.assim.method import Observations
@@ -75,13 +76,14 @@ def test_hybrid_w_zero_reproduces_the_static_analysis(setup):
 
 
 @pytest.mark.parametrize("hybrid_w", [0.0, 0.5, 1.0])
-def test_full_pool_ensemble_reproduces_the_static_analysis(setup, hybrid_w):
+@pytest.mark.parametrize("selection", [ANALOG_MISFIT, ANALOG_EVIDENCE])
+def test_full_pool_ensemble_reproduces_the_static_analysis(setup, hybrid_w, selection):
     """Sun et al.'s N = M identity: with every state selected there is no analog left.
 
     The re-centred pool covariance is exactly the covariance B was built from, and the
-    analog mean is zero, so the weight cannot matter.
+    analog mean is zero, so neither the weight nor the rule that ordered the pool matters.
     """
-    m = _build(setup, k=N_POOL, hybrid_w=hybrid_w)
+    m = _build(setup, k=N_POOL, hybrid_w=hybrid_w, selection=selection)
     gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
     got = m.apply_sweep(gain, setup["y"], np.zeros(setup["D"]))
     for res, expected in zip(got, _static_means(setup)):
@@ -157,6 +159,35 @@ def test_exclusion_band_needs_an_age_and_is_applied(setup):
     assert np.all(np.abs(setup["ages"][m.select(gain, setup["y"])] - age) >= 500.0)
 
 
+def test_evidence_at_zero_scale_is_the_misfit_estimator(setup):
+    """End-to-end form of the analog-level identity, and the regression guard for the rule.
+
+    Bit equality rather than a tolerance: the two paths must select the same members and
+    then run the same arithmetic, so any drift in either is a real change.
+    """
+    misfit = _build(setup, selection=ANALOG_MISFIT)
+    evidence = _build(setup, selection=ANALOG_EVIDENCE, evidence_scale=0.0)
+    zero = np.zeros(setup["D"])
+    for m in (misfit, evidence):
+        m.gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+    assert np.array_equal(misfit.select(misfit.gain, setup["y"]),
+                          evidence.select(evidence.gain, setup["y"]))
+    for a, b in zip(misfit.apply_sweep(misfit.gain, setup["y"], zero),
+                    evidence.apply_sweep(evidence.gain, setup["y"], zero)):
+        assert np.array_equal(a.mean_anom, b.mean_anom)
+        assert np.array_equal(a.posterior_var, b.posterior_var)
+
+
+def test_evidence_selection_moves_the_ensemble_at_the_default_scale(setup):
+    """A nonzero background scale must change which states are chosen."""
+    misfit = _build(setup, selection=ANALOG_MISFIT)
+    evidence = _build(setup, selection=ANALOG_EVIDENCE)
+    gain_m = misfit.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+    gain_e = evidence.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+    assert not np.array_equal(misfit.select(gain_m, setup["y"]),
+                              evidence.select(gain_e, setup["y"]))
+
+
 def test_window_selection_ignores_the_observations(setup):
     m = _build(setup, selection=ANALOG_WINDOW)
     age = float(setup["ages"][N_POOL // 2])
@@ -179,10 +210,12 @@ def test_factory_pool_matches_the_prior_it_is_built_from(cube, ages, lats, lons,
     shape = (2, len(lats), len(lons))
     prior_idx = np.arange(0, len(ages), 2)
     prior = build_prior(cube, ages, lats, lons, prior_idx, valid, localization_km=9000.0)
-    m = make_hgaoenkf(cube, ages, lats, lons, k=4, hybrid_w=0.5)(prior, shape)
+    m = make_hgaoenkf(cube, ages, lats, lons, k=4, hybrid_w=0.5,
+                      selection=ANALOG_EVIDENCE, evidence_scale=2.5)(prior, shape)
     assert m.pool.shape == (len(prior_idx), int(np.prod(shape)))
     assert np.array_equal(m.pool_ages, np.asarray(ages)[prior_idx])
     assert m.taper_meta["localization_km"] == 9000.0
+    assert m.selection == ANALOG_EVIDENCE and m.evidence_scale == 2.5
 
 
 def test_factory_rejects_invalid_arguments(cube, ages, lats, lons, valid):
@@ -194,3 +227,6 @@ def test_factory_rejects_invalid_arguments(cube, ages, lats, lons, valid):
         make_hgaoenkf(cube, ages, lats, lons, k=4, hybrid_w=1.5)(prior, shape)
     with pytest.raises(ValueError, match="unknown selection"):
         make_hgaoenkf(cube, ages, lats, lons, k=4, hybrid_w=0.5, selection="nope")(prior, shape)
+    with pytest.raises(ValueError, match="evidence_scale"):
+        make_hgaoenkf(cube, ages, lats, lons, k=4, hybrid_w=0.5,
+                      evidence_scale=-1.0)(prior, shape)

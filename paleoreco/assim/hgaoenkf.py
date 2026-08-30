@@ -10,9 +10,11 @@ update and Eq. 5 the deviation update, both of which this implements.
 
 Two departures from the paper, each measured rather than assumed:
 
-* candidates are ranked by R-weighted misfit rather than by the spatial-pattern
-  correlation of Eq. 3, so a corrected observation pair is scored the way the update
-  consumes it (see :mod:`paleoreco.assim.analog`);
+* how candidates are ranked is a choice rather than Eq. 3's spatial-pattern correlation.
+  The misfit rule scores the R-weighted residual, so a corrected observation pair is scored
+  the way the update consumes it; the evidence rule scores the candidate's marginal
+  likelihood under the same background covariance the update uses, and reduces to the
+  misfit rule at ``evidence_scale = 0`` (see :mod:`paleoreco.assim.analog`);
 * the prior mean is ``hybrid_w`` times the analog mean rather than the analog mean itself,
   which makes ``hybrid_w = 0`` reduce exactly to the static-covariance analysis rather than
   to Sun et al.'s AOEnKF-B.
@@ -37,11 +39,14 @@ from dataclasses import dataclass
 import numpy as np
 
 from paleoreco.assim.analog import (
+    ANALOG_EVIDENCE,
     ANALOG_MISFIT,
     ANALOG_RULES,
     ANALOG_WINDOW,
+    EVIDENCE_SCALE,
     analog_indices,
     eligible_mask,
+    evidence_indices,
     window_indices,
 )
 from paleoreco.assim.ensrf import WhitenedBlock, mean_gain_apply, sqrt_gain_apply, whitened_block
@@ -56,7 +61,8 @@ class _HybridSweepGain:
     The static block factorizes once here, as it does for 3DVar. The analog block cannot:
     it depends on which states the observations select, so it is built in
     :meth:`HGAOEnKF.apply_sweep`. What can be prepared is everything selection needs
-    (``pool_at_obs``, ``eligible``) and the reduced taper the analog blocks are masked with.
+    (``pool_at_obs``, ``eligible``, and ``static`` for the evidence rule) and the reduced
+    taper the analog blocks are masked with.
     """
 
     gather: np.ndarray
@@ -75,19 +81,23 @@ class HGAOEnKF(Method):
     ``pool`` is the archive of candidate states as anomalies about the same mean ``B`` was
     built from, ``(n_pool, D)``; ``k`` members are drawn from it per assimilation.
     ``exclude_yr`` drops candidates within that many years of the age being reconstructed,
-    which matters only where the archive spans that age.
+    which matters only where the archive spans that age. ``evidence_scale`` is the
+    background amplitude the evidence rule scores against and is unused by the others.
     """
 
     def __init__(self, pool: np.ndarray, pool_ages: np.ndarray, B: np.ndarray,
                  shape: tuple[int, int, int], lats: np.ndarray, lons: np.ndarray, *,
                  k: int, hybrid_w: float, taper_meta: dict,
-                 selection: str = ANALOG_MISFIT, exclude_yr: float = 0.0):
+                 selection: str = ANALOG_MISFIT, exclude_yr: float = 0.0,
+                 evidence_scale: float = EVIDENCE_SCALE):
         if selection not in ANALOG_RULES:
             raise ValueError(f"unknown selection rule {selection!r}; expected one of {ANALOG_RULES}")
         if k < 2:
             raise ValueError(f"an analog ensemble needs at least 2 members; got {k}")
         if not 0.0 <= hybrid_w <= 1.0:
             raise ValueError(f"hybrid_w must lie in [0, 1]; got {hybrid_w}")
+        if evidence_scale < 0.0:
+            raise ValueError(f"evidence_scale must be non-negative; got {evidence_scale}")
         self.pool = np.asarray(pool, dtype=np.float64)
         self.pool_ages = np.asarray(pool_ages, dtype=np.float64)
         self.B = np.asfortranarray(B, dtype=np.float64)
@@ -98,6 +108,7 @@ class HGAOEnKF(Method):
         self.hybrid_w = float(hybrid_w)
         self.selection = selection
         self.exclude_yr = float(exclude_yr)
+        self.evidence_scale = float(evidence_scale)
         self.taper_meta = {key: taper_meta[key]
                            for key in ("localization_km", "shrinkage_lambda", "alpha")}
 
@@ -129,6 +140,11 @@ class HGAOEnKF(Method):
         """
         if self.selection == ANALOG_WINDOW:
             return window_indices(self.pool_ages, gain.age, self.k, eligible=gain.eligible)
+        if self.selection == ANALOG_EVIDENCE:
+            # The static block is already factorized for the gain, so the marginal
+            # likelihood costs one product over the pool rather than a second solve.
+            return evidence_indices(gain.pool_at_obs, y_anom, gain.static, self.k,
+                                    eligible=gain.eligible, scale=self.evidence_scale)
         return analog_indices(gain.pool_at_obs, y_anom, gain.r_diag, self.k,
                               eligible=gain.eligible)
 
@@ -175,6 +191,7 @@ class HGAOEnKF(Method):
 def make_hgaoenkf(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray, *,
     k: int, hybrid_w: float, selection: str = ANALOG_MISFIT, exclude_yr: float = 0.0,
+    evidence_scale: float = EVIDENCE_SCALE,
 ):
     """A method factory building :class:`HGAOEnKF` from a built prior.
 
@@ -191,6 +208,7 @@ def make_hgaoenkf(
         pool = cube[idx].reshape(len(idx), -1).astype(np.float64) - prior.clim_mean.ravel()
         return HGAOEnKF(pool, prior.ages, prior.B, shape, lats, lons,
                         k=k, hybrid_w=hybrid_w, taper_meta=prior.meta,
-                        selection=selection, exclude_yr=exclude_yr)
+                        selection=selection, exclude_yr=exclude_yr,
+                        evidence_scale=evidence_scale)
 
     return factory
