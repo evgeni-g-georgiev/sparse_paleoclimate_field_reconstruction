@@ -8,21 +8,25 @@ covariance through a hybrid gain (Penny 2014; Lei et al. 2021): one prior mean, 
 innovation, two gains summed at weight ``hybrid_w``. Sun et al. Eq. 4 gives the mean
 update and Eq. 5 the deviation update, both of which this implements.
 
-Two departures from the paper, each measured rather than assumed:
+``hybrid_w`` is Sun et al.'s hybrid weight alpha: at 0 the analysis is their AOEnKF-B, the
+analog mean updated by the static covariance alone; at 1 their AOEnKF, updated by the analog
+covariance alone. The prior mean is the analog mean at every weight.
 
-* how candidates are ranked is a choice rather than Eq. 3's spatial-pattern correlation.
-  The misfit rule scores the R-weighted residual, so a corrected observation pair is scored
-  the way the update consumes it; the evidence rule scores the candidate's marginal
-  likelihood under the same background covariance the update uses, and reduces to the
-  misfit rule at ``evidence_scale = 0`` (see :mod:`paleoreco.assim.analog`);
-* the prior mean is ``hybrid_w`` times the analog mean rather than the analog mean itself,
-  which makes ``hybrid_w = 0`` reduce exactly to the static-covariance analysis rather than
-  to Sun et al.'s AOEnKF-B.
+One departure from the paper, measured rather than assumed: how candidates are ranked.
+Sun et al. (2024) Eq. 3 rank by spatial-pattern correlation, while the misfit rule here
+scores the R-weighted residual, which is Sun et al. (2025) Eq. 12 up to a monotone
+transform, so a corrected observation pair is scored the way the update consumes it. The
+evidence rule scores the candidate's marginal likelihood under the same background
+covariance the update uses, and reduces to the misfit rule at ``evidence_scale = 0`` (see
+:mod:`paleoreco.assim.analog`).
 
 The state and observation conventions are pixel 3DVar's: anomaly space throughout, H is
 nearest-cell selection, and the returned :class:`AnalysisResult` is pixel-space. Both
-covariances carry the same Schur taper, taken from the prior that built the static one, so
-the blend never compares differently regularized objects.
+covariances carry one Schur taper, taken from the prior that built the static one. Sun et al.
+tune the flow-dependent lengthscale tighter as the ensemble shrinks; on a prior whose
+variance is dominated by two global modes, tightening it degrades skill monotonically, so the
+long-range correlations localization would suppress carry the signal rather than sampling
+noise.
 
 One property of Eq. 5 is worth knowing when reading the posterior spread: the deviations
 start from the analog ensemble alone but are reduced by a gain that is part static, so the
@@ -169,7 +173,7 @@ class HGAOEnKF(Method):
         analog = whitened_block(P_obs, S_obs, gain.r_diag)
 
         w = self.hybrid_w
-        x_b = np.asarray(background_anom, dtype=np.float64).ravel() + w * mu
+        x_b = np.asarray(background_anom, dtype=np.float64).ravel() + mu
         d = np.asarray(y_anom, dtype=np.float64) - x_b[g]
 
         out = []

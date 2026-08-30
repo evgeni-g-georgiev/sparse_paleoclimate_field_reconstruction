@@ -1,10 +1,10 @@
 """Tests for the hybrid gain analog offline EnKF (paleoreco.assim.hgaoenkf).
 
 Three algebraic identities carry most of the weight, because each says a piece is wired up
-rather than merely running: ``hybrid_w = 0`` must reproduce the static-covariance analysis,
-an analog ensemble as large as the pool must do the same whatever the weight and whatever
-the selection rule, and the evidence rule at zero background scale must reproduce the
-misfit rule exactly.
+rather than merely running: ``hybrid_w = 0`` must reproduce Sun et al.'s AOEnKF-B, an analog
+ensemble as large as the pool must reproduce the static analysis whatever the weight and
+whatever the selection rule, and the evidence rule at zero background scale must reproduce
+the misfit rule exactly.
 """
 
 from __future__ import annotations
@@ -55,23 +55,26 @@ def _build(setup, **kw):
                     setup["lats"], setup["lons"], taper_meta=setup["taper"], **kw)
 
 
-def _static_means(setup):
+def _static_means(setup, background=None):
+    """Mean analyses from the static covariance alone, over the ``b_scale`` sweep."""
     tv = ThreeDVar(setup["B"], setup["shape"])
     gain = tv.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
-    zero = np.zeros(setup["D"])
-    return [res.mean_anom for res in tv.apply_sweep(gain, setup["y"], zero)]
+    bg = np.zeros(setup["D"]) if background is None else background
+    return [res.mean_anom for res in tv.apply_sweep(gain, setup["y"], bg)]
 
 
-def test_hybrid_w_zero_reproduces_the_static_analysis(setup):
-    """The cheapest proof the blend is wired up: at weight zero the analog side vanishes.
+def test_hybrid_w_zero_is_aoenkf_b(setup):
+    """At weight zero the gain is purely static, but the prior mean is still the analog one.
 
-    Only the mean is asserted. The posterior variance legitimately differs: 3DVar's is the
-    full-rank analytic diagonal, this one is the sample spread of k updated members.
+    That is Sun et al.'s AOEnKF-B, the corner of the family the hybrid weight interpolates
+    from. Only the mean is asserted: 3DVar's posterior variance is the full-rank analytic
+    diagonal, this one is the sample spread of k updated members.
     """
     m = _build(setup, hybrid_w=0.0)
     gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+    mu = m.pool[m.select(gain, setup["y"])].mean(axis=0)
     got = m.apply_sweep(gain, setup["y"], np.zeros(setup["D"]))
-    for res, expected in zip(got, _static_means(setup)):
+    for res, expected in zip(got, _static_means(setup, mu)):
         assert np.allclose(res.mean_anom, expected, atol=1e-10)
 
 
