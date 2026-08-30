@@ -112,9 +112,11 @@ SHRINKAGE_GRID = (0.0, 0.25, 0.5)
 ALPHA_GRID = (0.0, 0.5, 1.0)
 SEL_TOL = 0.0   # 0 = pure argmin of selection RRMSE; >0 prefers the simpler config within this relative band
 # Analog-ensemble tuning grid: how many prior states form the ensemble, and how much of
-# the gain their covariance carries against the static one.
+# the gain their covariance carries against the static one. The weight spans Sun et al.'s
+# whole family, from their AOEnKF-B at 0 to their AOEnKF at 1, so the published ablation
+# ladder falls out of the sweep rather than needing separate runs.
 K_GRID = (20, 40, 60, 100)
-HYBRID_W_GRID = (0.25, 0.5, 0.75)
+HYBRID_W_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 # Width of the band around the analysis age dropped from the analog pool, and the widths
 # a sensitivity pass sweeps. Only bites where the prior spans the age being reconstructed.
 EXCLUDE_YR = 1000.0
