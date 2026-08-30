@@ -7,12 +7,16 @@ only place the prior sees the data, and it is what makes the resulting covarianc
 flow-dependent.
 
 Three rules live here. The misfit rule ranks candidates by R-weighted squared distance to
-the observations, which is the likelihood of a candidate being the truth. Sun et al. (2024)
-Eq. 3 rank by spatial-pattern correlation and Wu et al. (2025) Eq. 5 by plain RMSE;
-weighting by R is what lets a network of unequally trusted sites contribute in proportion
-to what it knows, and it is what makes the score consistent with a corrected observation
-pair, where dividing the observation by its attenuation and inflating R by its square
-leaves the comparison between the raw observation and the attenuated candidate.
+the observations, which is the likelihood of a candidate being the truth. The same lineage
+ranks three ways: Sun et al. (2024) Eq. 3 by spatial-pattern correlation, Wu et al. (2025)
+Eq. 5 by plain RMSE, and Sun et al. (2025) Eq. 12 by RMSE normalised by the observation
+error variance, which is this rule up to a monotone transform. Weighting by R is what lets a
+network of unequally trusted sites contribute in proportion to what it knows, and it is what
+makes the score consistent with a corrected observation pair, where dividing the observation
+by its attenuation and inflating R by its square leaves the comparison between the raw
+observation and the attenuated candidate. Eq. 3 differs in kind rather than in weighting: it
+removes the spatial mean and normalises amplitude, so it is blind to a uniform offset that
+the misfit rule reads.
 
 The evidence rule ranks by the candidate's marginal likelihood ``N(y; H x_j, c H B H^T +
 R)`` instead. A candidate is not the truth but the centre of a background with covariance
