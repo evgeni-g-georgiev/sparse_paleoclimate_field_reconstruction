@@ -6,19 +6,27 @@ reconstructed rather than the average of the whole run (Sun et al. 2022). Select
 only place the prior sees the data, and it is what makes the resulting covariance
 flow-dependent.
 
-Two rules live here. The misfit rule ranks candidates by R-weighted squared distance to
-the observations, which is their negative log-likelihood up to a constant. Sun et al.
-(2024) Eq. 3 rank by spatial-pattern correlation and Wu et al. (2025) Eq. 5 by plain RMSE;
+Three rules live here. The misfit rule ranks candidates by R-weighted squared distance to
+the observations, which is the likelihood of a candidate being the truth. Sun et al. (2024)
+Eq. 3 rank by spatial-pattern correlation and Wu et al. (2025) Eq. 5 by plain RMSE;
 weighting by R is what lets a network of unequally trusted sites contribute in proportion
 to what it knows, and it is what makes the score consistent with a corrected observation
 pair, where dividing the observation by its attenuation and inflating R by its square
 leaves the comparison between the raw observation and the attenuated candidate.
 
-The window rule ranks by nearness in time instead, which is how a running-window prior is
-built (Osman et al. 2021; Erb et al. 2022). Window against misfit separates whether what
-matters is the epoch or the climate regime.
+The evidence rule ranks by the candidate's marginal likelihood ``N(y; H x_j, c H B H^T +
+R)`` instead. A candidate is not the truth but the centre of a background with covariance
+B, so the update that consumes the ensemble already carries that spread; measuring the
+residual against R alone is the ``c = 0`` limit of the same score, which the misfit rule
+reproduces exactly. Whitening by the prior predictive puts every direction on the scale the
+prior says is normal for it and discounts observations the prior holds to be redundant with
+each other.
 
-Both rules are deterministic to the tie, so an estimator built on them consumes no random
+The window rule ranks by nearness in time instead, which is how a running-window prior is
+built (Osman et al. 2021; Erb et al. 2022). Window against the two data-driven rules
+separates whether what matters is the epoch or the climate regime.
+
+Every rule is deterministic to the tie, so an estimator built on them consumes no random
 numbers and repeats exactly.
 """
 
@@ -26,10 +34,16 @@ from __future__ import annotations
 
 import numpy as np
 
+from paleoreco.assim.ensrf import WhitenedBlock
+
 # How the k members of an analog ensemble are chosen.
 ANALOG_MISFIT = "misfit"
 ANALOG_WINDOW = "window"
-ANALOG_RULES = (ANALOG_MISFIT, ANALOG_WINDOW)
+ANALOG_EVIDENCE = "evidence"
+ANALOG_RULES = (ANALOG_MISFIT, ANALOG_WINDOW, ANALOG_EVIDENCE)
+# Amplitude of the background covariance in the evidence metric. Zero recovers the misfit
+# rule, so this states which error model selection assumes rather than tuning a knob.
+EVIDENCE_SCALE = 1.0
 
 
 def eligible_mask(pool_ages: np.ndarray, age: float, exclude_yr: float) -> np.ndarray | None:
@@ -77,6 +91,24 @@ def analog_indices(
     r = np.asarray(r_diag, dtype=np.float64)
     misfit = (((y[None, :] - np.asarray(pool_at_obs, dtype=np.float64)) ** 2) / r[None, :]).sum(axis=1)
     return _rank(misfit, k, eligible)
+
+
+def evidence_indices(
+    pool_at_obs: np.ndarray, y_anom: np.ndarray, whitened: WhitenedBlock, k: int, *,
+    eligible: np.ndarray | None = None, scale: float = EVIDENCE_SCALE,
+) -> np.ndarray:
+    """Indices of the ``k`` prior states whose marginal likelihood best explains ``y_anom``.
+
+    ``whitened`` factorizes the static covariance against this network, so the score is
+    ``d^T (scale H B H^T + R)^-1 d`` without a second decomposition; R enters through
+    ``rinv_sqrt``, which is why no separate ``r_diag`` is taken. The log-determinant is the
+    same for every candidate, so the Mahalanobis term alone orders them.
+    """
+    y = np.asarray(y_anom, dtype=np.float64)
+    d = y[None, :] - np.asarray(pool_at_obs, dtype=np.float64)          # (n_pool, m)
+    q = (d * whitened.rinv_sqrt[None, :]) @ whitened.U
+    chi = (q ** 2 / (float(scale) * whitened.Lam + 1.0)[None, :]).sum(axis=1)
+    return _rank(chi, k, eligible)
 
 
 def window_indices(
