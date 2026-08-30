@@ -141,13 +141,15 @@ def test_variants_lane_labels_every_ablation_distinctly(
     df = ex.run_hgaoenkf_withholding_variants(
         cube, ages, lats, lons, valid, _varying_obs(obs_long), str(tmp_path),
         k=K, hybrid_w=W, misfit_exclude=(0.0, 600.0), window_exclude=(0.0, 600.0),
-        k_folds=3, b_scales=B_SCALES, seed=0)
+        evidence_exclude=(0.0, 600.0), k_folds=3, b_scales=B_SCALES, seed=0)
 
     assert set(df["method"]) == {
         "hgaoenkf_misfit_excl0_temporal_deflate",
         "hgaoenkf_misfit_excl600_temporal_deflate",
         "hgaoenkf_window_excl0_temporal_deflate",
         "hgaoenkf_window_excl600_temporal_deflate",
+        "hgaoenkf_evidence_excl0_temporal_deflate",
+        "hgaoenkf_evidence_excl600_temporal_deflate",
     }
     # The window rule ignores the observations, so banding it must still change the result.
     def ce(method):

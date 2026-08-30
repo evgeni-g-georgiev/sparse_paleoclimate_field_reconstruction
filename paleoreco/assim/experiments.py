@@ -19,7 +19,9 @@ coarse localization/shrinkage/coupling grid, jointly selecting the operating poi
 ``b_scale`` on the held-out selection split and persisting only the winning config's
 fields. :func:`run_hgaoenkf_ppe_grid` and :func:`run_hgaoenkf_withholding_grid` do the
 same over the analog ensemble size and hybrid weight, at a taper those grids already
-settled, and :func:`run_hgaoenkf_withholding_variants` scores how the ensemble is chosen.
+settled and under one analog selection rule, which names the estimator through
+:func:`hgaoenkf_estimator`; :func:`run_hgaoenkf_withholding_variants` scores how the
+ensemble is chosen.
 
 A row's ``method`` composes the estimator with its treatment of observation staleness
 (:func:`method_label`), so several estimators share one schema without colliding and every
@@ -84,7 +86,12 @@ from paleoreco.assim.observations import (
     sample_block_centres,
     temporal_terms,
 )
-from paleoreco.assim.analog import ANALOG_MISFIT, ANALOG_WINDOW
+from paleoreco.assim.analog import (
+    ANALOG_EVIDENCE,
+    ANALOG_MISFIT,
+    ANALOG_WINDOW,
+    EVIDENCE_SCALE,
+)
 from paleoreco.assim.hgaoenkf import make_hgaoenkf
 from paleoreco.assim.innovation import nearest_age_index, obs_cell_index
 from paleoreco.assim.priors import Prior, build_prior, great_circle_km_between
@@ -127,6 +134,16 @@ _TEMPORAL_SUFFIX = {TEMPORAL_OFF: "", TEMPORAL_ADD: "_temporal_add",
 def method_label(estimator: str, mode: str = TEMPORAL_OFF) -> str:
     """The metrics-CSV ``method`` for one (estimator, staleness treatment) pair."""
     return f"{estimator}{_TEMPORAL_SUFFIX[mode]}"
+
+
+def hgaoenkf_estimator(selection: str) -> str:
+    """Estimator tag for one analog selection rule; the misfit rule keeps the bare name.
+
+    Holding ``misfit`` at the unqualified name is what keeps a run made before the other
+    rules existed comparable to one made after, row for row.
+    """
+    return (ESTIMATOR_HGAOENKF if selection == ANALOG_MISFIT
+            else f"{ESTIMATOR_HGAOENKF}_{selection}")
 
 
 def ceiling_label(estimator: str) -> str:
@@ -1603,6 +1620,7 @@ def run_hgaoenkf_ppe_grid(
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
     localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
     k_grid=K_GRID, hybrid_w_grid=HYBRID_W_GRID,
+    selection: str = ANALOG_MISFIT, evidence_scale: float = EVIDENCE_SCALE,
     b_scales: tuple[float, ...] = B_SCALES,
     n_shapes: int = 5, n_select: int = 4, n_noise: int = 20, truth_stride: int = 10,
     dist_edges_km: np.ndarray | None = None, seed: int = 0,
@@ -1614,6 +1632,9 @@ def run_hgaoenkf_ppe_grid(
     static covariance that the pixel grid settles once, and holding it fixed is also what
     keeps the comparison against 3DVar a comparison of estimators rather than of two
     differently regularized covariances.
+
+    ``selection`` names the analog rule and so the estimator the rows are tagged with, which
+    is what lets two rules share a metrics CSV and still be compared row for row.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
     prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
@@ -1625,15 +1646,17 @@ def run_hgaoenkf_ppe_grid(
     truth_anoms = truth_cube - truth_clim
     reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
                 "alpha": alpha}
-    label = method_label(ESTIMATOR_HGAOENKF)
+    estimator = hgaoenkf_estimator(selection)
+    label = method_label(estimator)
     configs, grid_record = _analog_grid_configs(k_grid, hybrid_w_grid)
 
     def score(k, w, full_metrics, progress=None):
         return _score_ppe_lane(
             truth_anoms, prior, long, lats, lons,
             lane=LANE_PPE, space="pixel", reg_cols=reg_cols,
-            make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=w),
-            estimator=ESTIMATOR_HGAOENKF, method_cols=analog_cols(k, w),
+            make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=w,
+                                      selection=selection, evidence_scale=evidence_scale),
+            estimator=estimator, method_cols=analog_cols(k, w),
             b_scales=b_scales, n_shapes=n_shapes, n_select=n_select, n_noise=n_noise,
             dist_edges_km=dist_edges_km, seed=seed, full_metrics=full_metrics,
             npz_extra={"truth_clim": truth_clim}, progress_every=progress)
@@ -1655,7 +1678,8 @@ def run_hgaoenkf_ppe_grid(
         LANE_PPE, "pixel", prior, len(truth_anoms), n_shapes, n_select, n_noise,
         b_scales, seed, reg_cols,
         _chronological_split_meta(ages_i, prior_idx, truth_idx, truth_stride),
-        extra={"estimator": ESTIMATOR_HGAOENKF, "selected": win, **grid_record})
+        extra={"estimator": estimator, "selection": selection,
+               "evidence_scale": float(evidence_scale), "selected": win, **grid_record})
     _write_ppe_artifacts(out_dir, LANE_PPE, all_rows, npz_arrays, skill, config)
     return pd.DataFrame(all_rows)
 
@@ -1665,6 +1689,7 @@ def run_hgaoenkf_withholding_grid(
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
     localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
     k_grid=K_GRID, hybrid_w_grid=HYBRID_W_GRID, exclude_yr: float = EXCLUDE_YR,
+    selection: str = ANALOG_MISFIT, evidence_scale: float = EVIDENCE_SCALE,
     temporal_mode: str = TEMPORAL_DEFLATE,
     k_folds: int = 5, fold_kind: str = "random",
     b_scales: tuple[float, ...] = B_SCALES, seed: int = 0,
@@ -1680,7 +1705,8 @@ def run_hgaoenkf_withholding_grid(
 
     ``temporal_mode`` is fixed rather than swept: which treatment of observation staleness
     to use is settled on the 3DVar lanes, and varying it here would confound the analog
-    parameters with it.
+    parameters with it. ``selection`` names the analog rule and so the estimator the rows
+    are tagged with.
     """
     prior_idx = np.arange(len(ages))
     prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
@@ -1688,7 +1714,8 @@ def run_hgaoenkf_withholding_grid(
                         shrinkage_lambda=shrinkage_lambda, alpha=alpha)
     reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
                 "alpha": alpha}
-    label = method_label(ESTIMATOR_HGAOENKF, temporal_mode)
+    estimator = hgaoenkf_estimator(selection)
+    label = method_label(estimator, temporal_mode)
     configs, grid_record = _analog_grid_configs(k_grid, hybrid_w_grid)
 
     def score(k, w, progress=None):
@@ -1696,8 +1723,9 @@ def run_hgaoenkf_withholding_grid(
             prior, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
             space="pixel", reg_cols=reg_cols,
             make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=w,
-                                      exclude_yr=exclude_yr),
-            estimator=ESTIMATOR_HGAOENKF, method_cols=analog_cols(k, w),
+                                      exclude_yr=exclude_yr, selection=selection,
+                                      evidence_scale=evidence_scale),
+            estimator=estimator, method_cols=analog_cols(k, w),
             temporal_modes=(temporal_mode,), k_folds=k_folds, fold_kind=fold_kind,
             b_scales=b_scales, seed=seed, progress_every=progress)
 
@@ -1716,9 +1744,10 @@ def run_hgaoenkf_withholding_grid(
 
     config = _withholding_config(
         lane, "pixel", prior, k_folds, fold_kind, b_scales, seed, reg_cols,
-        extra={"estimator": ESTIMATOR_HGAOENKF, "selected": win, "exclude_yr": exclude_yr,
-               "temporal_mode": temporal_mode, "rep_var_full": _rep_var_full(predictions),
-               **grid_record})
+        extra={"estimator": estimator, "selection": selection,
+               "evidence_scale": float(evidence_scale), "selected": win,
+               "exclude_yr": exclude_yr, "temporal_mode": temporal_mode,
+               "rep_var_full": _rep_var_full(predictions), **grid_record})
     _write_withholding_artifacts(out_dir, lane, all_rows, predictions, config)
     return pd.DataFrame(all_rows)
 
@@ -1733,12 +1762,22 @@ def analog_variant_estimator(rule: str, exclude_yr: float) -> str:
     return f"{ESTIMATOR_HGAOENKF}_{rule}_excl{int(exclude_yr)}"
 
 
+def evidence_scale_estimator(scale: float) -> str:
+    """Estimator tag for one value of the evidence rule's background scale.
+
+    A sensitivity pass, not a tuning axis: the scale states which error model selection
+    assumes, so it names the estimator rather than joining the analog grid.
+    """
+    return f"{hgaoenkf_estimator(ANALOG_EVIDENCE)}_c{scale:g}"
+
+
 def run_hgaoenkf_withholding_variants(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
     k: int, hybrid_w: float,
     localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
     misfit_exclude=EXCLUDE_YR_GRID, window_exclude=(0.0, EXCLUDE_YR),
+    evidence_exclude=(EXCLUDE_YR,), evidence_scale: float = EVIDENCE_SCALE,
     temporal_mode: str = TEMPORAL_DEFLATE,
     k_folds: int = 5, fold_kind: str = "random",
     b_scales: tuple[float, ...] = B_SCALES, seed: int = 0,
@@ -1749,9 +1788,11 @@ def run_hgaoenkf_withholding_variants(
     Two axes, both left out of the tuning grid because neither is a knob to optimise.
     Sweeping the exclusion width says how much of the skill comes from the analog step
     being allowed to select the simulation's own neighbourhood of the target age. Swapping
-    the misfit rule for nearness in time gives the running-window prior of Osman et al.
-    (2021) and Erb et al. (2022), which separates whether what matters is the epoch or the
-    climate regime; it is meaningful only on a lane whose prior spans the target ages.
+    the rule changes what similarity means: nearness in time gives the running-window prior
+    of Osman et al. (2021) and Erb et al. (2022), which separates whether what matters is
+    the epoch or the climate regime and is meaningful only on a lane whose prior spans the
+    target ages, while the evidence rule scores the same observations against the prior
+    predictive rather than against R alone.
 
     Rows land in their own directory under estimator-tagged method labels, so the
     head-to-head comparison is not cluttered by variants that are not candidates for it.
@@ -1763,7 +1804,8 @@ def run_hgaoenkf_withholding_variants(
     reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
                 "alpha": alpha}
     variants = ([(ANALOG_MISFIT, w) for w in misfit_exclude]
-                + [(ANALOG_WINDOW, w) for w in window_exclude])
+                + [(ANALOG_WINDOW, w) for w in window_exclude]
+                + [(ANALOG_EVIDENCE, w) for w in evidence_exclude])
 
     all_rows: list[dict] = []
     t0 = time.time()
@@ -1772,7 +1814,8 @@ def run_hgaoenkf_withholding_variants(
             prior, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
             space="pixel", reg_cols=reg_cols,
             make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=hybrid_w,
-                                      selection=rule, exclude_yr=exclude_yr),
+                                      selection=rule, exclude_yr=exclude_yr,
+                                      evidence_scale=evidence_scale),
             estimator=analog_variant_estimator(rule, exclude_yr),
             method_cols=analog_cols(k, hybrid_w), temporal_modes=(temporal_mode,),
             k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales, seed=seed)
@@ -1787,6 +1830,8 @@ def run_hgaoenkf_withholding_variants(
               "hybrid_w": float(hybrid_w), "temporal_mode": temporal_mode,
               "misfit_exclude_yr": [float(w) for w in misfit_exclude],
               "window_exclude_yr": [float(w) for w in window_exclude],
+              "evidence_exclude_yr": [float(w) for w in evidence_exclude],
+              "evidence_scale": float(evidence_scale),
               "k_folds": k_folds, "fold_kind": fold_kind, "seed": seed,
               "b_scales": [float(b) for b in b_scales], "prior_meta": prior.meta}
     with open(os.path.join(out_dir, f"{lane}_variants_config.json"), "w") as fh:
