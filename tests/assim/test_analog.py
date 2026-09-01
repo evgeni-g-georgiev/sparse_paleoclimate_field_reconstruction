@@ -14,9 +14,9 @@ import pytest
 
 from paleoreco.assim.analog import (
     analog_indices,
+    correlation_indices,
     eligible_mask,
     evidence_indices,
-    window_indices,
 )
 from paleoreco.assim.ensrf import whitened_block
 
@@ -49,7 +49,7 @@ def test_misfit_ranking_matches_an_explicit_loop(pool):
 
 
 def test_r_weighting_changes_the_ranking(pool):
-    """Unequal R must matter, or the rule is Wu et al.'s unweighted RMSE by another name."""
+    """Unequal R must matter, or the rule is Sun et al. (2022) Eq. 5's unweighted RMSE."""
     y = pool[0] + np.array([2.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     flat = analog_indices(pool, y, np.ones(6), 5)
     # Distrust exactly the site carrying the discrepancy.
@@ -154,11 +154,79 @@ def test_exclusion_band_keeps_selected_ages_outside_it(pool):
     assert np.all(np.abs(ages[banded] - 2000.0) >= 500.0)
 
 
-def test_window_selects_the_nearest_in_time_and_respects_eligibility():
-    ages = np.array([0, 100, 200, 300, 400, 500], dtype=np.int64)
-    assert sorted(window_indices(ages, 250, 2)) == [2, 3]
-    banded = window_indices(ages, 250, 2, eligible=eligible_mask(ages, 250, 150.0))
-    assert sorted(banded) == [1, 4]
+def test_correlation_matches_an_explicit_loop(pool):
+    """Sun et al. (2022) Eq. 6: the spatial mean leaves both sides before they correlate."""
+    y = np.array([0.4, -1.1, 0.2, 0.9, -0.3, 0.0])
+    explicit = np.array([float(np.corrcoef(row, y)[0, 1]) for row in pool])
+    assert np.array_equal(correlation_indices(pool, y, 7),
+                          np.argsort(-explicit, kind="stable")[:7])
+
+
+def test_correlation_is_blind_to_a_uniform_offset(pool):
+    """The property that separates the two published rules.
+
+    Eq. 6 removes the spatial mean, so shifting every observation by the same amount leaves
+    its ranking untouched while the misfit rule reads the shift. A stadial-to-interstadial
+    transition is largely such an offset, which is why the two rules can disagree here.
+    """
+    y = np.array([0.4, -1.1, 0.2, 0.9, -0.3, 0.0])
+    r = np.ones(6)
+    assert np.array_equal(correlation_indices(pool, y, 8),
+                          correlation_indices(pool, y + 3.0, 8))
+    assert not np.array_equal(analog_indices(pool, y, r, 8),
+                              analog_indices(pool, y + 3.0, r, 8))
+
+
+def test_correlation_is_blind_to_amplitude(pool):
+    """It normalises both sides, so a uniformly rescaled observation ranks identically."""
+    y = np.array([0.4, -1.1, 0.2, 0.9, -0.3, 0.0])
+    assert np.array_equal(correlation_indices(pool, y, 8),
+                          correlation_indices(pool, 2.5 * y, 8))
+
+
+def test_per_channel_correlation_resists_a_dominant_channel(pool):
+    """Why the pooled transcription is not the only reading of Eq. 6 here.
+
+    Both published papers correlate over one observed variable. Inflating one channel of a
+    two-channel vector leaves the pooled score reading that channel alone, while the
+    per-channel form weights the two equally.
+    """
+    channel = np.array([0, 0, 0, 1, 1, 1])
+    y = np.array([0.4, -1.1, 0.2, 0.9, -0.3, 0.0])
+    loud = pool.copy()
+    loud[:, 3:] *= 20.0
+    y_loud = y.copy()
+    y_loud[3:] *= 20.0
+    assert not np.array_equal(correlation_indices(loud, y_loud, 8),
+                              correlation_indices(loud, y_loud, 8, channel=channel))
+
+
+def test_the_two_correlation_readings_agree_on_a_single_channel(pool):
+    """The case both published papers treat, and the only one where the two coincide.
+
+    Over one channel there is one spatial mean to remove either way. Over two there are
+    two, so the readings differ whatever the channels' relative scale.
+    """
+    y = np.array([0.4, -1.1, 0.2, 0.9, -0.3, 0.0])
+    assert np.array_equal(correlation_indices(pool, y, 40),
+                          correlation_indices(pool, y, 40, channel=np.zeros(6, dtype=int)))
+
+
+def test_correlation_scores_a_patternless_candidate_without_raising(pool):
+    """A constant candidate has no pattern; it must rank last rather than produce a NaN."""
+    flat = np.vstack([pool, np.full(6, 2.0)])
+    y = np.array([0.4, -1.1, 0.2, 0.9, -0.3, 0.0])
+    assert len(correlation_indices(flat, y, len(flat))) == len(flat)
+
+
+def test_correlation_respects_eligibility_and_the_candidate_count(pool):
+    ages = np.arange(40) * 100.0
+    y = pool[20].copy()                                # its own row correlates perfectly
+    assert 20 in correlation_indices(pool, y, 5)
+    banded = correlation_indices(pool, y, 5, eligible=eligible_mask(ages, 2000.0, 500.0))
+    assert np.all(np.abs(ages[banded] - 2000.0) >= 500.0)
+    with pytest.raises(ValueError, match="eligible candidates"):
+        correlation_indices(pool, y, 30, eligible=eligible_mask(ages, 2000.0, 2000.0))
 
 
 def test_raises_when_too_few_candidates_are_eligible(pool):

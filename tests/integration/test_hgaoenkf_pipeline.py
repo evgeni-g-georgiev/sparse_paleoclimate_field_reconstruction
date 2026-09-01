@@ -16,6 +16,7 @@ import pandas as pd
 import pytest
 
 from paleoreco.assim import experiments as ex
+from paleoreco.assim.analog import ANALOG_MISFIT
 from paleoreco.assim.hgaoenkf import make_hgaoenkf
 from paleoreco.assim.observations import TEMPORAL_DEFLATE
 
@@ -79,6 +80,84 @@ def test_trajectory_lane_runs_one_treatment_and_records_the_selection(
     assert set(cfg["selected_b_scale_by_method"]) == {"hgaoenkf_temporal_deflate"}
 
 
+def test_trajectory_lane_runs_the_whole_staleness_ladder(
+    tmp_path, cube, ages, lats, lons, valid, obs_long, factory
+):
+    """The ladder is a property of the observation layer, so one estimator carries it all.
+
+    ``recon_realistic`` holds whichever treatment came first in the tuple, so the deflated
+    run has to be reachable by name; reading the alias would silently return the
+    uncorrected one.
+    """
+    df = ex.run_trajectory(cube, ages, lats, lons, valid, obs_long, str(tmp_path),
+                           make_method=factory, estimator=ex.ESTIMATOR_HGAOENKF,
+                           method_cols=ex.analog_cols(K, W),
+                           temporal_modes=ex.TEMPORAL_MODES, b_scales=B_SCALES,
+                           lowpass_windows=(500,), bands=((500, 1000),), min_obs=2, seed=0)
+
+    assert set(df["method"]) == {"hgaoenkf", "hgaoenkf_temporal_add",
+                                 "hgaoenkf_temporal_deflate", "hgaoenkf_ceiling",
+                                 "nearest", "idw"}
+    z = np.load(tmp_path / "trajectory_analysis.npz")
+    for key in ("recon_realistic", "recon_ceiling", "recon_hgaoenkf_temporal_add",
+                "recon_hgaoenkf_temporal_deflate", "analog_index"):
+        assert key in z.files
+    # The alias is the uncorrected run, so it must not be the deflated one.
+    assert not np.allclose(z["recon_realistic"], z["recon_hgaoenkf_temporal_deflate"])
+
+
+def test_trajectory_naive_rows_do_not_depend_on_the_estimator(
+    tmp_path, cube, ages, lats, lons, valid, obs_long, factory
+):
+    """Prior-free references are built from the observations, so every run must agree.
+
+    They come from whichever treatment leads the tuple, so a run that led with a corrected
+    treatment would interpolate corrected observations and quietly disagree with a run that
+    did not. Notebook 09 pools directories and drops duplicates, which would hide it.
+    """
+    common = dict(b_scales=B_SCALES, lowpass_windows=(500,), bands=((500, 1000),),
+                  min_obs=2, seed=0, temporal_modes=ex.TEMPORAL_MODES)
+    base = ex.run_trajectory(cube, ages, lats, lons, valid, obs_long,
+                             str(tmp_path / "3dvar"), **common)
+    analog = ex.run_trajectory(cube, ages, lats, lons, valid, obs_long,
+                               str(tmp_path / "hg"), make_method=factory,
+                               estimator=ex.ESTIMATOR_HGAOENKF,
+                               method_cols=ex.analog_cols(K, W), **common)
+
+    def naive(df):
+        sub = df[df["background"] == "none"]
+        return sub.set_index(["method", "channel", "metric", "split"])["value"].sort_index()
+
+    pd.testing.assert_series_equal(naive(base), naive(analog))
+
+
+def test_withholding_grid_reports_the_ladder_at_the_selected_point(
+    tmp_path, cube, ages, lats, lons, valid, obs_long
+):
+    """The grid selects under one treatment; the winner is then scored under all of them.
+
+    Selecting per treatment would confound the analog parameters with the observation
+    model, so the ladder has to be a re-scoring of one operating point rather than three.
+    """
+    out = tmp_path / "hg"
+    df = ex.run_hgaoenkf_withholding_grid(
+        cube, ages, lats, lons, valid, _varying_obs(obs_long), str(out),
+        exclude_yr=600.0, k_folds=3, b_scales=B_SCALES, seed=0,
+        report_temporal_modes=ex.TEMPORAL_MODES, **TINY_GRID)
+
+    label = "hgaoenkf_temporal_deflate"
+    assert {"hgaoenkf", "hgaoenkf_temporal_add", label} <= set(df["method"])
+    # Only the treatment the grid ran carries the whole grid; the others come from the
+    # winner pass alone and so sit at one config.
+    assert len(df[df.method == label][["analog_k", "hybrid_w"]].drop_duplicates()) == 4
+    for other in ("hgaoenkf", "hgaoenkf_temporal_add"):
+        cfg = json.load(open(out / "withholding_random_config.json"))
+        sub = df[df.method == other][["analog_k", "hybrid_w"]].drop_duplicates()
+        assert len(sub) == 1
+        assert sub.iloc[0]["analog_k"] == cfg["selected"]["analog_k"]
+        assert sub.iloc[0]["hybrid_w"] == cfg["selected"]["hybrid_w"]
+
+
 def test_withholding_lane_runs_with_an_exclusion_band(
     tmp_path, cube, ages, lats, lons, valid, obs_long
 ):
@@ -138,27 +217,41 @@ def test_withholding_grid_persists_a_winner_the_csv_re_derives(
 def test_variants_lane_labels_every_ablation_distinctly(
     tmp_path, cube, ages, lats, lons, valid, obs_long
 ):
+    variants = (
+        (ex.analog_variant_estimator(ANALOG_MISFIT, 0.0),
+         dict(selection=ANALOG_MISFIT, exclude_yr=0.0)),
+        (ex.analog_variant_estimator(ANALOG_MISFIT, 600.0),
+         dict(selection=ANALOG_MISFIT, exclude_yr=600.0)),
+        (ex.analog_localization_estimator(ANALOG_MISFIT, None),
+         dict(selection=ANALOG_MISFIT, exclude_yr=600.0, analog_localization_km=None)),
+        (ex.analog_localization_estimator(ANALOG_MISFIT, 3000.0),
+         dict(selection=ANALOG_MISFIT, exclude_yr=600.0, analog_localization_km=3000.0)),
+    )
     df = ex.run_hgaoenkf_withholding_variants(
         cube, ages, lats, lons, valid, _varying_obs(obs_long), str(tmp_path),
-        k=K, hybrid_w=W, misfit_exclude=(0.0, 600.0), window_exclude=(0.0, 600.0),
-        evidence_exclude=(0.0, 600.0), k_folds=3, b_scales=B_SCALES, seed=0)
+        k=K, hybrid_w=W, variants=variants, k_folds=3, b_scales=B_SCALES, seed=0)
 
     assert set(df["method"]) == {
         "hgaoenkf_misfit_excl0_temporal_deflate",
         "hgaoenkf_misfit_excl600_temporal_deflate",
-        "hgaoenkf_window_excl0_temporal_deflate",
-        "hgaoenkf_window_excl600_temporal_deflate",
-        "hgaoenkf_evidence_excl0_temporal_deflate",
-        "hgaoenkf_evidence_excl600_temporal_deflate",
+        "hgaoenkf_locstatic_temporal_deflate",
+        "hgaoenkf_loc3000_temporal_deflate",
     }
-    # The window rule ignores the observations, so banding it must still change the result.
+
     def ce(method):
         sub = df[(df.method == method) & (df.metric == "ce") & (df.channel == "pooled")
                  & (df.split == "test") & (df.fold == -1)]
         return sub["value"].to_numpy()
 
-    assert not np.allclose(ce("hgaoenkf_window_excl0_temporal_deflate"),
-                           ce("hgaoenkf_window_excl600_temporal_deflate"))
+    # Both axes have to bite, or the pass is scoring one estimator under several names.
+    assert not np.allclose(ce("hgaoenkf_misfit_excl0_temporal_deflate"),
+                           ce("hgaoenkf_misfit_excl600_temporal_deflate"))
+    assert not np.allclose(ce("hgaoenkf_locstatic_temporal_deflate"),
+                           ce("hgaoenkf_loc3000_temporal_deflate"))
+    # A null lengthscale is the static covariance's own, so that variant is the banded
+    # misfit run under a second tag and must score identically to it.
+    assert np.array_equal(ce("hgaoenkf_locstatic_temporal_deflate"),
+                          ce("hgaoenkf_misfit_excl600_temporal_deflate"))
     assert os.path.exists(tmp_path / "withholding_random_variants_config.json")
 
 

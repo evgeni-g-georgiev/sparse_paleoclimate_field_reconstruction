@@ -1,10 +1,10 @@
 """Tests for the hybrid gain analog offline EnKF (paleoreco.assim.hgaoenkf).
 
 Three algebraic identities carry most of the weight, because each says a piece is wired up
-rather than merely running: ``hybrid_w = 0`` must reproduce Sun et al.'s AOEnKF-B, an analog
-ensemble as large as the pool must reproduce the static analysis whatever the weight and
-whatever the selection rule, and the evidence rule at zero background scale must reproduce
-the misfit rule exactly.
+rather than merely running: ``hybrid_w = 0`` must reproduce the mean of Sun et al.'s
+AOEnKF-B, an analog ensemble as large as the pool must reproduce the static analysis
+whatever the weight and whatever the selection rule, and the evidence rule at zero
+background scale must reproduce the misfit rule exactly.
 """
 
 from __future__ import annotations
@@ -12,7 +12,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from paleoreco.assim.analog import ANALOG_EVIDENCE, ANALOG_MISFIT, ANALOG_WINDOW
+from paleoreco.assim.analog import (
+    ANALOG_CORRELATION,
+    ANALOG_CORRELATION_PERCHAN,
+    ANALOG_EVIDENCE,
+    ANALOG_MISFIT,
+)
 from paleoreco.assim.background import background_covariance
 from paleoreco.assim.hgaoenkf import HGAOEnKF, make_hgaoenkf
 from paleoreco.assim.method import Observations
@@ -63,12 +68,14 @@ def _static_means(setup, background=None):
     return [res.mean_anom for res in tv.apply_sweep(gain, setup["y"], bg)]
 
 
-def test_hybrid_w_zero_is_aoenkf_b(setup):
+def test_hybrid_w_zero_reproduces_the_aoenkf_b_mean(setup):
     """At weight zero the gain is purely static, but the prior mean is still the analog one.
 
-    That is Sun et al.'s AOEnKF-B, the corner of the family the hybrid weight interpolates
-    from. Only the mean is asserted: 3DVar's posterior variance is the full-rank analytic
-    diagonal, this one is the sample spread of k updated members.
+    That reproduces the mean of Sun et al.'s AOEnKF-B, the corner of the family the hybrid
+    weight interpolates from, and only the mean: their AOEnKF-B carries the climatological
+    perturbations, while Eq. 5 at alpha = 0 reduces the analog ones by a static gain. The
+    spread is not asserted for a second reason too, that 3DVar's posterior variance is the
+    full-rank analytic diagonal where this one is the sample spread of k updated members.
     """
     m = _build(setup, hybrid_w=0.0)
     gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
@@ -79,12 +86,16 @@ def test_hybrid_w_zero_is_aoenkf_b(setup):
 
 
 @pytest.mark.parametrize("hybrid_w", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("selection", [ANALOG_MISFIT, ANALOG_EVIDENCE])
+@pytest.mark.parametrize("selection", [ANALOG_MISFIT, ANALOG_CORRELATION,
+                                       ANALOG_CORRELATION_PERCHAN, ANALOG_EVIDENCE])
 def test_full_pool_ensemble_reproduces_the_static_analysis(setup, hybrid_w, selection):
     """Sun et al.'s N = M identity: with every state selected there is no analog left.
 
     The re-centred pool covariance is exactly the covariance B was built from, and the
     analog mean is zero, so neither the weight nor the rule that ordered the pool matters.
+    It also needs the two covariances to share a lengthscale, which is what Sun et al.
+    Table 2 arranges: their flow-dependent lengthscale widens with the ensemble and reaches
+    the static one exactly where N reaches M.
     """
     m = _build(setup, k=N_POOL, hybrid_w=hybrid_w, selection=selection)
     gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
@@ -153,7 +164,7 @@ def test_selection_uses_the_observations_and_is_reported(setup):
     assert not np.array_equal(sel, m.select(gain, -setup["y"]))
 
 
-def test_exclusion_band_needs_an_age_and_is_applied(setup):
+def test_exclusion_band_is_applied_only_with_an_age(setup):
     m = _build(setup, exclude_yr=500.0)
     age = float(setup["ages"][N_POOL // 2])
     # Without an age there is nothing to exclude, which is the split lanes' case.
@@ -191,13 +202,81 @@ def test_evidence_selection_moves_the_ensemble_at_the_default_scale(setup):
                               evidence.select(gain_e, setup["y"]))
 
 
-def test_window_selection_ignores_the_observations(setup):
-    m = _build(setup, selection=ANALOG_WINDOW)
-    age = float(setup["ages"][N_POOL // 2])
-    gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES, age=age)
-    assert np.array_equal(m.select(gain, setup["y"]), m.select(gain, -setup["y"]))
-    with pytest.raises(ValueError, match="needs the age"):
-        m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+@pytest.mark.parametrize("selection", [ANALOG_CORRELATION, ANALOG_CORRELATION_PERCHAN])
+def test_correlation_selection_reads_the_observations(setup, selection):
+    m = _build(setup, selection=selection)
+    gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+    sel = m.select(gain, setup["y"])
+    assert sel.shape == (m.k,) and len(set(sel.tolist())) == m.k
+    # Eq. 6 normalises, so reversing the sign of every observation is the one change it
+    # does see: the best-correlated candidates become the worst.
+    assert not np.array_equal(sel, m.select(gain, -setup["y"]))
+
+
+def test_the_two_correlation_readings_differ_across_channels(setup):
+    """The network spans both channels, so the pooled and per-channel forms must diverge."""
+    pooled = _build(setup, selection=ANALOG_CORRELATION)
+    per_chan = _build(setup, selection=ANALOG_CORRELATION_PERCHAN)
+    gain = pooled.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+    assert len(set(gain.obs_channel.tolist())) == 2
+    assert not np.array_equal(pooled.select(gain, setup["y"]),
+                              per_chan.select(gain, setup["y"]))
+
+
+def test_analog_localization_defaults_to_the_static_lengthscale(setup):
+    """The regression guard: ``None`` is the static covariance's own lengthscale.
+
+    Bit equality rather than a tolerance, since the two paths must build the same taper and
+    then run the same arithmetic. Without this the parameter could silently change the
+    analysis at its default.
+    """
+    inherited = _build(setup)
+    explicit = _build(setup, analog_localization_km=setup["taper"]["localization_km"])
+    zero = np.zeros(setup["D"])
+    for a, b in zip(
+            inherited.apply_sweep(inherited.prepare_sweep(setup["gather"], setup["r"],
+                                                          B_SCALES), setup["y"], zero),
+            explicit.apply_sweep(explicit.prepare_sweep(setup["gather"], setup["r"],
+                                                        B_SCALES), setup["y"], zero)):
+        assert np.array_equal(a.mean_anom, b.mean_anom)
+        assert np.array_equal(a.posterior_var, b.posterior_var)
+
+
+def test_analog_localization_rejects_a_silencing_lengthscale(setup):
+    """A lengthscale that cannot taper must raise rather than annihilate.
+
+    Gaspari-Cohn compares ``dist / length``, and every comparison against a non-finite
+    value is false, so the mask stays at its pre-allocated zeros: the analog covariance is
+    multiplied by nothing rather than localized, the hybrid weight goes inert, and every
+    number stays finite. A read of a swept lengthscale out of a table is one path to it.
+    """
+    for bad in (float("nan"), float("inf"), 0.0, -1.0):
+        with pytest.raises(ValueError, match="analog_localization_km"):
+            _build(setup, analog_localization_km=bad)
+
+
+def test_a_separate_analog_localization_moves_the_analysis(setup):
+    """A different lengthscale must reach the analog blocks, or the parameter is inert."""
+    shared = _build(setup)
+    tighter = _build(setup, analog_localization_km=2000.0)
+    zero = np.zeros(setup["D"])
+    got = [m.apply_sweep(m.prepare_sweep(setup["gather"], setup["r"], B_SCALES),
+                         setup["y"], zero)[1].mean_anom for m in (shared, tighter)]
+    assert not np.allclose(*got)
+
+
+def test_a_separate_analog_localization_breaks_the_full_pool_identity(setup):
+    """The companion to the N = M identity: it holds because the tapers agree.
+
+    Giving the analog covariance its own lengthscale makes the two blocks differently
+    regularized, so the full-pool ensemble no longer reproduces the static analysis. That
+    is what says the parameter reaches the analog block and only the analog block.
+    """
+    m = _build(setup, k=N_POOL, hybrid_w=1.0, analog_localization_km=2000.0)
+    gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+    got = m.apply_sweep(gain, setup["y"], np.zeros(setup["D"]))
+    assert not any(np.allclose(res.mean_anom, expected, atol=1e-10)
+                   for res, expected in zip(got, _static_means(setup)))
 
 
 def test_analyze_satisfies_the_method_contract(setup):
@@ -214,10 +293,14 @@ def test_factory_pool_matches_the_prior_it_is_built_from(cube, ages, lats, lons,
     prior_idx = np.arange(0, len(ages), 2)
     prior = build_prior(cube, ages, lats, lons, prior_idx, valid, localization_km=9000.0)
     m = make_hgaoenkf(cube, ages, lats, lons, k=4, hybrid_w=0.5,
-                      selection=ANALOG_EVIDENCE, evidence_scale=2.5)(prior, shape)
+                      selection=ANALOG_EVIDENCE, evidence_scale=2.5,
+                      analog_localization_km=3000.0)(prior, shape)
     assert m.pool.shape == (len(prior_idx), int(np.prod(shape)))
     assert np.array_equal(m.pool_ages, np.asarray(ages)[prior_idx])
     assert m.taper_meta["localization_km"] == 9000.0
+    # Only the lengthscale is overridden; the rest of the taper stays the prior's.
+    assert m.analog_taper_meta["localization_km"] == 3000.0
+    assert m.analog_taper_meta["alpha"] == m.taper_meta["alpha"]
     assert m.selection == ANALOG_EVIDENCE and m.evidence_scale == 2.5
 
 

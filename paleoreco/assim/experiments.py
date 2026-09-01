@@ -87,9 +87,10 @@ from paleoreco.assim.observations import (
     temporal_terms,
 )
 from paleoreco.assim.analog import (
+    ANALOG_CORRELATION,
+    ANALOG_CORRELATION_PERCHAN,
     ANALOG_EVIDENCE,
     ANALOG_MISFIT,
-    ANALOG_WINDOW,
     EVIDENCE_SCALE,
 )
 from paleoreco.assim.hgaoenkf import make_hgaoenkf
@@ -120,7 +121,12 @@ HYBRID_W_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 # Width of the band around the analysis age dropped from the analog pool, and the widths
 # a sensitivity pass sweeps. Only bites where the prior spans the age being reconstructed.
 EXCLUDE_YR = 1000.0
-EXCLUDE_YR_GRID = (0.0, 500.0, 1000.0, 2000.0)
+EXCLUDE_YR_GRID = (0.0, 1000.0, 2000.0)
+# Lengthscales for the analog covariance's own taper, swept at a fixed (k, hybrid_w).
+# ``None`` is whatever the static covariance carries, which differs by lane, so the two
+# grids bracket both that value and the tighter one Sun et al. (2024) Table 2 predicts.
+ANALOG_LOCALIZATION_GRID_PPE = (None, 5000.0, 7500.0, 10000.0, 20000.0)
+ANALOG_LOCALIZATION_GRID_WH = (None, 5000.0, 10000.0, 15000.0)
 LANE_PPE = "ppe"
 LANE_TRAJECTORY = "trajectory"
 
@@ -131,6 +137,16 @@ ESTIMATOR_3DVAR = "3dvar"
 ESTIMATOR_HGAOENKF = "hgaoenkf"
 _TEMPORAL_SUFFIX = {TEMPORAL_OFF: "", TEMPORAL_ADD: "_temporal_add",
                     TEMPORAL_DEFLATE: "_temporal_deflate"}
+# Estimator tag per analog selection rule. The map is explicit rather than derived from the
+# rule string so a tag can be renamed without renaming the rule it selects by: the baseline
+# is the published one and holds the bare name, and the rule with no published counterpart
+# is tagged for what it is rather than for how it scores.
+_HGAOENKF_TAG = {
+    ANALOG_MISFIT: ESTIMATOR_HGAOENKF,
+    ANALOG_EVIDENCE: f"{ESTIMATOR_HGAOENKF}_plus",
+    ANALOG_CORRELATION: f"{ESTIMATOR_HGAOENKF}_correlation",
+    ANALOG_CORRELATION_PERCHAN: f"{ESTIMATOR_HGAOENKF}_correlation_perchan",
+}
 
 
 def method_label(estimator: str, mode: str = TEMPORAL_OFF) -> str:
@@ -139,13 +155,8 @@ def method_label(estimator: str, mode: str = TEMPORAL_OFF) -> str:
 
 
 def hgaoenkf_estimator(selection: str) -> str:
-    """Estimator tag for one analog selection rule; the misfit rule keeps the bare name.
-
-    Holding ``misfit`` at the unqualified name is what keeps a run made before the other
-    rules existed comparable to one made after, row for row.
-    """
-    return (ESTIMATOR_HGAOENKF if selection == ANALOG_MISFIT
-            else f"{ESTIMATOR_HGAOENKF}_{selection}")
+    """Estimator tag for one analog selection rule."""
+    return _HGAOENKF_TAG[selection]
 
 
 def ceiling_label(estimator: str) -> str:
@@ -1623,6 +1634,7 @@ def run_hgaoenkf_ppe_grid(
     localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
     k_grid=K_GRID, hybrid_w_grid=HYBRID_W_GRID,
     selection: str = ANALOG_MISFIT, evidence_scale: float = EVIDENCE_SCALE,
+    analog_localization_km: float | None = None,
     b_scales: tuple[float, ...] = B_SCALES,
     n_shapes: int = 5, n_select: int = 4, n_noise: int = 20, truth_stride: int = 10,
     dist_edges_km: np.ndarray | None = None, seed: int = 0,
@@ -1657,7 +1669,8 @@ def run_hgaoenkf_ppe_grid(
             truth_anoms, prior, long, lats, lons,
             lane=LANE_PPE, space="pixel", reg_cols=reg_cols,
             make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=w,
-                                      selection=selection, evidence_scale=evidence_scale),
+                                      selection=selection, evidence_scale=evidence_scale,
+                                      analog_localization_km=analog_localization_km),
             estimator=estimator, method_cols=analog_cols(k, w),
             b_scales=b_scales, n_shapes=n_shapes, n_select=n_select, n_noise=n_noise,
             dist_edges_km=dist_edges_km, seed=seed, full_metrics=full_metrics,
@@ -1681,7 +1694,9 @@ def run_hgaoenkf_ppe_grid(
         b_scales, seed, reg_cols,
         _chronological_split_meta(ages_i, prior_idx, truth_idx, truth_stride),
         extra={"estimator": estimator, "selection": selection,
-               "evidence_scale": float(evidence_scale), "selected": win, **grid_record})
+               "evidence_scale": float(evidence_scale),
+               "analog_localization_km": analog_localization_km,
+               "selected": win, **grid_record})
     _write_ppe_artifacts(out_dir, LANE_PPE, all_rows, npz_arrays, skill, config)
     return pd.DataFrame(all_rows)
 
@@ -1692,7 +1707,9 @@ def run_hgaoenkf_withholding_grid(
     localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
     k_grid=K_GRID, hybrid_w_grid=HYBRID_W_GRID, exclude_yr: float = EXCLUDE_YR,
     selection: str = ANALOG_MISFIT, evidence_scale: float = EVIDENCE_SCALE,
+    analog_localization_km: float | None = None,
     temporal_mode: str = TEMPORAL_DEFLATE,
+    report_temporal_modes: tuple[str, ...] = (TEMPORAL_DEFLATE,),
     k_folds: int = 5, fold_kind: str = "random",
     b_scales: tuple[float, ...] = B_SCALES, seed: int = 0,
     progress_every: int | None = None,
@@ -1707,8 +1724,10 @@ def run_hgaoenkf_withholding_grid(
 
     ``temporal_mode`` is fixed rather than swept: which treatment of observation staleness
     to use is settled on the 3DVar lanes, and varying it here would confound the analog
-    parameters with it. ``selection`` names the analog rule and so the estimator the rows
-    are tagged with.
+    parameters with it. ``report_temporal_modes`` are the treatments the winner is then
+    scored under, so the staleness ladder is read at one operating point rather than
+    re-selecting the analog parameters per treatment. ``selection`` names the analog rule
+    and so the estimator the rows are tagged with.
     """
     prior_idx = np.arange(len(ages))
     prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
@@ -1720,55 +1739,70 @@ def run_hgaoenkf_withholding_grid(
     label = method_label(estimator, temporal_mode)
     configs, grid_record = _analog_grid_configs(k_grid, hybrid_w_grid)
 
-    def score(k, w, progress=None):
+    def score(k, w, modes, progress=None):
         return _score_withholding_lane(
             prior, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
             space="pixel", reg_cols=reg_cols,
             make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=w,
                                       exclude_yr=exclude_yr, selection=selection,
-                                      evidence_scale=evidence_scale),
+                                      evidence_scale=evidence_scale,
+                                      analog_localization_km=analog_localization_km),
             estimator=estimator, method_cols=analog_cols(k, w),
-            temporal_modes=(temporal_mode,), k_folds=k_folds, fold_kind=fold_kind,
+            temporal_modes=modes, k_folds=k_folds, fold_kind=fold_kind,
             b_scales=b_scales, seed=seed, progress_every=progress)
 
     all_rows: list[dict] = []
     t0 = time.time()
     for ci, (k, w) in enumerate(configs):
-        lane, rows, _ = score(k, w)
+        lane, rows, _ = score(k, w, (temporal_mode,))
         all_rows += [r for r in rows if r["method"] == label]
         _report_progress(f"analog-grid config ({lane})", ci + 1, len(configs), t0)
 
     win = select_analog_config(_selection_rrmse(all_rows, lane, label))
-    _, win_rows, predictions = score(win["analog_k"], win["hybrid_w"], progress=progress_every)
-    # The winner's own skill rows are already in from the grid pass at this same config;
-    # what the re-run adds is the prior-free references and the predictions npz.
+    _, win_rows, predictions = score(win["analog_k"], win["hybrid_w"],
+                                     report_temporal_modes, progress=progress_every)
+    # The winner's rows under the selection treatment are already in from the grid pass at
+    # this same config; what the re-run adds is the other treatments, the prior-free
+    # references and the predictions npz.
     all_rows += [r for r in win_rows if r["method"] != label]
 
     config = _withholding_config(
         lane, "pixel", prior, k_folds, fold_kind, b_scales, seed, reg_cols,
         extra={"estimator": estimator, "selection": selection,
-               "evidence_scale": float(evidence_scale), "selected": win,
+               "evidence_scale": float(evidence_scale),
+               "analog_localization_km": analog_localization_km, "selected": win,
                "exclude_yr": exclude_yr, "temporal_mode": temporal_mode,
+               "report_temporal_modes": list(report_temporal_modes),
                "rep_var_full": _rep_var_full(predictions), **grid_record})
     _write_withholding_artifacts(out_dir, lane, all_rows, predictions, config)
     return pd.DataFrame(all_rows)
 
 
 def analog_variant_estimator(rule: str, exclude_yr: float) -> str:
-    """Estimator tag for one ablation of how the analog ensemble is chosen.
+    """Estimator tag for one width of the exclusion band.
 
-    The selection rule and the exclusion width are modelling choices rather than tuned
-    parameters, so they name the estimator and compose into the method label the same way
-    a treatment of staleness does, instead of adding columns to the shared row schema.
+    The width is a modelling choice rather than a tuned parameter, so it names the
+    estimator and composes into the method label the same way a treatment of staleness
+    does, instead of adding a column to the shared row schema.
     """
     return f"{ESTIMATOR_HGAOENKF}_{rule}_excl{int(exclude_yr)}"
+
+
+def analog_localization_estimator(rule: str, km: float | None) -> str:
+    """Estimator tag for one lengthscale of the analog covariance's own taper.
+
+    ``None`` is the lengthscale the static covariance carries, so it tags as ``static``
+    rather than as a number that would differ between lanes.
+    """
+    suffix = "static" if km is None else f"{int(km)}"
+    return f"{hgaoenkf_estimator(rule)}_loc{suffix}"
 
 
 def evidence_scale_estimator(scale: float) -> str:
     """Estimator tag for one value of the evidence rule's background scale.
 
-    A sensitivity pass, not a tuning axis: the scale states which error model selection
-    assumes, so it names the estimator rather than joining the analog grid.
+    A sensitivity pass, not a tuning axis: the scale is held at one value everywhere else,
+    so it names the estimator rather than joining the analog grid.
     """
     return f"{hgaoenkf_estimator(ANALOG_EVIDENCE)}_c{scale:g}"
 
@@ -1776,25 +1810,22 @@ def evidence_scale_estimator(scale: float) -> str:
 def run_hgaoenkf_withholding_variants(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
-    k: int, hybrid_w: float,
+    k: int, hybrid_w: float, variants: tuple[tuple[str, dict], ...],
     localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
-    misfit_exclude=EXCLUDE_YR_GRID, window_exclude=(0.0, EXCLUDE_YR),
-    evidence_exclude=(EXCLUDE_YR,), evidence_scale: float = EVIDENCE_SCALE,
+    evidence_scale: float = EVIDENCE_SCALE,
     temporal_mode: str = TEMPORAL_DEFLATE,
     k_folds: int = 5, fold_kind: str = "random",
     b_scales: tuple[float, ...] = B_SCALES, seed: int = 0,
     progress_every: int | None = None,
 ) -> pd.DataFrame:
-    """Score how the analog ensemble is chosen, at a fixed ``(k, hybrid_w)``.
+    """Score variations on how the analog covariance is built, at a fixed ``(k, hybrid_w)``.
 
-    Two axes, both left out of the tuning grid because neither is a knob to optimise.
-    Sweeping the exclusion width says how much of the skill comes from the analog step
-    being allowed to select the simulation's own neighbourhood of the target age. Swapping
-    the rule changes what similarity means: nearness in time gives the running-window prior
-    of Osman et al. (2021) and Erb et al. (2022), which separates whether what matters is
-    the epoch or the climate regime and is meaningful only on a lane whose prior spans the
-    target ages, while the evidence rule scores the same observations against the prior
-    predictive rather than against R alone.
+    ``variants`` pairs an estimator tag with the :func:`make_hgaoenkf` keywords that vary,
+    so one pass can sweep the exclusion width, the analog lengthscale, or the selection
+    rule without any of them joining the tuning grid. None of them is a knob to optimise:
+    the exclusion width says how much of the skill comes from the analog step being allowed
+    to select the simulation's own neighbourhood of the target age, and the lengthscale
+    answers the ensemble-size question Sun et al. (2024) Table 2 poses.
 
     Rows land in their own directory under estimator-tagged method labels, so the
     head-to-head comparison is not cluttered by variants that are not candidates for it.
@@ -1805,20 +1836,16 @@ def run_hgaoenkf_withholding_variants(
                         shrinkage_lambda=shrinkage_lambda, alpha=alpha)
     reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
                 "alpha": alpha}
-    variants = ([(ANALOG_MISFIT, w) for w in misfit_exclude]
-                + [(ANALOG_WINDOW, w) for w in window_exclude]
-                + [(ANALOG_EVIDENCE, w) for w in evidence_exclude])
 
     all_rows: list[dict] = []
     t0 = time.time()
-    for vi, (rule, exclude_yr) in enumerate(variants):
+    for vi, (tag, kw) in enumerate(variants):
         lane, rows, _ = _score_withholding_lane(
             prior, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
             space="pixel", reg_cols=reg_cols,
             make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=hybrid_w,
-                                      selection=rule, exclude_yr=exclude_yr,
-                                      evidence_scale=evidence_scale),
-            estimator=analog_variant_estimator(rule, exclude_yr),
+                                      evidence_scale=evidence_scale, **kw),
+            estimator=tag,
             method_cols=analog_cols(k, hybrid_w), temporal_modes=(temporal_mode,),
             k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales, seed=seed)
         # The prior-free references do not depend on any of this, and the grid pass has
@@ -1830,9 +1857,8 @@ def run_hgaoenkf_withholding_variants(
     _append_csv(os.path.join(out_dir, "metrics.csv"), all_rows)
     config = {"lane": lane, "space": "pixel", **reg_cols, "analog_k": int(k),
               "hybrid_w": float(hybrid_w), "temporal_mode": temporal_mode,
-              "misfit_exclude_yr": [float(w) for w in misfit_exclude],
-              "window_exclude_yr": [float(w) for w in window_exclude],
-              "evidence_exclude_yr": [float(w) for w in evidence_exclude],
+              "variants": {tag: {key: val for key, val in kw.items()}
+                           for tag, kw in variants},
               "evidence_scale": float(evidence_scale),
               "k_folds": k_folds, "fold_kind": fold_kind, "seed": seed,
               "b_scales": [float(b) for b in b_scales], "prior_meta": prior.meta}

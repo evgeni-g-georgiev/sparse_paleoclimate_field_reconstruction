@@ -6,17 +6,21 @@ reconstructed rather than the average of the whole run (Sun et al. 2022). Select
 only place the prior sees the data, and it is what makes the resulting covariance
 flow-dependent.
 
-Three rules live here. The misfit rule ranks candidates by R-weighted squared distance to
-the observations, which is the likelihood of a candidate being the truth. The same lineage
-ranks three ways: Sun et al. (2024) Eq. 3 by spatial-pattern correlation, Wu et al. (2025)
-Eq. 5 by plain RMSE, and Sun et al. (2025) Eq. 12 by RMSE normalised by the observation
-error variance, which is this rule up to a monotone transform. Weighting by R is what lets a
-network of unequally trusted sites contribute in proportion to what it knows, and it is what
-makes the score consistent with a corrected observation pair, where dividing the observation
-by its attenuation and inflating R by its square leaves the comparison between the raw
-observation and the attenuated candidate. Eq. 3 differs in kind rather than in weighting: it
+Three rules live here, two of them published. The misfit rule ranks candidates by
+R-weighted squared distance to the observations, which is Sun et al. (2025) Eq. 12 up to a
+monotone transform; the same lineage ranks unweighted in Sun et al. (2022) Eq. 5 and Wu et
+al. (2025) Eq. 5. Weighting by R is what lets a network of unequally trusted sites
+contribute in proportion to what it knows, and it is what makes the score consistent with a
+corrected observation pair, where dividing the observation by its attenuation and inflating
+R by its square leaves the comparison between the raw observation and the attenuated
+candidate.
+
+The correlation rule is Sun et al. (2022) Eq. 6, carried into Sun et al. (2024) Eq. 3 as the
+rule their hybrid gain filter selects by. It differs in kind rather than in weighting: it
 removes the spatial mean and normalises amplitude, so it is blind to a uniform offset that
-the misfit rule reads.
+the misfit rule reads, and it discards R entirely. Both papers apply it to a single observed
+variable, which leaves "the spatial average" ambiguous over an observation vector spanning
+two channels, so the rule comes in a pooled transcription and a per-channel one.
 
 The evidence rule ranks by the candidate's marginal likelihood ``N(y; H x_j, c H B H^T +
 R)`` instead. A candidate is not the truth but the centre of a background with covariance
@@ -24,11 +28,7 @@ B, so the update that consumes the ensemble already carries that spread; measuri
 residual against R alone is the ``c = 0`` limit of the same score, which the misfit rule
 reproduces exactly. Whitening by the prior predictive puts every direction on the scale the
 prior says is normal for it and discounts observations the prior holds to be redundant with
-each other.
-
-The window rule ranks by nearness in time instead, which is how a running-window prior is
-built (Osman et al. 2021; Erb et al. 2022). Window against the two data-driven rules
-separates whether what matters is the epoch or the climate regime.
+each other. No published rule scores candidates this way.
 
 Every rule is deterministic to the tie, so an estimator built on them consumes no random
 numbers and repeats exactly.
@@ -40,13 +40,18 @@ import numpy as np
 
 from paleoreco.assim.ensrf import WhitenedBlock
 
-# How the k members of an analog ensemble are chosen.
+# How the k members of an analog ensemble are chosen. The two correlation entries are the
+# same published rule under the two readings its spatial average admits here.
 ANALOG_MISFIT = "misfit"
-ANALOG_WINDOW = "window"
+ANALOG_CORRELATION = "correlation"
+ANALOG_CORRELATION_PERCHAN = "correlation_perchan"
 ANALOG_EVIDENCE = "evidence"
-ANALOG_RULES = (ANALOG_MISFIT, ANALOG_WINDOW, ANALOG_EVIDENCE)
+ANALOG_RULES = (ANALOG_MISFIT, ANALOG_CORRELATION, ANALOG_CORRELATION_PERCHAN,
+                ANALOG_EVIDENCE)
 # Amplitude of the background covariance in the evidence metric. Zero recovers the misfit
-# rule, so this states which error model selection assumes rather than tuning a knob.
+# rule. This is a tunable parameter held at the value that makes selection assume the same
+# background the update applies; that is not where a sweep puts its optimum, so holding it
+# here rather than tuning keeps the rule's reported margin conservative.
 EVIDENCE_SCALE = 1.0
 
 
@@ -97,6 +102,46 @@ def analog_indices(
     return _rank(misfit, k, eligible)
 
 
+def _pearson(pool_at_obs: np.ndarray, y_anom: np.ndarray) -> np.ndarray:
+    """Correlation of each candidate's predicted observations with ``y_anom``.
+
+    A candidate whose predictions are constant across the network has no pattern to
+    correlate, and neither does an observation vector that is; both score zero rather than
+    a NaN so the ranking stays total and reproducible.
+    """
+    a = pool_at_obs - pool_at_obs.mean(axis=1, keepdims=True)
+    b = y_anom - y_anom.mean()
+    denom = np.sqrt((a ** 2).sum(axis=1)) * np.sqrt((b ** 2).sum())
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.nan_to_num((a @ b) / denom, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def correlation_indices(
+    pool_at_obs: np.ndarray, y_anom: np.ndarray, k: int, *,
+    channel: np.ndarray | None = None, eligible: np.ndarray | None = None,
+) -> np.ndarray:
+    """Indices of the ``k`` prior states correlating best with the observations.
+
+    Sun et al. (2022) Eq. 6, the rule Sun et al. (2024) Eq. 3 selects their analog ensemble
+    by. Passing ``channel`` centres and normalises within each channel instead of over the
+    whole vector, which is the same quantity as the mean of the per-channel correlations.
+    The two agree where a network observes one variable, which is the case both papers
+    treat; they diverge once a vector mixes channels of unequal spread, since the pooled
+    form is then dominated by the wider one.
+    """
+    p = np.asarray(pool_at_obs, dtype=np.float64)
+    y = np.asarray(y_anom, dtype=np.float64)
+    if channel is None:
+        corr = _pearson(p, y)
+    else:
+        ch = np.asarray(channel)
+        # A correlation needs two points, so a channel carrying fewer contributes nothing.
+        groups = [ch == c for c in np.unique(ch) if np.count_nonzero(ch == c) >= 2]
+        corr = (np.mean([_pearson(p[:, g], y[g]) for g in groups], axis=0)
+                if groups else np.zeros(len(p)))
+    return _rank(-corr, k, eligible)
+
+
 def evidence_indices(
     pool_at_obs: np.ndarray, y_anom: np.ndarray, whitened: WhitenedBlock, k: int, *,
     eligible: np.ndarray | None = None, scale: float = EVIDENCE_SCALE,
@@ -113,10 +158,3 @@ def evidence_indices(
     q = (d * whitened.rinv_sqrt[None, :]) @ whitened.U
     chi = (q ** 2 / (float(scale) * whitened.Lam + 1.0)[None, :]).sum(axis=1)
     return _rank(chi, k, eligible)
-
-
-def window_indices(
-    pool_ages: np.ndarray, age: float, k: int, *, eligible: np.ndarray | None = None,
-) -> np.ndarray:
-    """Indices of the ``k`` prior states nearest ``age`` in time."""
-    return _rank(np.abs(np.asarray(pool_ages, dtype=np.float64) - float(age)), k, eligible)
