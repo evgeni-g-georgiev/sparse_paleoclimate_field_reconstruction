@@ -125,7 +125,17 @@ HYBRID_W_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 # ablation is a set of rows in the same grid rather than a separate run.
 TENDENCY_THETA_GRID = (0.0, 1.0)
 TENDENCY_LAG_YR_GRID = (200.0, 400.0)
-REDUNDANCY_THETA_GRID = (0.0, 0.25)
+# The redundancy penalty is held off rather than swept. It buys a covariance that spans
+# more directions by passing over the candidates that fit best, so it trades the quality of
+# the ensemble mean for the quality of the ensemble spread. That trade only pays where the
+# gain is large enough for the covariance to carry the analysis: the PPE lane selects
+# ``b_scale`` 2-5 and the penalty wins there, but the trajectory lane's observations are
+# stale enough that it selects 0.3, and at that amplitude the analysis is close to the
+# prior mean alone, so the penalty is a cost with nothing to set against it. Held at zero
+# it is nested away, and the estimator that remains extends the published one through the
+# tendency term alone. The rule keeps its ``redundancy`` argument, so restoring the axis
+# here is all that a sweep needs.
+REDUNDANCY_THETA_GRID = (0.0,)
 # Width of the band around the analysis age dropped from the analog pool, and the widths
 # a sensitivity pass sweeps. Only bites where the prior spans the age being reconstructed.
 EXCLUDE_YR = 1000.0
