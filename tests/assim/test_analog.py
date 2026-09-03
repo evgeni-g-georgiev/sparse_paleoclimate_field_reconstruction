@@ -13,6 +13,8 @@ import numpy as np
 import pytest
 
 from paleoreco.assim.analog import (
+    _greedy_rank,
+    _rank,
     analog_indices,
     correlation_indices,
     eligible_mask,
@@ -125,6 +127,57 @@ def test_evidence_reads_the_corrected_observation_pair(pool, obs_block):
     raw = evidence_indices(pool, y, _whitened(obs_block, r), 8)
     corrected = evidence_indices(pool, y / rho, _whitened(obs_block, r / rho ** 2), 8)
     assert not np.array_equal(raw, corrected)
+
+
+def test_greedy_ranking_without_a_penalty_is_the_plain_ranking(pool):
+    """The identity the redundancy penalty rests on: at zero it must not reorder anything.
+
+    The estimator short-circuits to :func:`_rank` there, so this checks the greedy pass
+    itself agrees rather than that the short-circuit was taken.
+    """
+    rng = np.random.default_rng(3)
+    score = rng.normal(size=len(pool)) ** 2
+    signatures = rng.normal(size=(len(pool), 4))
+    signatures /= np.linalg.norm(signatures, axis=1, keepdims=True)
+    assert np.array_equal(_greedy_rank(score, signatures, 9, 0.0, None),
+                          _rank(score, 9, None))
+
+
+def test_redundancy_penalty_spreads_the_selected_set(pool, obs_block):
+    """A penalised draw must be less mutually redundant, which is the whole point of it.
+
+    The pool is built with near-duplicate candidates so an unpenalised top-k has something
+    to be redundant about.
+    """
+    rng = np.random.default_rng(17)
+    twinned = np.repeat(pool[:10], 4, axis=0) + 0.01 * rng.normal(size=(40, 6))
+    y = np.array([0.4, -1.1, 0.2, 0.9, -0.3, 0.0])
+    r = np.full(6, 1.0)
+    wb = _whitened(obs_block, r)
+
+    def worst_similarity(idx):
+        z = twinned[idx] / np.linalg.norm(twinned[idx], axis=1, keepdims=True)
+        gram = np.abs(z @ z.T)
+        np.fill_diagonal(gram, 0.0)
+        return gram.max()
+
+    plain = evidence_indices(twinned, y, wb, 6)
+    spread = evidence_indices(twinned, y, wb, 6, redundancy=1.0)
+    assert not np.array_equal(plain, spread)
+    assert worst_similarity(spread) < worst_similarity(plain)
+
+
+def test_redundancy_respects_eligibility_and_the_candidate_count(pool, obs_block):
+    ages = np.arange(40) * 100.0
+    y, r = pool[20].copy(), np.ones(6)
+    wb = _whitened(obs_block, r)
+    banded = evidence_indices(pool, y, wb, 5, redundancy=0.5,
+                              eligible=eligible_mask(ages, 2000.0, 500.0))
+    assert len(set(banded)) == 5
+    assert np.all(np.abs(ages[banded] - 2000.0) >= 500.0)
+    with pytest.raises(ValueError, match="eligible candidates"):
+        evidence_indices(pool, y, wb, 30, redundancy=0.5,
+                         eligible=eligible_mask(ages, 2000.0, 2000.0))
 
 
 def test_evidence_respects_eligibility_and_the_candidate_count(pool, obs_block):

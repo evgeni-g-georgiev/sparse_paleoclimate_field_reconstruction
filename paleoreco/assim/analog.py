@@ -30,6 +30,12 @@ reproduces exactly. Whitening by the prior predictive puts every direction on th
 prior says is normal for it and discounts observations the prior holds to be redundant with
 each other. No published rule scores candidates this way.
 
+Every rule scores a candidate on its own, so the best k can be near-duplicates: the archive
+is a trajectory, and states close in time predict a sparse network almost identically. The
+redundancy penalty makes the draw a set problem instead, charging a candidate for how much
+it resembles one already taken, as a cosine in the same whitened coordinates the evidence
+score uses. At zero penalty the greedy pass reproduces the ranking.
+
 Every rule is deterministic to the tie, so an estimator built on them consumes no random
 numbers and repeats exactly.
 """
@@ -68,21 +74,49 @@ def eligible_mask(pool_ages: np.ndarray, age: float, exclude_yr: float) -> np.nd
     return np.abs(np.asarray(pool_ages, dtype=np.float64) - float(age)) >= float(exclude_yr)
 
 
+def _masked_score(score: np.ndarray, k: int, eligible: np.ndarray | None) -> np.ndarray:
+    """``score`` with ineligible candidates at infinity, once there are enough to draw."""
+    s = np.asarray(score, dtype=np.float64)
+    if eligible is not None:
+        n_ok = int(np.count_nonzero(eligible))
+        if n_ok < k:
+            raise ValueError(f"only {n_ok} eligible candidates for an ensemble of {k}")
+        return np.where(eligible, s, np.inf)
+    if len(s) < k:
+        raise ValueError(f"only {len(s)} candidates for an ensemble of {k}")
+    return s
+
+
 def _rank(score: np.ndarray, k: int, eligible: np.ndarray | None) -> np.ndarray:
     """The ``k`` eligible candidates with the smallest score, ties broken by index.
 
     A stable sort rather than a partial one: the archive is small enough that the full
     sort is free, and the ordering has to be reproducible for the estimator to be.
     """
-    s = np.asarray(score, dtype=np.float64)
-    if eligible is not None:
-        n_ok = int(np.count_nonzero(eligible))
-        if n_ok < k:
-            raise ValueError(f"only {n_ok} eligible candidates for an ensemble of {k}")
-        s = np.where(eligible, s, np.inf)
-    elif len(s) < k:
-        raise ValueError(f"only {len(s)} candidates for an ensemble of {k}")
-    return np.argsort(s, kind="stable")[:k]
+    return np.argsort(_masked_score(score, k, eligible), kind="stable")[:k]
+
+
+def _greedy_rank(score: np.ndarray, signatures: np.ndarray, k: int, redundancy: float,
+                 eligible: np.ndarray | None) -> np.ndarray:
+    """The ``k`` candidates minimising ``score`` plus a penalty for resembling those taken.
+
+    ``signatures`` are unit vectors, one per candidate, whose inner product is the
+    similarity charged for. The score is divided by its own eligible mean, so
+    ``redundancy`` means the same thing whatever scale the network puts the score on.
+    Ties break by index, as :func:`_rank` does, so the ranking stays reproducible.
+    """
+    s = _masked_score(score, k, eligible)
+    finite = np.isfinite(s)
+    s = s / s[finite].mean()
+    penalty = np.zeros(len(s))
+    chosen = np.empty(k, dtype=np.int64)
+    for i in range(k):
+        adjusted = s + redundancy * penalty
+        adjusted[chosen[:i]] = np.inf
+        j = int(np.argmin(adjusted))
+        chosen[i] = j
+        penalty = np.maximum(penalty, np.abs(signatures @ signatures[j]))
+    return chosen
 
 
 def analog_indices(
@@ -145,6 +179,7 @@ def correlation_indices(
 def evidence_indices(
     pool_at_obs: np.ndarray, y_anom: np.ndarray, whitened: WhitenedBlock, k: int, *,
     eligible: np.ndarray | None = None, scale: float = EVIDENCE_SCALE,
+    redundancy: float = 0.0,
 ) -> np.ndarray:
     """Indices of the ``k`` prior states whose marginal likelihood best explains ``y_anom``.
 
@@ -152,9 +187,24 @@ def evidence_indices(
     ``d^T (scale H B H^T + R)^-1 d`` without a second decomposition; R enters through
     ``rinv_sqrt``, which is why no separate ``r_diag`` is taken. The log-determinant is the
     same for every candidate, so the Mahalanobis term alone orders them.
+
+    ``redundancy`` charges a candidate for resembling one already taken, which makes the
+    draw a set rather than a ranking; zero returns the ranking itself.
     """
     y = np.asarray(y_anom, dtype=np.float64)
     d = y[None, :] - np.asarray(pool_at_obs, dtype=np.float64)          # (n_pool, m)
     q = (d * whitened.rinv_sqrt[None, :]) @ whitened.U
-    chi = (q ** 2 / (float(scale) * whitened.Lam + 1.0)[None, :]).sum(axis=1)
-    return _rank(chi, k, eligible)
+    weight = float(scale) * whitened.Lam + 1.0
+    chi = (q ** 2 / weight[None, :]).sum(axis=1)
+    if redundancy <= 0.0:
+        return _rank(chi, k, eligible)
+    # Each candidate's predicted observations, in the coordinates the score whitens by.
+    # q already holds their residual against y, so subtracting it from the whitened
+    # observations recovers them without a second product over the pool.
+    z = ((y * whitened.rinv_sqrt) @ whitened.U)[None, :] - q
+    z /= np.sqrt(weight)[None, :]
+    norm = np.linalg.norm(z, axis=1, keepdims=True)
+    # A candidate the network cannot distinguish from the climatology has no direction to
+    # be redundant in, so it scores zero similarity against everything rather than a NaN.
+    z = np.divide(z, norm, out=np.zeros_like(z), where=norm > 0.0)
+    return _greedy_rank(chi, z, k, float(redundancy), eligible)
