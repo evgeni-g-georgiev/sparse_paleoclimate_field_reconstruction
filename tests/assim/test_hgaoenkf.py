@@ -17,6 +17,7 @@ from paleoreco.assim.analog import (
     ANALOG_CORRELATION_PERCHAN,
     ANALOG_EVIDENCE,
     ANALOG_MISFIT,
+    eligible_mask,
 )
 from paleoreco.assim.background import background_covariance
 from paleoreco.assim.hgaoenkf import HGAOEnKF, make_hgaoenkf
@@ -145,9 +146,14 @@ def test_posterior_variance_is_finite_and_non_negative(setup):
         assert np.isfinite(v).all() and (v >= 0.0).all()
 
 
-def test_estimator_is_deterministic(setup):
+@pytest.mark.parametrize("terms", [
+    {},
+    {"tendency_theta": 1.0, "tendency_lag_yr": 200.0},
+    {"selection": ANALOG_EVIDENCE, "redundancy_theta": 0.5},
+])
+def test_estimator_is_deterministic(setup, terms):
     """No random numbers anywhere, so a lane's own draws stay aligned across estimators."""
-    m = _build(setup)
+    m = _build(setup, **terms)
     gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
     first = m.apply_sweep(gain, setup["y"], np.zeros(setup["D"]))
     second = m.apply_sweep(gain, setup["y"], np.zeros(setup["D"]))
@@ -277,6 +283,84 @@ def test_a_separate_analog_localization_breaks_the_full_pool_identity(setup):
     got = m.apply_sweep(gain, setup["y"], np.zeros(setup["D"]))
     assert not any(np.allclose(res.mean_anom, expected, atol=1e-10)
                    for res, expected in zip(got, _static_means(setup)))
+
+
+def test_extension_terms_at_zero_reproduce_the_published_estimator(setup):
+    """The identity both extension terms rest on, asserted to the bit.
+
+    Not merely close: the tendency rows are exactly zero at zero weight and the greedy
+    draw short-circuits to the ranking, so anything but an identical analysis means one of
+    them has leaked into the published estimator.
+    """
+    kw = dict(k=8, hybrid_w=0.75, selection=ANALOG_EVIDENCE)
+    published = _build(setup, **kw)
+    extended = _build(setup, **kw, tendency_theta=0.0, tendency_lag_yr=0.0,
+                      redundancy_theta=0.0)
+    zero = np.zeros(setup["D"])
+    for a, b in zip(published.apply_sweep(published.prepare_sweep(setup["gather"], setup["r"],
+                                                                 B_SCALES), setup["y"], zero),
+                    extended.apply_sweep(extended.prepare_sweep(setup["gather"], setup["r"],
+                                                                B_SCALES), setup["y"], zero)):
+        assert np.array_equal(a.mean_anom, b.mean_anom)
+        assert np.array_equal(a.posterior_var, b.posterior_var)
+
+
+def test_tendency_rows_difference_the_archive_across_the_lag(setup):
+    """The lag is read against the age axis, so one archive step is one age step."""
+    m = _build(setup, tendency_theta=2.0, tendency_lag_yr=100.0)
+    members = np.array([5, 6, 7])
+    raw = 0.5 * (setup["pool"][members + 1] - setup["pool"][members - 1])
+    assert np.allclose(m._tendency_rows(members, None), 2.0 * (raw - raw.mean(axis=0)))
+
+
+def test_tendency_skips_a_member_whose_neighbour_falls_in_the_exclusion_band(setup):
+    """The band keeps the analog step off the simulation's own state at the target age.
+
+    A neighbour a lag away can sit inside the band while the member itself is eligible, so
+    without this the tendency would walk straight back into what the band excludes. Only
+    bites where the archive spans the age being reconstructed.
+    """
+    m = _build(setup, tendency_theta=1.0, tendency_lag_yr=100.0)
+    ages = setup["ages"]
+    eligible = eligible_mask(ages, float(ages[15]), 150.0)      # excludes 14, 15, 16
+    members = np.array([13, 20, 25])                            # 13's neighbour is 14
+    assert len(m._tendency_rows(members, None)) == 3
+    assert len(m._tendency_rows(members, eligible)) == 2
+
+
+def test_tendency_modes_move_the_analysis(setup):
+    """A weighted tendency must reach the covariance, or the term is inert."""
+    kw = dict(k=8, hybrid_w=1.0, selection=ANALOG_EVIDENCE)
+    zero = np.zeros(setup["D"])
+
+    def analysis(**extra):
+        m = _build(setup, **kw, **extra)
+        gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+        return m.apply_sweep(gain, setup["y"], zero)[0].mean_anom
+
+    assert not np.allclose(analysis(), analysis(tendency_theta=1.0, tendency_lag_yr=100.0))
+
+
+def test_redundancy_penalty_moves_the_selected_ensemble(setup):
+    """The penalty must reach selection, and only the evidence rule forms its coordinates."""
+    m = _build(setup, k=8, selection=ANALOG_EVIDENCE)
+    penalised = _build(setup, k=8, selection=ANALOG_EVIDENCE, redundancy_theta=2.0)
+    gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+    assert not np.array_equal(m.select(gain, setup["y"]),
+                              penalised.select(gain, setup["y"]))
+    with pytest.raises(ValueError, match="evidence rule"):
+        _build(setup, k=8, selection=ANALOG_MISFIT, redundancy_theta=0.5)
+
+
+def test_extension_terms_reject_invalid_arguments(setup):
+    with pytest.raises(ValueError, match="tendency_theta"):
+        _build(setup, tendency_theta=-1.0)
+    with pytest.raises(ValueError, match="tendency_lag_yr"):
+        _build(setup, tendency_lag_yr=-1.0)
+    with pytest.raises(ValueError, match="positive tendency_lag_yr"):
+        _build(setup, tendency_theta=1.0)
+    with pytest.raises(ValueError, match="redundancy_theta"):
+        _build(setup, selection=ANALOG_EVIDENCE, redundancy_theta=-0.5)
 
 
 def test_analyze_satisfies_the_method_contract(setup):

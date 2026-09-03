@@ -19,6 +19,15 @@ AOEnKF-B carries the climatological ones.
 How candidates are ranked is a choice the family leaves open; :mod:`paleoreco.assim.analog`
 holds the rules, and ``selection`` names one.
 
+Two terms extend that scheme, both zero by default and both nested: at zero the analysis is
+the published one. The tendency term augments the analog deviations with the archive's local
+rate of change around each selected member, differenced over ``tendency_lag_yr``. Selection
+draws members that agree with the observations, so they agree with each other there too and
+the covariance is flattest in the directions the gain leans on hardest; the tendency modes
+never had to agree with anything, and they restore that spread out of the archive's time
+ordering, which selection otherwise reads only to build the exclusion band. The redundancy
+term is its selection-side counterpart and lives with the rules.
+
 The state and observation conventions are pixel 3DVar's: anomaly space throughout, H is
 nearest-cell selection, and the returned :class:`AnalysisResult` is pixel-space. Both
 covariances carry a Schur taper from the prior that built the static one, except that Sun et
@@ -28,8 +37,8 @@ Their values are radians on another model, grid and network, so the schedule tra
 the number does not.
 
 One property of Eq. 5 is worth knowing when reading the posterior spread: the deviations
-start from the analog ensemble alone but are reduced by a gain that is part static, so the
-mean and the spread come from different mixtures. A square-root update guarantees the
+start from whatever built the analog covariance but are reduced by a gain that is part
+static, so the mean and the spread come from different mixtures. A square-root update guarantees the
 spread shrinks only when the gain matches the covariance the deviations came from, which
 here holds at ``hybrid_w = 1`` and is approached as the weight rises. At low weight the
 per-cell variance can exceed the analog ensemble's own by a few per cent.
@@ -54,6 +63,7 @@ from paleoreco.assim.analog import (
     evidence_indices,
 )
 from paleoreco.assim.ensrf import WhitenedBlock, mean_gain_apply, sqrt_gain_apply, whitened_block
+from paleoreco.assim.innovation import nearest_age_index
 from paleoreco.assim.method import AnalysisResult, Method, Observations
 from paleoreco.assim.priors import Prior, taper_obs_blocks
 
@@ -90,6 +100,9 @@ class HGAOEnKF(Method):
     background amplitude the evidence rule scores against and is unused by the others.
     ``analog_localization_km`` localizes the analog covariance alone; ``None`` gives it the
     static covariance's lengthscale, so the two are tapered identically.
+    ``tendency_theta`` weights the archive's local tendency modes into the analog
+    covariance and ``tendency_lag_yr`` is the interval they are differenced over;
+    ``redundancy_theta`` charges a candidate for resembling one already selected.
     """
 
     def __init__(self, pool: np.ndarray, pool_ages: np.ndarray, B: np.ndarray,
@@ -97,7 +110,9 @@ class HGAOEnKF(Method):
                  k: int, hybrid_w: float, taper_meta: dict,
                  selection: str = ANALOG_MISFIT, exclude_yr: float = 0.0,
                  evidence_scale: float = EVIDENCE_SCALE,
-                 analog_localization_km: float | None = None):
+                 analog_localization_km: float | None = None,
+                 tendency_theta: float = 0.0, tendency_lag_yr: float = 0.0,
+                 redundancy_theta: float = 0.0):
         if selection not in ANALOG_RULES:
             raise ValueError(f"unknown selection rule {selection!r}; expected one of {ANALOG_RULES}")
         if k < 2:
@@ -106,6 +121,22 @@ class HGAOEnKF(Method):
             raise ValueError(f"hybrid_w must lie in [0, 1]; got {hybrid_w}")
         if evidence_scale < 0.0:
             raise ValueError(f"evidence_scale must be non-negative; got {evidence_scale}")
+        if tendency_theta < 0.0:
+            raise ValueError(f"tendency_theta must be non-negative; got {tendency_theta}")
+        if tendency_lag_yr < 0.0:
+            raise ValueError(f"tendency_lag_yr must be non-negative; got {tendency_lag_yr}")
+        # A weighted tendency with no lag differences a state against itself, which would
+        # be a silent no-op rather than the term the caller asked for.
+        if tendency_theta > 0.0 and tendency_lag_yr <= 0.0:
+            raise ValueError("a positive tendency_theta needs a positive tendency_lag_yr; "
+                             f"got {tendency_lag_yr}")
+        if redundancy_theta < 0.0:
+            raise ValueError(f"redundancy_theta must be non-negative; got {redundancy_theta}")
+        # The penalty is a cosine in the coordinates the evidence score whitens by, so it
+        # has no meaning under a rule that never forms them.
+        if redundancy_theta > 0.0 and selection != ANALOG_EVIDENCE:
+            raise ValueError("redundancy_theta is defined against the evidence rule's "
+                             f"whitened score; selection is {selection!r}")
         # A non-finite or non-positive lengthscale makes every Gaspari-Cohn comparison
         # false, so the taper returns its pre-allocated zeros and silences the analog
         # covariance instead of localizing it. The analysis stays finite, so nothing
@@ -134,6 +165,40 @@ class HGAOEnKF(Method):
         self.analog_taper_meta = dict(self.taper_meta)
         if analog_localization_km is not None:
             self.analog_taper_meta["localization_km"] = float(analog_localization_km)
+        self.tendency_theta = float(tendency_theta)
+        self.tendency_lag_yr = float(tendency_lag_yr)
+        self.redundancy_theta = float(redundancy_theta)
+        # The neighbours depend on the archive's age axis alone, so they are the same for
+        # every network and every analysis this estimator runs.
+        self._tendency_pair = (self._tendency_neighbours()
+                               if self.tendency_theta > 0.0 else None)
+
+    def _tendency_neighbours(self) -> tuple[np.ndarray, np.ndarray]:
+        """Pool rows one lag either side of each candidate, clamped at the archive's ends."""
+        order = np.argsort(self.pool_ages, kind="stable")
+        sorted_ages = self.pool_ages[order]
+        lo = order[nearest_age_index(self.pool_ages - self.tendency_lag_yr, sorted_ages)]
+        hi = order[nearest_age_index(self.pool_ages + self.tendency_lag_yr, sorted_ages)]
+        return lo, hi
+
+    def _tendency_rows(self, members: np.ndarray,
+                       eligible: np.ndarray | None) -> np.ndarray:
+        """Centred tendency deviations for the selected members, ``(n_kept, D)``.
+
+        A member contributes nothing where the exclusion band rules out either neighbour,
+        which is what stops a lane whose archive spans the analysis age from reaching back
+        inside that band through the tendency, and nothing where the two neighbours
+        coincide at the ends of the archive and there is no interval to difference.
+        """
+        lo, hi = self._tendency_pair
+        a, b = lo[members], hi[members]
+        keep = a != b
+        if eligible is not None:
+            keep = keep & eligible[a] & eligible[b]
+        if not keep.any():
+            return np.empty((0, self.pool.shape[1]))
+        tend = 0.5 * (self.pool[b[keep]] - self.pool[a[keep]])
+        return self.tendency_theta * (tend - tend.mean(axis=0))
 
     def prepare_sweep(self, gather: np.ndarray, r_diag: np.ndarray,
                       b_scales: np.ndarray, *, age: float | None = None) -> _HybridSweepGain:
@@ -169,7 +234,8 @@ class HGAOEnKF(Method):
             # The static block is already factorized for the gain, so the marginal
             # likelihood costs one product over the pool rather than a second solve.
             return evidence_indices(gain.pool_at_obs, y_anom, gain.static, self.k,
-                                    eligible=gain.eligible, scale=self.evidence_scale)
+                                    eligible=gain.eligible, scale=self.evidence_scale,
+                                    redundancy=self.redundancy_theta)
         return analog_indices(gain.pool_at_obs, y_anom, gain.r_diag, self.k,
                               eligible=gain.eligible)
 
@@ -182,10 +248,16 @@ class HGAOEnKF(Method):
         square root to match.
         """
         g = gain.gather
-        members = self.pool[self.select(gain, y_anom)]
+        selected = self.select(gain, y_anom)
+        members = self.pool[selected]
         mu = members.mean(axis=0)
         dev = members - mu                                    # (k, D)
-        h_dev = dev[:, g].T                                   # (m, k)
+        if self._tendency_pair is not None:
+            dev = np.vstack([dev, self._tendency_rows(selected, gain.eligible)])
+        h_dev = dev[:, g].T                                   # (m, n_dev)
+        # The normalizer counts the members, not the rows: the tendency rows are extra
+        # directions added to the same k-member ensemble, so at zero weight they contribute
+        # nothing and the covariance is the published one exactly.
         P_obs = (dev.T @ h_dev.T) / (self.k - 1.0)            # B_a H^T, never B_a itself
         S_obs = (h_dev @ h_dev.T) / (self.k - 1.0)            # H B_a H^T
         if gain.taper is not None:
@@ -217,6 +289,8 @@ def make_hgaoenkf(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray, *,
     k: int, hybrid_w: float, selection: str = ANALOG_MISFIT, exclude_yr: float = 0.0,
     evidence_scale: float = EVIDENCE_SCALE, analog_localization_km: float | None = None,
+    tendency_theta: float = 0.0, tendency_lag_yr: float = 0.0,
+    redundancy_theta: float = 0.0,
 ):
     """A method factory building :class:`HGAOEnKF` from a built prior.
 
@@ -235,6 +309,9 @@ def make_hgaoenkf(
                         k=k, hybrid_w=hybrid_w, taper_meta=prior.meta,
                         selection=selection, exclude_yr=exclude_yr,
                         evidence_scale=evidence_scale,
-                        analog_localization_km=analog_localization_km)
+                        analog_localization_km=analog_localization_km,
+                        tendency_theta=tendency_theta,
+                        tendency_lag_yr=tendency_lag_yr,
+                        redundancy_theta=redundancy_theta)
 
     return factory
