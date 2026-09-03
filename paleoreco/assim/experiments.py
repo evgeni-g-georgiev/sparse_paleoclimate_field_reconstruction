@@ -118,6 +118,14 @@ SEL_TOL = 0.0   # 0 = pure argmin of selection RRMSE; >0 prefers the simpler con
 # ladder falls out of the sweep rather than needing separate runs.
 K_GRID = (20, 40, 60, 100)
 HYBRID_W_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
+# The two terms that extend the analog scheme, each swept from off. The tendency weight
+# scales the archive's local rate of change into the analog covariance and the lag is the
+# interval it is differenced over; the redundancy penalty charges a candidate for
+# resembling one already selected. Zero on both axes is the published estimator, so the
+# ablation is a set of rows in the same grid rather than a separate run.
+TENDENCY_THETA_GRID = (0.0, 1.0)
+TENDENCY_LAG_YR_GRID = (200.0, 400.0)
+REDUNDANCY_THETA_GRID = (0.0, 0.25)
 # Width of the band around the analysis age dropped from the analog pool, and the widths
 # a sensitivity pass sweeps. Only bites where the prior spans the age being reconstructed.
 EXCLUDE_YR = 1000.0
@@ -189,13 +197,25 @@ _FULL_METRICS = frozenset({"ssim", "crps", "crpss", "rcrv_bias", "rcrv_dispersio
 
 # Taper columns for prior-free (naive) rows, which carry no regularizer.
 _NAN_REG = {"localization_km": np.nan, "shrinkage_lambda": np.nan, "alpha": np.nan}
+# The extension terms, named once so a row's columns cannot drift from the keywords the
+# estimator was built with.
+TERM_KEYS = ("tendency_theta", "tendency_lag_yr", "redundancy_theta")
 # Analog-ensemble columns for rows from an estimator that draws no analog ensemble.
-_NAN_ANALOG = {"analog_k": np.nan, "hybrid_w": np.nan}
+_NAN_ANALOG = {"analog_k": np.nan, "hybrid_w": np.nan,
+               **{key: np.nan for key in TERM_KEYS}}
 
 
-def analog_cols(k: int, hybrid_w: float) -> dict:
-    """The two analog columns for a row, as :func:`_NAN_REG` does for the taper."""
-    return {"analog_k": float(k), "hybrid_w": float(hybrid_w)}
+def analog_cols(k: int, hybrid_w: float, *, tendency_theta: float = 0.0,
+                tendency_lag_yr: float = 0.0, redundancy_theta: float = 0.0) -> dict:
+    """The analog columns for a row, as :func:`_NAN_REG` does for the taper.
+
+    The extension terms default to off, which is what an estimator that does not carry
+    them is: a row saying zero and a row from before they existed mean the same thing.
+    """
+    return {"analog_k": float(k), "hybrid_w": float(hybrid_w),
+            "tendency_theta": float(tendency_theta),
+            "tendency_lag_yr": float(tendency_lag_yr),
+            "redundancy_theta": float(redundancy_theta)}
 
 
 # ---------------------------------------------------------------------------
@@ -1451,19 +1471,22 @@ def select_best_config(sel_rows: pd.DataFrame, *, sel_tol: float = SEL_TOL) -> d
 
 
 def select_analog_config(sel_rows: pd.DataFrame) -> dict:
-    """Winner ``{analog_k, hybrid_w, b_scale}`` on the selection split.
+    """Winner over the analog axes and ``b_scale`` on the selection split.
 
     A plain argmin, unlike :func:`select_best_config`, whose tie-break prefers the config
-    closest to a raw sample covariance. Neither the ensemble size nor the hybrid weight has
-    a "simpler" end to lean toward: both bracket the static analysis, one at a full-pool
-    ensemble and the other at zero weight.
+    closest to a raw sample covariance. None of these axes has a "simpler" end to lean
+    toward: the ensemble size and the hybrid weight bracket the static analysis, one at a
+    full-pool ensemble and the other at zero weight, and the extension terms bracket the
+    published estimator at zero. Rows written before an axis existed read as zero on it.
     """
     df = sel_rows.dropna(subset=["value"])
     if df.empty:
         raise ValueError("no finite selection-split RRMSE to select from")
     win = df.loc[df["value"].idxmin()]
+    extras = {col: 0.0 if pd.isna(win.get(col, np.nan)) else float(win[col])
+              for col in TERM_KEYS}
     return {"analog_k": int(win["analog_k"]), "hybrid_w": float(win["hybrid_w"]),
-            "b_scale": float(win["b_scale"])}
+            **extras, "b_scale": float(win["b_scale"])}
 
 
 def _pixel_grid_configs(localization_grid, shrinkage_grid, alpha_grid):
@@ -1620,11 +1643,38 @@ def run_withholding_pixel_grid(
 # ---------------------------------------------------------------------------
 # Analog-ensemble tuning: (k, hybrid_w, b_scale) at an inherited taper.
 # ---------------------------------------------------------------------------
-def _analog_grid_configs(k_grid, hybrid_w_grid):
-    """The ``(k, hybrid_w)`` grid points, and a JSON-safe record of the axes."""
-    configs = list(itertools.product(k_grid, hybrid_w_grid))
+def analog_term_states(tendency_theta_grid, tendency_lag_yr_grid, redundancy_theta_grid):
+    """Distinct ``(tendency_theta, tendency_lag_yr, redundancy_theta)`` states.
+
+    The lag says nothing where the tendency weight is zero, so those combinations collapse
+    to one state rather than running the same estimator once per lag.
+    """
+    states = []
+    for theta in tendency_theta_grid:
+        lags = tendency_lag_yr_grid if theta > 0.0 else (0.0,)
+        for lag in lags:
+            for redundancy in redundancy_theta_grid:
+                states.append((float(theta), float(lag), float(redundancy)))
+    return states
+
+
+def _analog_grid_configs(k_grid, hybrid_w_grid,
+                         tendency_theta_grid=(0.0,), tendency_lag_yr_grid=(0.0,),
+                         redundancy_theta_grid=(0.0,)):
+    """The analog grid points, and a JSON-safe record of the axes.
+
+    The extension-term grids default to off, so a caller that names only ``k`` and
+    ``hybrid_w`` gets the published estimator's grid.
+    """
+    states = analog_term_states(tendency_theta_grid, tendency_lag_yr_grid,
+                                redundancy_theta_grid)
+    configs = [(k, w, *state) for k, w in itertools.product(k_grid, hybrid_w_grid)
+               for state in states]
     record = {"k_grid": [int(k) for k in k_grid],
-              "hybrid_w_grid": [float(w) for w in hybrid_w_grid]}
+              "hybrid_w_grid": [float(w) for w in hybrid_w_grid],
+              "tendency_theta_grid": [float(t) for t in tendency_theta_grid],
+              "tendency_lag_yr_grid": [float(g) for g in tendency_lag_yr_grid],
+              "redundancy_theta_grid": [float(r) for r in redundancy_theta_grid]}
     return configs, record
 
 
@@ -1633,6 +1683,7 @@ def run_hgaoenkf_ppe_grid(
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
     localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
     k_grid=K_GRID, hybrid_w_grid=HYBRID_W_GRID,
+    tendency_theta_grid=(0.0,), tendency_lag_yr_grid=(0.0,), redundancy_theta_grid=(0.0,),
     selection: str = ANALOG_MISFIT, evidence_scale: float = EVIDENCE_SCALE,
     analog_localization_km: float | None = None,
     b_scales: tuple[float, ...] = B_SCALES,
@@ -1662,30 +1713,37 @@ def run_hgaoenkf_ppe_grid(
                 "alpha": alpha}
     estimator = hgaoenkf_estimator(selection)
     label = method_label(estimator)
-    configs, grid_record = _analog_grid_configs(k_grid, hybrid_w_grid)
+    configs, grid_record = _analog_grid_configs(
+        k_grid, hybrid_w_grid, tendency_theta_grid, tendency_lag_yr_grid,
+        redundancy_theta_grid)
 
-    def score(k, w, full_metrics, progress=None):
+    def score(k, w, tendency_theta, tendency_lag_yr, redundancy_theta,
+              full_metrics, progress=None):
+        terms = dict(tendency_theta=tendency_theta, tendency_lag_yr=tendency_lag_yr,
+                     redundancy_theta=redundancy_theta)
         return _score_ppe_lane(
             truth_anoms, prior, long, lats, lons,
             lane=LANE_PPE, space="pixel", reg_cols=reg_cols,
             make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=w,
                                       selection=selection, evidence_scale=evidence_scale,
-                                      analog_localization_km=analog_localization_km),
-            estimator=estimator, method_cols=analog_cols(k, w),
+                                      analog_localization_km=analog_localization_km,
+                                      **terms),
+            estimator=estimator, method_cols=analog_cols(k, w, **terms),
             b_scales=b_scales, n_shapes=n_shapes, n_select=n_select, n_noise=n_noise,
             dist_edges_km=dist_edges_km, seed=seed, full_metrics=full_metrics,
             npz_extra={"truth_clim": truth_clim}, progress_every=progress)
 
     all_rows: list[dict] = []
     t0 = time.time()
-    for ci, (k, w) in enumerate(configs):
-        rows, _, _ = score(k, w, full_metrics=False)
+    for ci, config in enumerate(configs):
+        rows, _, _ = score(*config, full_metrics=False)
         all_rows += [r for r in rows if r["method"] == label]
         _report_progress("analog-grid config", ci + 1, len(configs), t0)
 
     win = select_analog_config(_selection_rrmse(all_rows, LANE_PPE, label))
-    win_rows, npz_arrays, skill = score(win["analog_k"], win["hybrid_w"],
-                                        full_metrics=True, progress=progress_every)
+    win_rows, npz_arrays, skill = score(
+        win["analog_k"], win["hybrid_w"], win["tendency_theta"], win["tendency_lag_yr"],
+        win["redundancy_theta"], full_metrics=True, progress=progress_every)
     all_rows += [r for r in win_rows if r["method"] == label and r["metric"] in _FULL_METRICS]
     all_rows += [r for r in win_rows if r["method"] != label]
 
@@ -1705,7 +1763,9 @@ def run_hgaoenkf_withholding_grid(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
     localization_km: float | None = None, shrinkage_lambda: float = 0.0, alpha: float = 1.0,
-    k_grid=K_GRID, hybrid_w_grid=HYBRID_W_GRID, exclude_yr: float = EXCLUDE_YR,
+    k_grid=K_GRID, hybrid_w_grid=HYBRID_W_GRID,
+    tendency_theta_grid=(0.0,), tendency_lag_yr_grid=(0.0,), redundancy_theta_grid=(0.0,),
+    exclude_yr: float = EXCLUDE_YR,
     selection: str = ANALOG_MISFIT, evidence_scale: float = EVIDENCE_SCALE,
     analog_localization_km: float | None = None,
     temporal_mode: str = TEMPORAL_DEFLATE,
@@ -1737,30 +1797,37 @@ def run_hgaoenkf_withholding_grid(
                 "alpha": alpha}
     estimator = hgaoenkf_estimator(selection)
     label = method_label(estimator, temporal_mode)
-    configs, grid_record = _analog_grid_configs(k_grid, hybrid_w_grid)
+    configs, grid_record = _analog_grid_configs(
+        k_grid, hybrid_w_grid, tendency_theta_grid, tendency_lag_yr_grid,
+        redundancy_theta_grid)
 
-    def score(k, w, modes, progress=None):
+    def score(k, w, tendency_theta, tendency_lag_yr, redundancy_theta, modes,
+              progress=None):
+        terms = dict(tendency_theta=tendency_theta, tendency_lag_yr=tendency_lag_yr,
+                     redundancy_theta=redundancy_theta)
         return _score_withholding_lane(
             prior, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
             space="pixel", reg_cols=reg_cols,
             make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=w,
                                       exclude_yr=exclude_yr, selection=selection,
                                       evidence_scale=evidence_scale,
-                                      analog_localization_km=analog_localization_km),
-            estimator=estimator, method_cols=analog_cols(k, w),
+                                      analog_localization_km=analog_localization_km,
+                                      **terms),
+            estimator=estimator, method_cols=analog_cols(k, w, **terms),
             temporal_modes=modes, k_folds=k_folds, fold_kind=fold_kind,
             b_scales=b_scales, seed=seed, progress_every=progress)
 
     all_rows: list[dict] = []
     t0 = time.time()
-    for ci, (k, w) in enumerate(configs):
-        lane, rows, _ = score(k, w, (temporal_mode,))
+    for ci, config in enumerate(configs):
+        lane, rows, _ = score(*config, (temporal_mode,))
         all_rows += [r for r in rows if r["method"] == label]
         _report_progress(f"analog-grid config ({lane})", ci + 1, len(configs), t0)
 
     win = select_analog_config(_selection_rrmse(all_rows, lane, label))
-    _, win_rows, predictions = score(win["analog_k"], win["hybrid_w"],
-                                     report_temporal_modes, progress=progress_every)
+    _, win_rows, predictions = score(
+        win["analog_k"], win["hybrid_w"], win["tendency_theta"], win["tendency_lag_yr"],
+        win["redundancy_theta"], report_temporal_modes, progress=progress_every)
     # The winner's rows under the selection treatment are already in from the grid pass at
     # this same config; what the re-run adds is the other treatments, the prior-free
     # references and the predictions npz.
@@ -1846,7 +1913,11 @@ def run_hgaoenkf_withholding_variants(
             make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=hybrid_w,
                                       evidence_scale=evidence_scale, **kw),
             estimator=tag,
-            method_cols=analog_cols(k, hybrid_w), temporal_modes=(temporal_mode,),
+            # A variant that varies an extension term has to say so in its rows, or the
+            # sweep is labelled as though the term were off.
+            method_cols=analog_cols(k, hybrid_w,
+                                    **{key: kw[key] for key in TERM_KEYS if key in kw}),
+            temporal_modes=(temporal_mode,),
             k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales, seed=seed)
         # The prior-free references do not depend on any of this, and the grid pass has
         # already written them.
