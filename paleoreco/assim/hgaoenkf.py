@@ -28,6 +28,20 @@ never had to agree with anything, and they restore that spread out of the archiv
 ordering, which selection otherwise reads only to build the exclusion band. The redundancy
 term is its selection-side counterpart and lives with the rules.
 
+One lag samples one timescale. ``tendency_extra_lags_yr`` carries the same construction at
+further lags and ``tendency_curvature_yr`` at second differences, so the prior gains the
+archive's flow across the band of timescales D-O variability actually occupies rather than
+at a single one. ``tendency_normalise`` puts every block on the amplitude of the reference
+lag, without which a stack is dominated by its longest lag and is little more than a
+rescaled copy of it. Both default to the single-lag term exactly.
+
+``preserve_obs_trace`` is what makes such a stack comparable to the estimator it extends.
+Augmenting the deviations inflates the prior, so the ``b_scale`` that suits it can fall
+below the grid a lane sweeps, and the estimator is then scored at an amplitude it did not
+ask for rather than on the directions it added. Rescaling the augmented ensemble to the
+unaugmented one's observation-space trace holds ``b_scale``'s meaning fixed and leaves the
+comparison about which directions the prior carries.
+
 The state and observation conventions are pixel 3DVar's: anomaly space throughout, H is
 nearest-cell selection, and the returned :class:`AnalysisResult` is pixel-space. Both
 covariances carry a Schur taper from the prior that built the static one, except that Sun et
@@ -102,6 +116,11 @@ class HGAOEnKF(Method):
     static covariance's lengthscale, so the two are tapered identically.
     ``tendency_theta`` weights the archive's local tendency modes into the analog
     covariance and ``tendency_lag_yr`` is the interval they are differenced over;
+    ``tendency_extra_lags_yr`` differences at further intervals and
+    ``tendency_curvature_yr`` at second differences, both empty by default;
+    ``tendency_normalise`` rescales every block to the reference lag's amplitude;
+    ``preserve_obs_trace`` holds the augmented ensemble at the unaugmented one's
+    observation-space trace so ``b_scale`` keeps its meaning.
     ``redundancy_theta`` charges a candidate for resembling one already selected.
     """
 
@@ -112,6 +131,10 @@ class HGAOEnKF(Method):
                  evidence_scale: float = EVIDENCE_SCALE,
                  analog_localization_km: float | None = None,
                  tendency_theta: float = 0.0, tendency_lag_yr: float = 0.0,
+                 tendency_extra_lags_yr: tuple[float, ...] = (),
+                 tendency_curvature_yr: tuple[float, ...] = (),
+                 tendency_normalise: bool = False,
+                 preserve_obs_trace: bool = False,
                  redundancy_theta: float = 0.0):
         if selection not in ANALOG_RULES:
             raise ValueError(f"unknown selection rule {selection!r}; expected one of {ANALOG_RULES}")
@@ -130,6 +153,26 @@ class HGAOEnKF(Method):
         if tendency_theta > 0.0 and tendency_lag_yr <= 0.0:
             raise ValueError("a positive tendency_theta needs a positive tendency_lag_yr; "
                              f"got {tendency_lag_yr}")
+        extra = tuple(float(v) for v in tendency_extra_lags_yr)
+        curvature = tuple(float(v) for v in tendency_curvature_yr)
+        # A non-positive extra lag differences a state against itself exactly as a
+        # non-positive reference lag would, so it is rejected for the same reason.
+        if any(v <= 0.0 for v in extra + curvature):
+            raise ValueError("every tendency lag must be positive; got extra "
+                             f"{extra} and curvature {curvature}")
+        # Blocks beyond the reference one are weighted by the same theta, so with the term
+        # switched off they would silently be nothing rather than the stack asked for.
+        if (extra or curvature) and tendency_theta <= 0.0:
+            raise ValueError("extra or curvature tendency lags need a positive "
+                             f"tendency_theta; got {tendency_theta}")
+        # Blocks are keyed by lag when their neighbours are looked up but stacked as a
+        # list, so a repeated first difference would be carried twice at full weight
+        # rather than once, which reads as a lag that carries more weight than it was given.
+        if float(tendency_lag_yr) in extra or len(set(extra)) != len(extra):
+            raise ValueError("tendency_extra_lags_yr must not repeat a lag or the "
+                             f"reference {tendency_lag_yr}; got {extra}")
+        if len(set(curvature)) != len(curvature):
+            raise ValueError(f"tendency_curvature_yr must not repeat a lag; got {curvature}")
         if redundancy_theta < 0.0:
             raise ValueError(f"redundancy_theta must be non-negative; got {redundancy_theta}")
         # The penalty is a cosine in the coordinates the evidence score whitens by, so it
@@ -167,38 +210,110 @@ class HGAOEnKF(Method):
             self.analog_taper_meta["localization_km"] = float(analog_localization_km)
         self.tendency_theta = float(tendency_theta)
         self.tendency_lag_yr = float(tendency_lag_yr)
+        self.tendency_extra_lags_yr = extra
+        self.tendency_curvature_yr = curvature
+        self.tendency_normalise = bool(tendency_normalise)
+        self.preserve_obs_trace = bool(preserve_obs_trace)
         self.redundancy_theta = float(redundancy_theta)
+        # One block per (lag, order). The reference lag leads, so it is the amplitude the
+        # others are normalised against and the single-lag term is the head of the list.
+        self._tendency_blocks = (
+            tuple([(self.tendency_lag_yr, False)]
+                  + [(lag, False) for lag in extra]
+                  + [(lag, True) for lag in curvature])
+            if self.tendency_theta > 0.0 else ())
         # The neighbours depend on the archive's age axis alone, so they are the same for
         # every network and every analysis this estimator runs.
-        self._tendency_pair = (self._tendency_neighbours()
-                               if self.tendency_theta > 0.0 else None)
+        self._tendency_pair = {lag: self._tendency_neighbours(lag)
+                               for lag, _ in self._tendency_blocks} or None
+        # The reference block's amplitude is the same for every block, so it is measured
+        # once here rather than per block.
+        self._tendency_scale = {}
+        if self.tendency_normalise and self._tendency_blocks:
+            reference = self._block_amplitude(self._tendency_blocks[0])
+            self._tendency_scale = {block: self._block_scale(block, reference)
+                                    for block in self._tendency_blocks}
 
-    def _tendency_neighbours(self) -> tuple[np.ndarray, np.ndarray]:
+    def _tendency_neighbours(self, lag: float) -> tuple[np.ndarray, np.ndarray]:
         """Pool rows one lag either side of each candidate, clamped at the archive's ends."""
         order = np.argsort(self.pool_ages, kind="stable")
         sorted_ages = self.pool_ages[order]
-        lo = order[nearest_age_index(self.pool_ages - self.tendency_lag_yr, sorted_ages)]
-        hi = order[nearest_age_index(self.pool_ages + self.tendency_lag_yr, sorted_ages)]
+        lo = order[nearest_age_index(self.pool_ages - lag, sorted_ages)]
+        hi = order[nearest_age_index(self.pool_ages + lag, sorted_ages)]
         return lo, hi
 
-    def _tendency_rows(self, members: np.ndarray,
-                       eligible: np.ndarray | None) -> np.ndarray:
-        """Centred tendency deviations for the selected members, ``(n_kept, D)``.
-
-        A member contributes nothing where the exclusion band rules out either neighbour,
-        which is what stops a lane whose archive spans the analysis age from reaching back
-        inside that band through the tendency, and nothing where the two neighbours
-        coincide at the ends of the archive and there is no interval to difference.
-        """
-        lo, hi = self._tendency_pair
+    def _block_rows(self, members: np.ndarray, block: tuple[float, bool],
+                    eligible: np.ndarray | None) -> np.ndarray:
+        """Raw difference rows for one (lag, order) block, before centring or weighting."""
+        lag, second = block
+        lo, hi = self._tendency_pair[lag]
         a, b = lo[members], hi[members]
         keep = a != b
         if eligible is not None:
             keep = keep & eligible[a] & eligible[b]
         if not keep.any():
             return np.empty((0, self.pool.shape[1]))
-        tend = 0.5 * (self.pool[b[keep]] - self.pool[a[keep]])
-        return self.tendency_theta * (tend - tend.mean(axis=0))
+        if second:
+            return (self.pool[b[keep]] - 2.0 * self.pool[members[keep]]
+                    + self.pool[a[keep]])
+        return 0.5 * (self.pool[b[keep]] - self.pool[a[keep]])
+
+    def _block_amplitude(self, block: tuple[float, bool]) -> float:
+        """Rms of one block's difference rows over the whole pool.
+
+        Measured on the pool rather than per analysis, so it is a property of the archive
+        and does not move with the observations.
+        """
+        rows = self._block_rows(np.arange(len(self.pool)), block, None)
+        return float(np.sqrt((rows ** 2).mean())) if len(rows) else 0.0
+
+    def _block_scale(self, block: tuple[float, bool], reference: float) -> float:
+        """Factor putting one block on the ``reference`` amplitude.
+
+        A difference over a longer lag is larger, so an unnormalised stack is dominated by
+        its longest block and carries little more than a rescaled copy of it.
+        """
+        amplitude = self._block_amplitude(block)
+        return reference / amplitude if amplitude > 0.0 else 0.0
+
+    def _tendency_rows(self, members: np.ndarray,
+                       eligible: np.ndarray | None) -> np.ndarray:
+        """Centred tendency deviations for the selected members, one block per lag.
+
+        A member contributes nothing to a block where the exclusion band rules out either
+        neighbour, which is what stops a lane whose archive spans the analysis age from
+        reaching back inside that band through the tendency, and nothing where the two
+        neighbours coincide at the ends of the archive and there is no interval to
+        difference. The test is per block, so a long lag can drop a member that a short
+        one keeps.
+        """
+        rows = []
+        for block in self._tendency_blocks:
+            tend = self._block_rows(members, block, eligible)
+            if not len(tend):
+                continue
+            scale = self._tendency_scale.get(block, 1.0)
+            if scale <= 0.0:
+                continue
+            rows.append((self.tendency_theta * scale) * (tend - tend.mean(axis=0)))
+        if not rows:
+            return np.empty((0, self.pool.shape[1]))
+        return np.vstack(rows)
+
+    def _trace_rescale(self, base: np.ndarray, dev: np.ndarray,
+                       gain: _HybridSweepGain) -> float:
+        """Factor holding ``dev`` at ``base``'s trace in whitened observation space.
+
+        The gain reads the ensemble only through ``H X'`` against R, so matching that
+        trace is what leaves ``b_scale`` meaning the amplitude it meant before the extra
+        rows were added. Returns 1.0 where the augmented ensemble is already the base one.
+        """
+        g, r = gain.gather, gain.r_diag
+        t_base = float(((base[:, g] ** 2) / r[None, :]).sum())
+        t_aug = float(((dev[:, g] ** 2) / r[None, :]).sum())
+        if t_aug <= 0.0 or t_base <= 0.0:
+            return 1.0
+        return float(np.sqrt(t_base / t_aug))
 
     def prepare_sweep(self, gather: np.ndarray, r_diag: np.ndarray,
                       b_scales: np.ndarray, *, age: float | None = None) -> _HybridSweepGain:
@@ -251,9 +366,11 @@ class HGAOEnKF(Method):
         selected = self.select(gain, y_anom)
         members = self.pool[selected]
         mu = members.mean(axis=0)
-        dev = members - mu                                    # (k, D)
+        dev = base = members - mu                             # (k, D)
         if self._tendency_pair is not None:
-            dev = np.vstack([dev, self._tendency_rows(selected, gain.eligible)])
+            dev = np.vstack([base, self._tendency_rows(selected, gain.eligible)])
+            if self.preserve_obs_trace:
+                dev = dev * self._trace_rescale(base, dev, gain)
         h_dev = dev[:, g].T                                   # (m, n_dev)
         # The normalizer counts the members, not the rows: the tendency rows are extra
         # directions added to the same k-member ensemble, so at zero weight they contribute
@@ -290,6 +407,9 @@ def make_hgaoenkf(
     k: int, hybrid_w: float, selection: str = ANALOG_MISFIT, exclude_yr: float = 0.0,
     evidence_scale: float = EVIDENCE_SCALE, analog_localization_km: float | None = None,
     tendency_theta: float = 0.0, tendency_lag_yr: float = 0.0,
+    tendency_extra_lags_yr: tuple[float, ...] = (),
+    tendency_curvature_yr: tuple[float, ...] = (),
+    tendency_normalise: bool = False, preserve_obs_trace: bool = False,
     redundancy_theta: float = 0.0,
 ):
     """A method factory building :class:`HGAOEnKF` from a built prior.
@@ -312,6 +432,10 @@ def make_hgaoenkf(
                         analog_localization_km=analog_localization_km,
                         tendency_theta=tendency_theta,
                         tendency_lag_yr=tendency_lag_yr,
+                        tendency_extra_lags_yr=tendency_extra_lags_yr,
+                        tendency_curvature_yr=tendency_curvature_yr,
+                        tendency_normalise=tendency_normalise,
+                        preserve_obs_trace=preserve_obs_trace,
                         redundancy_theta=redundancy_theta)
 
     return factory

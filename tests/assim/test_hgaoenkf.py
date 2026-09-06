@@ -400,3 +400,93 @@ def test_factory_rejects_invalid_arguments(cube, ages, lats, lons, valid):
     with pytest.raises(ValueError, match="evidence_scale"):
         make_hgaoenkf(cube, ages, lats, lons, k=4, hybrid_w=0.5,
                       evidence_scale=-1.0)(prior, shape)
+
+
+def test_a_single_lag_stack_is_the_published_tendency_term(setup):
+    """The extra blocks default to empty, so the shipped term must survive untouched.
+
+    Normalising is a no-op against the reference lag itself, and preserving the trace is
+    a no-op where there is one block whose amplitude already sets it, so both switches
+    have to leave a single-lag tendency exactly where it was.
+    """
+    kw = dict(k=8, hybrid_w=1.0, selection=ANALOG_EVIDENCE,
+              tendency_theta=1.0, tendency_lag_yr=100.0)
+    plain = _build(setup, **kw)
+    normalised = _build(setup, **kw, tendency_normalise=True)
+    members = np.array([5, 6, 7, 12])
+    assert np.allclose(plain._tendency_rows(members, None),
+                       normalised._tendency_rows(members, None))
+
+
+def test_extra_lags_add_one_block_of_rows_each(setup):
+    """Each block is the same construction at its own lag, stacked, not blended."""
+    m = _build(setup, tendency_theta=1.0, tendency_lag_yr=100.0,
+               tendency_extra_lags_yr=(200.0,), tendency_curvature_yr=(100.0,))
+    members = np.array([5, 6, 7])
+    rows = m._tendency_rows(members, None)
+    assert len(rows) == 3 * len(members)
+    first = 0.5 * (setup["pool"][members + 1] - setup["pool"][members - 1])
+    assert np.allclose(rows[:len(members)], first - first.mean(axis=0))
+    curv = (setup["pool"][members + 1] - 2.0 * setup["pool"][members]
+            + setup["pool"][members - 1])
+    assert np.allclose(rows[2 * len(members):], curv - curv.mean(axis=0))
+
+
+def test_normalising_puts_every_block_on_the_reference_lag_amplitude(setup):
+    """Without it a stack is dominated by its longest lag, which is the failure it fixes."""
+    m = _build(setup, tendency_theta=1.0, tendency_lag_yr=100.0,
+               tendency_extra_lags_yr=(300.0,), tendency_normalise=True)
+    every = np.arange(len(setup["pool"]))
+    ref = m._block_rows(every, (100.0, False), None)
+    far = m._block_rows(every, (300.0, False), None)
+    scaled = m._block_scale((300.0, False), m._block_amplitude((100.0, False))) * far
+    assert np.isclose(np.sqrt((scaled ** 2).mean()), np.sqrt((ref ** 2).mean()))
+
+
+def test_preserving_the_trace_leaves_the_whitened_observation_trace_alone(setup):
+    """b_scale only keeps its meaning if the extra rows change directions, not amplitude."""
+    kw = dict(k=8, hybrid_w=1.0, selection=ANALOG_EVIDENCE)
+    plain = _build(setup, **kw)
+    stacked = _build(setup, **kw, tendency_theta=1.0, tendency_lag_yr=100.0,
+                     tendency_extra_lags_yr=(200.0, 300.0), tendency_normalise=True,
+                     preserve_obs_trace=True)
+    g, r = setup["gather"], setup["r"]
+    gain = stacked.prepare_sweep(g, r, B_SCALES)
+    selected = stacked.select(gain, setup["y"])
+    members = stacked.pool[selected]
+    base = members - members.mean(axis=0)
+    dev = np.vstack([base, stacked._tendency_rows(selected, None)])
+    dev = dev * stacked._trace_rescale(base, dev, gain)
+    assert np.isclose(((dev[:, g] ** 2) / r[None, :]).sum(),
+                      ((base[:, g] ** 2) / r[None, :]).sum())
+    # and the directions really did change, or the rescale is hiding an inert term
+    zero = np.zeros(setup["D"])
+    assert not np.allclose(
+        plain.apply_sweep(plain.prepare_sweep(g, r, B_SCALES), setup["y"], zero)[0].mean_anom,
+        stacked.apply_sweep(gain, setup["y"], zero)[0].mean_anom)
+
+
+@pytest.mark.parametrize("kw", [
+    dict(tendency_theta=1.0, tendency_lag_yr=100.0, tendency_extra_lags_yr=(0.0,)),
+    dict(tendency_theta=1.0, tendency_lag_yr=100.0, tendency_curvature_yr=(-50.0,)),
+    dict(tendency_theta=0.0, tendency_lag_yr=0.0, tendency_extra_lags_yr=(100.0,)),
+])
+def test_a_stack_that_would_be_silently_inert_is_rejected(setup, kw):
+    """A zero lag differences a state against itself and a zero theta erases the stack."""
+    with pytest.raises(ValueError):
+        _build(setup, **kw)
+
+
+@pytest.mark.parametrize("kw", [
+    dict(tendency_extra_lags_yr=(100.0, 200.0)),          # repeats the reference lag
+    dict(tendency_extra_lags_yr=(200.0, 200.0)),
+    dict(tendency_curvature_yr=(200.0, 200.0)),
+])
+def test_a_repeated_lag_is_rejected_rather_than_stacked_twice(setup, kw):
+    """Blocks are keyed by lag for lookup but stacked as a list, so a repeat doubles it.
+
+    Nothing downstream would surface that: the covariance weights one timescale twice,
+    which reads as a lag that matters more rather than as a configuration error.
+    """
+    with pytest.raises(ValueError, match="repeat"):
+        _build(setup, tendency_theta=1.0, tendency_lag_yr=100.0, **kw)
