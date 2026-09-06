@@ -439,8 +439,27 @@ def test_normalising_puts_every_block_on_the_reference_lag_amplitude(setup):
     every = np.arange(len(setup["pool"]))
     ref = m._block_rows(every, (100.0, False), None)
     far = m._block_rows(every, (300.0, False), None)
-    scaled = m._block_scale((300.0, False), m._block_amplitude((100.0, False))) * far
+    scaled = far * (m._block_amplitude((100.0, False))
+                    / m._block_amplitude((300.0, False)))
     assert np.isclose(np.sqrt((scaled ** 2).mean()), np.sqrt((ref ** 2).mean()))
+
+
+def test_a_clamped_neighbour_carries_the_block_amplitude(setup):
+    """The archive's ends leave no room for a centred difference, and a damped row there
+    would be a quieter mode rather than the timescale the block names.
+
+    A first difference keeps the member and is carried over the interval that exists. A
+    second difference has no such reading, so the member leaves that block instead.
+    """
+    m = _build(setup, tendency_theta=1.0, tendency_lag_yr=100.0,
+               tendency_curvature_yr=(100.0,))
+    pool = setup["pool"]
+    edge, interior = np.array([0]), np.array([5])
+    assert np.allclose(m._block_rows(interior, (100.0, False), None),
+                       0.5 * (pool[6] - pool[4]))
+    assert np.allclose(m._block_rows(edge, (100.0, False), None), pool[1] - pool[0])
+    assert len(m._block_rows(interior, (100.0, True), None)) == 1
+    assert len(m._block_rows(edge, (100.0, True), None)) == 0
 
 
 def test_preserving_the_trace_leaves_the_whitened_observation_trace_alone(setup):

@@ -14,7 +14,9 @@ the algorithm here.
 ``hybrid_w`` is Sun et al.'s hybrid weight alpha: at 0 the gain is purely static, at 1
 purely analog. The prior mean is the analog mean at every weight. Weight 0 reproduces the
 mean of their AOEnKF-B but not its spread, since Eq. 5 reduces the analog deviations where
-AOEnKF-B carries the climatological ones.
+AOEnKF-B carries the climatological ones. At weight 1 the static gain leaves the update
+entirely, and B reaches the analysis only through whatever the selection rule makes of it, so
+the hybrid is a limit of the scheme rather than a fixed part of it.
 
 How candidates are ranked is a choice the family leaves open; :mod:`paleoreco.assim.analog`
 holds the rules, and ``selection`` names one.
@@ -33,14 +35,19 @@ further lags and ``tendency_curvature_yr`` at second differences, so the prior g
 archive's flow across the band of timescales D-O variability actually occupies rather than
 at a single one. ``tendency_normalise`` puts every block on the amplitude of the reference
 lag, without which a stack is dominated by its longest lag and is little more than a
-rescaled copy of it. Both default to the single-lag term exactly.
+rescaled copy of it. The reference carries no distinction beyond setting that amplitude:
+choosing a different one rescales every block by one factor, which ``tendency_theta`` already
+spans. Both default to the single-lag term exactly.
 
 ``preserve_obs_trace`` is what makes such a stack comparable to the estimator it extends.
-Augmenting the deviations inflates the prior, so the ``b_scale`` that suits it can fall
-below the grid a lane sweeps, and the estimator is then scored at an amplitude it did not
-ask for rather than on the directions it added. Rescaling the augmented ensemble to the
-unaugmented one's observation-space trace holds ``b_scale``'s meaning fixed and leaves the
-comparison about which directions the prior carries.
+``b_scale`` multiplies the covariance, so a constant factor on that covariance is a
+relabelling of the amplitude a lane sweeps; the ``k - 1`` normalizer and the reference lag's
+own amplitude are both such constants, and neither moves an analysis. Augmenting the
+deviations is not constant: it inflates the prior by an amount that grows with
+``tendency_theta``, so the amplitude that suits the stack moves with the weight and the two
+cannot be read apart. Rescaling the augmented ensemble to the unaugmented one's
+observation-space trace holds the amplitude where it was, which leaves weight and amplitude
+separable and the comparison about which directions the prior carries.
 
 The state and observation conventions are pixel 3DVar's: anomaly space throughout, H is
 nearest-cell selection, and the returned :class:`AnalysisResult` is pixel-space. Both
@@ -118,9 +125,10 @@ class HGAOEnKF(Method):
     covariance and ``tendency_lag_yr`` is the interval they are differenced over;
     ``tendency_extra_lags_yr`` differences at further intervals and
     ``tendency_curvature_yr`` at second differences, both empty by default;
-    ``tendency_normalise`` rescales every block to the reference lag's amplitude;
+    ``tendency_normalise`` rescales every block to the reference lag's amplitude, so which
+    lag is the reference sets a scale ``tendency_theta`` already spans;
     ``preserve_obs_trace`` holds the augmented ensemble at the unaugmented one's
-    observation-space trace so ``b_scale`` keeps its meaning.
+    observation-space trace, which keeps the flow weight and ``b_scale`` separable.
     ``redundancy_theta`` charges a candidate for resembling one already selected.
     """
 
@@ -225,14 +233,16 @@ class HGAOEnKF(Method):
         # The neighbours depend on the archive's age axis alone, so they are the same for
         # every network and every analysis this estimator runs.
         self._tendency_pair = {lag: self._tendency_neighbours(lag)
-                               for lag, _ in self._tendency_blocks} or None
-        # The reference block's amplitude is the same for every block, so it is measured
-        # once here rather than per block.
+                               for lag, _ in self._tendency_blocks}
+        # Every block is put on the reference block's amplitude, so each amplitude is measured
+        # once over the pool rather than once per block it is compared against. A difference
+        # over a longer lag is larger, and an unnormalised stack is dominated by its longest.
         self._tendency_scale = {}
         if self.tendency_normalise and self._tendency_blocks:
-            reference = self._block_amplitude(self._tendency_blocks[0])
-            self._tendency_scale = {block: self._block_scale(block, reference)
-                                    for block in self._tendency_blocks}
+            amplitude = {block: self._block_amplitude(block) for block in self._tendency_blocks}
+            reference = amplitude[self._tendency_blocks[0]]
+            self._tendency_scale = {block: (reference / amp if amp > 0.0 else 0.0)
+                                    for block, amp in amplitude.items()}
 
     def _tendency_neighbours(self, lag: float) -> tuple[np.ndarray, np.ndarray]:
         """Pool rows one lag either side of each candidate, clamped at the archive's ends."""
@@ -244,19 +254,37 @@ class HGAOEnKF(Method):
 
     def _block_rows(self, members: np.ndarray, block: tuple[float, bool],
                     eligible: np.ndarray | None) -> np.ndarray:
-        """Raw difference rows for one (lag, order) block, before centring or weighting."""
+        """Raw difference rows for one (lag, order) block, before centring or weighting.
+
+        The neighbour lookup clamps at the archive's ends, so a row there spans less than the
+        nominal interval. Dividing a first difference through the interval actually differenced
+        carries it at the block's own amplitude, leaving an end row a one-sided difference
+        rather than a centred one shrunk towards zero. A second difference has no such reading:
+        with one arm clamped it collapses towards a first difference, so those rows drop out.
+        """
         lag, second = block
         lo, hi = self._tendency_pair[lag]
         a, b = lo[members], hi[members]
-        keep = a != b
+        keep = a != b            # coincident neighbours leave no interval to divide through
         if eligible is not None:
             keep = keep & eligible[a] & eligible[b]
+        if second:
+            # Tested on the age asked for rather than the interval returned: a lag that is not
+            # a whole number of archive steps rounds one arm short for every member, which
+            # would empty the block instead of trimming the ends the archive cannot span.
+            age = self.pool_ages[members]
+            keep = (keep & (age - lag >= self.pool_ages.min())
+                    & (age + lag <= self.pool_ages.max()))
         if not keep.any():
             return np.empty((0, self.pool.shape[1]))
         if second:
             return (self.pool[b[keep]] - 2.0 * self.pool[members[keep]]
                     + self.pool[a[keep]])
-        return 0.5 * (self.pool[b[keep]] - self.pool[a[keep]])
+        # The factor is 1 wherever both arms are whole, so an interior row is the centred
+        # difference it always was.
+        span = (self.pool_ages[b] - self.pool_ages[a])[keep]
+        return (0.5 * (self.pool[b[keep]] - self.pool[a[keep]])
+                * (2.0 * lag / span)[:, None])
 
     def _block_amplitude(self, block: tuple[float, bool]) -> float:
         """Rms of one block's difference rows over the whole pool.
@@ -267,25 +295,16 @@ class HGAOEnKF(Method):
         rows = self._block_rows(np.arange(len(self.pool)), block, None)
         return float(np.sqrt((rows ** 2).mean())) if len(rows) else 0.0
 
-    def _block_scale(self, block: tuple[float, bool], reference: float) -> float:
-        """Factor putting one block on the ``reference`` amplitude.
-
-        A difference over a longer lag is larger, so an unnormalised stack is dominated by
-        its longest block and carries little more than a rescaled copy of it.
-        """
-        amplitude = self._block_amplitude(block)
-        return reference / amplitude if amplitude > 0.0 else 0.0
-
     def _tendency_rows(self, members: np.ndarray,
                        eligible: np.ndarray | None) -> np.ndarray:
         """Centred tendency deviations for the selected members, one block per lag.
 
         A member contributes nothing to a block where the exclusion band rules out either
         neighbour, which is what stops a lane whose archive spans the analysis age from
-        reaching back inside that band through the tendency, and nothing where the two
-        neighbours coincide at the ends of the archive and there is no interval to
-        difference. The test is per block, so a long lag can drop a member that a short
-        one keeps.
+        reaching back inside that band through the tendency, nothing where the two
+        neighbours coincide and there is no interval to difference, and nothing to a
+        curvature block where the archive's end leaves it one short arm. The test is per
+        block, so a long lag can drop a member that a short one keeps.
         """
         rows = []
         for block in self._tendency_blocks:
@@ -367,14 +386,15 @@ class HGAOEnKF(Method):
         members = self.pool[selected]
         mu = members.mean(axis=0)
         dev = base = members - mu                             # (k, D)
-        if self._tendency_pair is not None:
+        if self._tendency_blocks:
             dev = np.vstack([base, self._tendency_rows(selected, gain.eligible)])
             if self.preserve_obs_trace:
                 dev = dev * self._trace_rescale(base, dev, gain)
         h_dev = dev[:, g].T                                   # (m, n_dev)
         # The normalizer counts the members, not the rows: the tendency rows are extra
         # directions added to the same k-member ensemble, so at zero weight they contribute
-        # nothing and the covariance is the published one exactly.
+        # nothing and the covariance is the published one exactly. Counting the rows instead
+        # would scale both blocks by one constant, which b_scale already spans.
         P_obs = (dev.T @ h_dev.T) / (self.k - 1.0)            # B_a H^T, never B_a itself
         S_obs = (h_dev @ h_dev.T) / (self.k - 1.0)            # H B_a H^T
         if gain.taper is not None:
