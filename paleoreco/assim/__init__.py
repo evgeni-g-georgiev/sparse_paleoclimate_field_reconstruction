@@ -20,6 +20,7 @@ Methods and drivers, reached by submodule path rather than re-exported:
 * :mod:`paleoreco.assim.latent`       - latent-space 3DVar.
 * :mod:`paleoreco.assim.hgaoenkf`     - hybrid gain analog offline EnKF.
 * :mod:`paleoreco.assim.experiments`  - PPE, trajectory and withholding lane runners.
+* :mod:`paleoreco.assim.reconstruction` - full age axis assimilated from a real network.
 """
 
 from paleoreco.assim.observations import (
