@@ -36,11 +36,15 @@ class AnalysisResult:
     """Posterior of one assimilation, in anomaly space.
 
     ``mean_anom`` is ``(2, n_lat, n_lon)``; ``posterior_var`` (same shape) is filled
-    by whichever method can produce it.
+    by whichever method can produce it. ``posterior_cross_var`` is ``(n_lat, n_lon)``,
+    the posterior covariance between the two channels at each cell: the spread of a
+    seasonal contrast is a difference of correlated channels, which per-channel
+    variances alone cannot give.
     """
 
     mean_anom: np.ndarray
     posterior_var: np.ndarray | None = None
+    posterior_cross_var: np.ndarray | None = None
 
     def to_celsius(self, clim_mean: np.ndarray) -> np.ndarray:
         """Posterior mean in degC: anomaly plus the per-cell climatology."""
