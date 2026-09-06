@@ -136,6 +136,24 @@ TENDENCY_LAG_YR_GRID = (200.0, 400.0)
 # tendency term alone. The rule keeps its ``redundancy`` argument, so restoring the axis
 # here is all that a sweep needs.
 REDUNDANCY_THETA_GRID = (0.0,)
+# The timescales multiscale tendency augmentation differences the archive over. A single
+# lag samples a single band of variability, and the reference lag sets the amplitude the
+# other blocks are normalised against, so moving it is equivalent to rescaling the weight.
+# The stack is a property of the estimator rather than an axis: tuning it as well would add
+# a knob the estimator it extends never had, which is what the weight grid is for.
+MT_REFERENCE_LAG_YR = 400.0
+MT_EXTRA_LAGS_YR = (200.0, 800.0, 1200.0, 1600.0, 2400.0, 3200.0)
+MT_CURVATURE_YR = (400.0, 1600.0)
+MT_THETA_GRID = (0.0, 1.0, 2.0)
+# Stacks a sensitivity pass scores the shipped one against, as ``(extra lags, curvature)``.
+# All run at the same weight and the same observation-space trace, so the only difference
+# between them is the set of timescales. ``1lag`` is the single-difference term.
+MT_STACKS = {
+    "1lag": ((), ()),
+    "3lag": ((800.0, 1600.0), ()),
+    "7lag": (MT_EXTRA_LAGS_YR, ()),
+    "7lag_curv": (MT_EXTRA_LAGS_YR, MT_CURVATURE_YR),
+}
 # Width of the band around the analysis age dropped from the analog pool, and the widths
 # a sensitivity pass sweeps. Only bites where the prior spans the age being reconstructed.
 EXCLUDE_YR = 1000.0
@@ -153,6 +171,9 @@ LANE_TRAJECTORY = "trajectory"
 # every row still says which pair of choices it came from.
 ESTIMATOR_3DVAR = "3dvar"
 ESTIMATOR_HGAOENKF = "hgaoenkf"
+# The analog estimator carrying a multiscale flow stack. It selects by the same rule as the
+# tag below it, so it is named here rather than derived from a selection rule.
+ESTIMATOR_HGAOENKF_MT = f"{ESTIMATOR_HGAOENKF}_mt"
 _TEMPORAL_SUFFIX = {TEMPORAL_OFF: "", TEMPORAL_ADD: "_temporal_add",
                     TEMPORAL_DEFLATE: "_temporal_deflate"}
 # Estimator tag per analog selection rule. The map is explicit rather than derived from the
@@ -210,22 +231,32 @@ _NAN_REG = {"localization_km": np.nan, "shrinkage_lambda": np.nan, "alpha": np.n
 # The extension terms, named once so a row's columns cannot drift from the keywords the
 # estimator was built with.
 TERM_KEYS = ("tendency_theta", "tendency_lag_yr", "redundancy_theta")
+# How the flow stack was built, recorded so a row says which estimator wrote it. These stay
+# out of TERM_KEYS: that tuple drives the grid's winner selection, and neither switch is
+# tuned, so admitting them there would add axes to a search that does not vary them.
+_STACK_KEYS = ("tendency_normalise", "preserve_obs_trace")
 # Analog-ensemble columns for rows from an estimator that draws no analog ensemble.
 _NAN_ANALOG = {"analog_k": np.nan, "hybrid_w": np.nan,
-               **{key: np.nan for key in TERM_KEYS}}
+               **{key: np.nan for key in TERM_KEYS + _STACK_KEYS}}
 
 
 def analog_cols(k: int, hybrid_w: float, *, tendency_theta: float = 0.0,
-                tendency_lag_yr: float = 0.0, redundancy_theta: float = 0.0) -> dict:
+                tendency_lag_yr: float = 0.0, redundancy_theta: float = 0.0,
+                tendency_normalise: bool = False,
+                preserve_obs_trace: bool = False) -> dict:
     """The analog columns for a row, as :func:`_NAN_REG` does for the taper.
 
     The extension terms default to off, which is what an estimator that does not carry
     them is: a row saying zero and a row from before they existed mean the same thing.
+    The two switches are booleans on the estimator and floats here, so one column type
+    serves every analog column and a reader can compare them without a cast.
     """
     return {"analog_k": float(k), "hybrid_w": float(hybrid_w),
             "tendency_theta": float(tendency_theta),
             "tendency_lag_yr": float(tendency_lag_yr),
-            "redundancy_theta": float(redundancy_theta)}
+            "redundancy_theta": float(redundancy_theta),
+            "tendency_normalise": float(tendency_normalise),
+            "preserve_obs_trace": float(preserve_obs_trace)}
 
 
 # ---------------------------------------------------------------------------
@@ -544,8 +575,27 @@ def _timescale_rows(truth_anom: np.ndarray, recon_anom: np.ndarray, safe_valid: 
 
 
 def _append_csv(path: str, rows: list[dict]) -> None:
-    """Append metric rows to the tidy CSV, writing the header once."""
+    """Append metric rows to the tidy CSV, reconciling a file written to a narrower schema.
+
+    A plain append writes the header only for a new file, so rows carrying a column the
+    file predates would land one field out of step from the first extra column onward, and
+    nothing downstream would surface it. Where the headers already agree, which is every
+    append within one schema, only the header is read.
+    """
     df = pd.DataFrame(rows)
+    if os.path.exists(path):
+        header = list(pd.read_csv(path, nrows=0).columns)
+        if header != list(df.columns):
+            # Ordered by the incoming rows rather than by the file, so the reconciled
+            # header is the one the next append will bring and the rewrite happens once
+            # instead of on every append thereafter. Written aside and moved into place,
+            # since a rewrite interrupted midway would otherwise lose the whole lane.
+            cols = list(df.columns) + [c for c in header if c not in df.columns]
+            merged = pd.concat([pd.read_csv(path), df], ignore_index=True)[cols]
+            tmp = f"{path}.tmp"
+            merged.to_csv(tmp, index=False)
+            os.replace(tmp, path)
+            return
     df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
 
 
@@ -1688,6 +1738,26 @@ def _analog_grid_configs(k_grid, hybrid_w_grid,
     return configs, record
 
 
+def _mt_kwargs(extra_lags_yr, curvature_yr, normalise, preserve_trace):
+    """The flow-stack settings split into the row columns and the estimator keywords.
+
+    The columns are a subset of the keywords rather than a parallel description of them, so
+    a row cannot claim a stack the estimator was not built with. The lag sets stay out of
+    the columns: a tuple has no place in a tidy cell, and the config JSON records them.
+    """
+    switches = {"tendency_normalise": bool(normalise),
+                "preserve_obs_trace": bool(preserve_trace)}
+    stack = {"tendency_extra_lags_yr": tuple(float(v) for v in extra_lags_yr),
+             "tendency_curvature_yr": tuple(float(v) for v in curvature_yr), **switches}
+    return switches, stack
+
+
+def _mt_record(stack: dict) -> dict:
+    """JSON-safe record of the flow stack an analog grid held fixed."""
+    return {key: (list(value) if isinstance(value, tuple) else value)
+            for key, value in stack.items()}
+
+
 def run_hgaoenkf_ppe_grid(
     cube: np.ndarray, ages: np.ndarray, lats: np.ndarray, lons: np.ndarray,
     valid: np.ndarray, long: pd.DataFrame, out_dir: str, *,
@@ -1696,6 +1766,10 @@ def run_hgaoenkf_ppe_grid(
     tendency_theta_grid=(0.0,), tendency_lag_yr_grid=(0.0,), redundancy_theta_grid=(0.0,),
     selection: str = ANALOG_MISFIT, evidence_scale: float = EVIDENCE_SCALE,
     analog_localization_km: float | None = None,
+    tendency_extra_lags_yr: tuple[float, ...] = (),
+    tendency_curvature_yr: tuple[float, ...] = (),
+    tendency_normalise: bool = False, preserve_obs_trace: bool = False,
+    estimator: str | None = None,
     b_scales: tuple[float, ...] = B_SCALES,
     n_shapes: int = 5, n_select: int = 4, n_noise: int = 20, truth_stride: int = 10,
     dist_edges_km: np.ndarray | None = None, seed: int = 0,
@@ -1709,7 +1783,9 @@ def run_hgaoenkf_ppe_grid(
     differently regularized covariances.
 
     ``selection`` names the analog rule and so the estimator the rows are tagged with, which
-    is what lets two rules share a metrics CSV and still be compared row for row.
+    is what lets two rules share a metrics CSV and still be compared row for row. The flow
+    stack is held across the grid rather than swept, so ``estimator`` names an estimator two
+    rules cannot distinguish; it defaults to the tag the rule alone implies.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
     prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
@@ -1721,8 +1797,11 @@ def run_hgaoenkf_ppe_grid(
     truth_anoms = truth_cube - truth_clim
     reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
                 "alpha": alpha}
-    estimator = hgaoenkf_estimator(selection)
+    if estimator is None:
+        estimator = hgaoenkf_estimator(selection)
     label = method_label(estimator)
+    switches, stack = _mt_kwargs(tendency_extra_lags_yr, tendency_curvature_yr,
+                                 tendency_normalise, preserve_obs_trace)
     configs, grid_record = _analog_grid_configs(
         k_grid, hybrid_w_grid, tendency_theta_grid, tendency_lag_yr_grid,
         redundancy_theta_grid)
@@ -1731,14 +1810,20 @@ def run_hgaoenkf_ppe_grid(
               full_metrics, progress=None):
         terms = dict(tendency_theta=tendency_theta, tendency_lag_yr=tendency_lag_yr,
                      redundancy_theta=redundancy_theta)
+        # A stack needs a positive weight to be anything, and the estimator rejects one
+        # without it, so the zero-weight corner drops the stack rather than failing to
+        # build. That corner is the ablation the grid is read for, and its columns say the
+        # flow was off rather than describing a stack the analysis never carried.
+        on = tendency_theta > 0.0
         return _score_ppe_lane(
             truth_anoms, prior, long, lats, lons,
             lane=LANE_PPE, space="pixel", reg_cols=reg_cols,
             make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=w,
                                       selection=selection, evidence_scale=evidence_scale,
                                       analog_localization_km=analog_localization_km,
-                                      **terms),
-            estimator=estimator, method_cols=analog_cols(k, w, **terms),
+                                      **terms, **(stack if on else {})),
+            estimator=estimator,
+            method_cols=analog_cols(k, w, **terms, **(switches if on else {})),
             b_scales=b_scales, n_shapes=n_shapes, n_select=n_select, n_noise=n_noise,
             dist_edges_km=dist_edges_km, seed=seed, full_metrics=full_metrics,
             npz_extra={"truth_clim": truth_clim}, progress_every=progress)
@@ -1764,7 +1849,7 @@ def run_hgaoenkf_ppe_grid(
         extra={"estimator": estimator, "selection": selection,
                "evidence_scale": float(evidence_scale),
                "analog_localization_km": analog_localization_km,
-               "selected": win, **grid_record})
+               **_mt_record(stack), "selected": win, **grid_record})
     _write_ppe_artifacts(out_dir, LANE_PPE, all_rows, npz_arrays, skill, config)
     return pd.DataFrame(all_rows)
 
@@ -1778,6 +1863,10 @@ def run_hgaoenkf_withholding_grid(
     exclude_yr: float = EXCLUDE_YR,
     selection: str = ANALOG_MISFIT, evidence_scale: float = EVIDENCE_SCALE,
     analog_localization_km: float | None = None,
+    tendency_extra_lags_yr: tuple[float, ...] = (),
+    tendency_curvature_yr: tuple[float, ...] = (),
+    tendency_normalise: bool = False, preserve_obs_trace: bool = False,
+    estimator: str | None = None,
     temporal_mode: str = TEMPORAL_DEFLATE,
     report_temporal_modes: tuple[str, ...] = (TEMPORAL_DEFLATE,),
     k_folds: int = 5, fold_kind: str = "random",
@@ -1797,7 +1886,9 @@ def run_hgaoenkf_withholding_grid(
     parameters with it. ``report_temporal_modes`` are the treatments the winner is then
     scored under, so the staleness ladder is read at one operating point rather than
     re-selecting the analog parameters per treatment. ``selection`` names the analog rule
-    and so the estimator the rows are tagged with.
+    and so the estimator the rows are tagged with; the flow stack is held across the grid
+    rather than swept, so ``estimator`` names an estimator two rules cannot distinguish and
+    defaults to the tag the rule alone implies.
     """
     prior_idx = np.arange(len(ages))
     prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
@@ -1805,8 +1896,11 @@ def run_hgaoenkf_withholding_grid(
                         shrinkage_lambda=shrinkage_lambda, alpha=alpha)
     reg_cols = {"localization_km": localization_km, "shrinkage_lambda": shrinkage_lambda,
                 "alpha": alpha}
-    estimator = hgaoenkf_estimator(selection)
+    if estimator is None:
+        estimator = hgaoenkf_estimator(selection)
     label = method_label(estimator, temporal_mode)
+    switches, stack = _mt_kwargs(tendency_extra_lags_yr, tendency_curvature_yr,
+                                 tendency_normalise, preserve_obs_trace)
     configs, grid_record = _analog_grid_configs(
         k_grid, hybrid_w_grid, tendency_theta_grid, tendency_lag_yr_grid,
         redundancy_theta_grid)
@@ -1815,6 +1909,7 @@ def run_hgaoenkf_withholding_grid(
               progress=None):
         terms = dict(tendency_theta=tendency_theta, tendency_lag_yr=tendency_lag_yr,
                      redundancy_theta=redundancy_theta)
+        on = tendency_theta > 0.0
         return _score_withholding_lane(
             prior, long, ages, lats, lons, cube=cube, prior_age_indices=prior_idx,
             space="pixel", reg_cols=reg_cols,
@@ -1822,8 +1917,9 @@ def run_hgaoenkf_withholding_grid(
                                       exclude_yr=exclude_yr, selection=selection,
                                       evidence_scale=evidence_scale,
                                       analog_localization_km=analog_localization_km,
-                                      **terms),
-            estimator=estimator, method_cols=analog_cols(k, w, **terms),
+                                      **terms, **(stack if on else {})),
+            estimator=estimator,
+            method_cols=analog_cols(k, w, **terms, **(switches if on else {})),
             temporal_modes=modes, k_folds=k_folds, fold_kind=fold_kind,
             b_scales=b_scales, seed=seed, progress_every=progress)
 
@@ -1847,7 +1943,8 @@ def run_hgaoenkf_withholding_grid(
         lane, "pixel", prior, k_folds, fold_kind, b_scales, seed, reg_cols,
         extra={"estimator": estimator, "selection": selection,
                "evidence_scale": float(evidence_scale),
-               "analog_localization_km": analog_localization_km, "selected": win,
+               "analog_localization_km": analog_localization_km,
+               **_mt_record(stack), "selected": win,
                "exclude_yr": exclude_yr, "temporal_mode": temporal_mode,
                "report_temporal_modes": list(report_temporal_modes),
                "rep_var_full": _rep_var_full(predictions), **grid_record})
@@ -1882,6 +1979,15 @@ def evidence_scale_estimator(scale: float) -> str:
     so it names the estimator rather than joining the analog grid.
     """
     return f"{hgaoenkf_estimator(ANALOG_EVIDENCE)}_c{scale:g}"
+
+
+def mt_stack_estimator(name: str) -> str:
+    """Estimator tag for one flow stack, named by its entry in :data:`MT_STACKS`.
+
+    A sensitivity pass rather than a tuning axis, for the reason the evidence scale is:
+    the stack defines the estimator, so it names it instead of joining the analog grid.
+    """
+    return f"{ESTIMATOR_HGAOENKF_MT}_{name}"
 
 
 def run_hgaoenkf_withholding_variants(
@@ -1923,10 +2029,11 @@ def run_hgaoenkf_withholding_variants(
             make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=hybrid_w,
                                       evidence_scale=evidence_scale, **kw),
             estimator=tag,
-            # A variant that varies an extension term has to say so in its rows, or the
-            # sweep is labelled as though the term were off.
-            method_cols=analog_cols(k, hybrid_w,
-                                    **{key: kw[key] for key in TERM_KEYS if key in kw}),
+            # A variant that varies an extension term or the flow stack has to say so in
+            # its rows, or the sweep is labelled as though the term were off.
+            method_cols=analog_cols(k, hybrid_w, **{key: kw[key]
+                                                    for key in TERM_KEYS + _STACK_KEYS
+                                                    if key in kw}),
             temporal_modes=(temporal_mode,),
             k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales, seed=seed)
         # The prior-free references do not depend on any of this, and the grid pass has

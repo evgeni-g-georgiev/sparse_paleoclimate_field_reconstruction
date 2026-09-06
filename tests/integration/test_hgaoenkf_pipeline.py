@@ -270,3 +270,78 @@ def test_3dvar_rows_are_unchanged_by_the_estimator_parameters(
     assert set(a["method"]) == {"3dvar", "nearest", "idw"}
     assert a["analog_k"].isna().all()
     pd.testing.assert_frame_equal(a, b)
+
+
+def test_a_grid_tags_its_rows_with_the_estimator_it_was_given(
+    tmp_path, cube, ages, lats, lons, valid, obs_long
+):
+    """The flow stack is held across the grid, so the rule alone cannot name the estimator."""
+    out = tmp_path / "mt"
+    df = ex.run_hgaoenkf_ppe_grid(
+        cube, ages, lats, lons, valid, obs_long, str(out),
+        estimator=ex.ESTIMATOR_HGAOENKF_MT, tendency_theta_grid=(1.0,),
+        tendency_lag_yr_grid=(100.0,), tendency_extra_lags_yr=(200.0,),
+        tendency_normalise=True, preserve_obs_trace=True,
+        b_scales=B_SCALES, n_shapes=3, n_select=2, n_noise=1, truth_stride=1, seed=0,
+        **TINY_GRID)
+
+    assert ex.ESTIMATOR_HGAOENKF_MT in set(df["method"])
+    assert ex.hgaoenkf_estimator(ANALOG_MISFIT) not in set(df["method"])
+    mt = df[df["method"] == ex.ESTIMATOR_HGAOENKF_MT]
+    assert (mt["tendency_normalise"] == 1.0).all()
+    assert (mt["preserve_obs_trace"] == 1.0).all()
+    cfg = json.load(open(out / "ppe_config.json"))
+    assert cfg["estimator"] == ex.ESTIMATOR_HGAOENKF_MT
+    assert cfg["tendency_extra_lags_yr"] == [200.0]
+
+
+def test_a_zero_weight_grid_point_drops_the_stack_instead_of_failing_to_build(
+    tmp_path, cube, ages, lats, lons, valid, obs_long
+):
+    """The estimator rejects a stack at zero weight, and that corner is the ablation.
+
+    Dropping it there is what lets one grid hold both the flow estimator and the term
+    state it is measured against, rather than the grid dying on its own ablation row.
+    """
+    out = tmp_path / "mt"
+    df = ex.run_hgaoenkf_ppe_grid(
+        cube, ages, lats, lons, valid, obs_long, str(out),
+        estimator=ex.ESTIMATOR_HGAOENKF_MT, tendency_theta_grid=(0.0, 1.0),
+        tendency_lag_yr_grid=(100.0,), tendency_extra_lags_yr=(200.0,),
+        tendency_normalise=True, preserve_obs_trace=True,
+        b_scales=B_SCALES, n_shapes=3, n_select=2, n_noise=1, truth_stride=1, seed=0,
+        **TINY_GRID)
+
+    mt = df[df["method"] == ex.ESTIMATOR_HGAOENKF_MT]
+    off = mt[mt["tendency_theta"] == 0.0]
+    assert len(off) and (off["preserve_obs_trace"] == 0.0).all()
+    assert (mt[mt["tendency_theta"] > 0.0]["preserve_obs_trace"] == 1.0).all()
+
+
+def test_appending_rows_that_carry_a_new_column_keeps_the_file_readable(tmp_path):
+    """A plain append writes the header once, so wider rows would land a field out of step.
+
+    The reconcile has to converge as well as parse: ordering the merged file by the file
+    it found rather than by the rows it was given would re-read and rewrite on every
+    append thereafter, which on a grid's CSV is a permanent cost.
+    """
+    path = str(tmp_path / "metrics.csv")
+    narrow = [{"method": "old", "lane": "ppe", "value": 1.0}]
+    wide = [{"method": "new", "lane": "ppe", "preserve_obs_trace": 1.0, "value": 2.0}]
+    ex._append_csv(path, narrow)
+    ex._append_csv(path, wide)
+    once = pd.read_csv(path)
+    assert list(once.columns) == list(pd.DataFrame(wide).columns)
+    assert len(once) == 2 and np.isnan(once.iloc[0]["preserve_obs_trace"])
+
+    ex._append_csv(path, wide)
+    twice = pd.read_csv(path)
+    assert list(twice.columns) == list(once.columns) and len(twice) == 3
+    assert not os.path.exists(path + ".tmp")
+
+
+def test_analog_columns_default_to_the_stack_being_off():
+    """A row from an estimator that carries no stack means the same as one from before it."""
+    cols = ex.analog_cols(K, W)
+    assert cols["tendency_normalise"] == 0.0 and cols["preserve_obs_trace"] == 0.0
+    assert set(ex._NAN_ANALOG) == set(cols)
