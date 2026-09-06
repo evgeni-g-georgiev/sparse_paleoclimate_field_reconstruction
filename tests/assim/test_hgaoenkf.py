@@ -20,6 +20,7 @@ from paleoreco.assim.analog import (
     eligible_mask,
 )
 from paleoreco.assim.background import background_covariance
+from paleoreco.assim.ensrf import sqrt_gain_apply, whitened_block
 from paleoreco.assim.hgaoenkf import HGAOEnKF, make_hgaoenkf
 from paleoreco.assim.method import Observations
 from paleoreco.assim.priors import build_prior, regularization_mask
@@ -27,6 +28,9 @@ from paleoreco.assim.threedvar import ThreeDVar
 
 B_SCALES = np.array([0.5, 1.0, 5.0])
 N_POOL, N_LAT, N_LON = 30, 4, 5
+STACK = dict(tendency_theta=1.0, tendency_lag_yr=100.0,
+             tendency_extra_lags_yr=(200.0,), tendency_curvature_yr=(200.0,),
+             tendency_normalise=True, preserve_obs_trace=True)
 
 
 @pytest.fixture
@@ -59,6 +63,29 @@ def _build(setup, **kw):
     kw.setdefault("hybrid_w", 0.5)
     return HGAOEnKF(setup["pool"], setup["ages"], setup["B"], setup["shape"],
                     setup["lats"], setup["lons"], taper_meta=setup["taper"], **kw)
+
+
+def _analog_deviations(m, gain, y):
+    """The deviation matrix the analysis is built from, rebuilt outside ``apply_sweep``."""
+    selected = m.select(gain, y)
+    members = m.pool[selected]
+    base = members - members.mean(axis=0)
+    if not m._tendency_blocks:
+        return base
+    dev = np.vstack([base, m._tendency_rows(selected, gain.eligible)])
+    return dev * m._trace_rescale(base, dev, gain) if m.preserve_obs_trace else dev
+
+
+def _analog_posterior(m, gain, y, b):
+    """``(dev, post)`` at pure analog weight, where ``post`` is Eq. 5's updated deviations."""
+    dev = _analog_deviations(m, gain, y)
+    h_dev = dev[:, gain.gather].T
+    P_obs = (dev.T @ h_dev.T) / (m.k - 1.0)
+    S_obs = (h_dev @ h_dev.T) / (m.k - 1.0)
+    if gain.taper is not None:
+        P_obs, S_obs = P_obs * gain.taper[0], S_obs * gain.taper[1]
+    block = whitened_block(P_obs, S_obs, gain.r_diag)
+    return dev, dev.T - sqrt_gain_apply(block, b, h_dev)
 
 
 def _static_means(setup, background=None):
@@ -123,17 +150,20 @@ def test_hybrid_weight_moves_the_analysis(setup):
     assert not np.allclose(gains[0.0], gains[0.5])
 
 
-def test_pure_analog_spread_shrinks_as_a_square_root_filter_must(setup):
+@pytest.mark.parametrize("stack", [{}, STACK])
+def test_pure_analog_spread_shrinks_as_a_square_root_filter_must(setup, stack):
     """At weight 1 the reduced gain matches the covariance the deviations came from.
 
     That is the square-root guarantee, and it is the only weight at which it holds: a
     blended gain reduces analog deviations by a partly static factor, so the mean and the
-    spread come from different mixtures and the spread can grow slightly.
+    spread come from different mixtures and the spread can grow slightly. Both priors are
+    normalised by the members, so a posterior counting the stacked rows instead would pass
+    this by understating the spread rather than by shrinking it.
     """
-    m = _build(setup, hybrid_w=1.0)
+    m = _build(setup, hybrid_w=1.0, **stack)
     gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
-    dev = m.pool[m.select(gain, setup["y"])]
-    prior_var = (dev - dev.mean(axis=0)).var(axis=0, ddof=1)
+    dev = _analog_deviations(m, gain, setup["y"])
+    prior_var = (dev ** 2).sum(axis=0) / (m.k - 1.0)
     for b, res in zip(B_SCALES, m.apply_sweep(gain, setup["y"], np.zeros(setup["D"]))):
         assert (res.posterior_var.ravel() <= b * prior_var + 1e-9).all()
 
@@ -509,3 +539,52 @@ def test_a_repeated_lag_is_rejected_rather_than_stacked_twice(setup, kw):
     """
     with pytest.raises(ValueError, match="repeat"):
         _build(setup, tendency_theta=1.0, tendency_lag_yr=100.0, **kw)
+
+
+def test_posterior_variance_counts_the_members_not_the_stacked_rows(setup):
+    """The prior blocks divide by k - 1, so the posterior must divide by the same thing.
+
+    Dividing by the row count instead states a spread on a scale the prior it is read
+    against never used, and the gap grows with the stack: every calibration metric reads
+    this number, while no skill metric does, so only a comparison against the prior
+    normalizer surfaces it.
+    """
+    m = _build(setup, hybrid_w=1.0, **STACK)
+    gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+    for b, res in zip(B_SCALES, m.apply_sweep(gain, setup["y"], np.zeros(setup["D"]))):
+        dev, post = _analog_posterior(m, gain, setup["y"], b)
+        assert dev.shape[0] > m.k                      # the stack is taller than the members
+        assert np.allclose(res.posterior_var.ravel(),
+                           b * (post ** 2).sum(axis=1) / (m.k - 1.0))
+        assert not np.allclose(res.posterior_var.ravel(), b * post.var(axis=1, ddof=1))
+
+
+def test_an_unstacked_posterior_variance_is_the_spread_over_the_members(setup):
+    """Guards every stored result taken without a stack: there n_dev is k and nothing moves."""
+    m = _build(setup, hybrid_w=1.0)
+    gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+    for b, res in zip(B_SCALES, m.apply_sweep(gain, setup["y"], np.zeros(setup["D"]))):
+        _, post = _analog_posterior(m, gain, setup["y"], b)
+        assert np.allclose(res.posterior_var.ravel(), b * post.var(axis=1, ddof=1),
+                           rtol=1e-12)
+
+
+def test_posterior_cross_variance_is_the_covariance_between_the_two_channels(setup):
+    """A seasonal contrast is a difference of correlated channels.
+
+    Its spread cannot be read off the two per-channel variances, which is why the result
+    carries the cross term. Being a covariance it takes either sign, so a run that only
+    ever returned non-negative values would be reporting a variance by mistake.
+    """
+    m = _build(setup, hybrid_w=1.0, **STACK)
+    gain = m.prepare_sweep(setup["gather"], setup["r"], B_SCALES)
+    n_cells = N_LAT * N_LON
+    for b, res in zip(B_SCALES, m.apply_sweep(gain, setup["y"], np.zeros(setup["D"]))):
+        _, post = _analog_posterior(m, gain, setup["y"], b)
+        cross = res.posterior_cross_var
+        assert cross.shape == (N_LAT, N_LON)
+        assert np.allclose(cross.ravel(),
+                           b * (post[:n_cells] * post[n_cells:]).sum(axis=1) / (m.k - 1.0))
+        assert (cross < 0).any() and (cross > 0).any()
+        var = res.posterior_var.reshape(2, -1)
+        assert (np.abs(cross.ravel()) <= np.sqrt(var[0] * var[1]) + 1e-12).all()

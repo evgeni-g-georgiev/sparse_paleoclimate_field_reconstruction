@@ -406,15 +406,24 @@ class HGAOEnKF(Method):
         x_b = np.asarray(background_anom, dtype=np.float64).ravel() + mu
         d = np.asarray(y_anom, dtype=np.float64) - x_b[g]
 
+        n_cells = self.shape[1] * self.shape[2]
         out = []
         for b in gain.b_scales:
             x_a = x_b + (w * mean_gain_apply(analog, b, d)
                          + (1.0 - w) * mean_gain_apply(gain.static, b, d))
             post = dev.T - (w * sqrt_gain_apply(analog, b, h_dev)
                             + (1.0 - w) * sqrt_gain_apply(gain.static, b, h_dev))
+            # Normalized by the members for the reason P_obs is: the tendency rows are extra
+            # directions on one k-member ensemble, not extra members. Counting the rows would
+            # state a posterior spread on a scale the prior it is read against never used.
+            # Each block is centred, so no mean is removed, and where the stack is off this
+            # is the sample variance over the k members.
+            scale = b / (self.k - 1.0)
             out.append(AnalysisResult(
                 mean_anom=x_a.reshape(self.shape),
-                posterior_var=(b * post.var(axis=1, ddof=1)).reshape(self.shape)))
+                posterior_var=(scale * (post ** 2).sum(axis=1)).reshape(self.shape),
+                posterior_cross_var=(scale * (post[:n_cells] * post[n_cells:]).sum(axis=1)
+                                     ).reshape(self.shape[1:])))
         return out
 
     def analyze(self, obs: Observations, background_anom: np.ndarray) -> AnalysisResult:
