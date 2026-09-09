@@ -7,6 +7,9 @@
 numpy
 pandas
 matplotlib
+# Coastlines for report map figures (notebook 14). Downloads and caches
+# Natural Earth outlines on first use.
+cartopy==0.25.0
 scipy                 # Cholesky solve in assim/threedvar, normal CDF in eval/calibration
 scikit-image          # SSIM for field reconstructions (paleoreco.eval.da)
 
