@@ -15,8 +15,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-# Channel -> (value column, error-variance column) in the raw observation CSV.
-# ``sse_*`` is already a variance (squared standard error), so it enters R directly.
+# Channel -> (value column, error column) in the raw observation CSV.
+# ``sse_*`` is Liu et al.'s bootstrapped standard error in degC (fxTWAPLS::sse.sample
+# returns the square root of the bootstrap variance), so it is squared on load and the
+# ``sse`` column below carries a variance, which is what every consumer treats it as.
 _OBS_COLS: dict[str, tuple[str, str]] = {
     "mtco": ("mtco", "sse_mtco"),
     "mtwa": ("mtwa", "sse_mtwa"),
@@ -55,7 +57,7 @@ def load_observations(obs_csv: str) -> pd.DataFrame:
             "age": df["age"].to_numpy(),
             "age_mean": df["age_mean"].to_numpy(),
             "y": df[val_col].to_numpy(),
-            "sse": df[sse_col].to_numpy(),
+            "sse": df[sse_col].to_numpy() ** 2, # sse = sample specific error
             "lat": df["latitude"].to_numpy(),
             "lon": df["longitude"].to_numpy(),
         }))
