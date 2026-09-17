@@ -1,20 +1,16 @@
 """Data loading, caching, and per-cell statistics for the Prior cube.
 
 Turns ``Prior.csv`` (~1.6M rows in long format) into a dense
-``(N_ages, 2, n_lat, n_lon)`` cube of ``[mtco, mtwa]`` channels, caches
-the cube as ``.npz`` for reuse, and serves PyTorch tensors of shape
-``(3, n_lat, n_lon)`` whose third channel is a binary valid-mask.
-
-The Prior here is a LOVECLIM transient climate simulation; the loader
-is agnostic to the engine.
+``(N_ages, 2, n_lat, n_lon)`` cube of ``[mtco, mtwa]`` channels and caches it as
+``.npz`` for reuse. The Prior here is a LOVECLIM transient climate simulation;
+the loader is agnostic to the engine.
 
 Key invariants
 --------------
 * The Prior has no missing cells; the only mask that does anything is
   ``safe_valid``, which drops cells with degenerate std (e.g. permanent ice).
 * Per-cell stats use **train ages only** to avoid leakage; ``mean`` centres
-  the cube to anomaly, and ``std`` is kept for the assimilation's normalised
-  path (it is not used to scale the network inputs).
+  the cube to anomaly, and ``std`` is kept for the assimilation's normalised path.
 """
 
 from __future__ import annotations
@@ -24,8 +20,6 @@ from typing import Sequence
 
 import numpy as np
 import pandas as pd
-import torch
-from torch.utils.data import Dataset
 
 
 # ----------------------------------------------------------------------------
@@ -64,7 +58,7 @@ def build_prior_cube(
         valid : (n_lat, n_lon) bool. True where the cube is finite for
                 every age and both channels.
     """
-    # Use the cache when it's available and the caller hasn't asked us to refresh.
+    # Use the cache when it is available and no rebuild was asked for.
     if cache_path is not None and os.path.exists(cache_path) and not force_rebuild:
         with np.load(cache_path) as z:
             return {k: z[k] for k in z.files}
@@ -115,28 +109,6 @@ def build_prior_cube(
     return result
 
 
-def verify_mask_constant_across_ages(cube: np.ndarray) -> bool:
-    """Assert per-age finite-masks all match age 0's.
-
-    Tautological under the current contract: ``build_prior_cube`` already
-    refuses to build a cube with any NaN. Kept as explicit documentation
-    of the "mask is constant in time" assumption for future data sources.
-    """
-    per_age = np.isfinite(cube).all(axis=1)  # (N_ages, n_lat, n_lon)
-    constant = bool((per_age == per_age[0:1]).all())
-    if not constant:
-        n_differing = int((per_age != per_age[0:1]).any(axis=(1, 2)).sum())
-        print(
-            f"WARNING: per-age valid mask differs from age 0 on "
-            f"{n_differing} / {len(per_age)} ages; the constant-mask "
-            "assumption needs revisiting."
-        )
-    return constant
-
-
-# ----------------------------------------------------------------------------
-# Per-cell statistics (mean, std, valid mask).
-# ----------------------------------------------------------------------------
 def compute_zscore_stats(
     cube: np.ndarray,
     train_age_indices: Sequence[int] | np.ndarray,
@@ -187,58 +159,3 @@ def compute_zscore_stats(
         "std": std_safe,
         "safe_valid": safe_valid,
     }
-
-
-def apply_anomaly(cube: np.ndarray, stats: dict) -> np.ndarray:
-    """Centre the cube to per-cell anomaly and zero out masked cells.
-
-    Output shape matches ``cube``. Zeroing out masked cells means the
-    AE never sees the raw values on degenerate/invalid cells, and the
-    binary mask channel tells it where those zeros are real vs filled.
-    """
-    anom = cube - stats["mean"]
-    mask = stats["safe_valid"].astype(np.float32)  # broadcasts (n_lat, n_lon) over leading dims
-    return (anom * mask).astype(np.float32)
-
-
-# ----------------------------------------------------------------------------
-# PyTorch dataset.
-# ----------------------------------------------------------------------------
-class PaleoFieldDataset(Dataset):
-    """Serves (3, n_lat, n_lon) tensors: [mtco_anom, mtwa_anom, valid_mask].
-
-    Parameters
-    ----------
-    cube : np.ndarray, shape (N_ages, 2, n_lat, n_lon), float32
-        Full anomaly cube (output of ``apply_anomaly``).
-    mask : np.ndarray, shape (n_lat, n_lon), bool
-        ``safe_valid`` mask. Becomes the third input channel and is also
-        used by ``masked_mse`` for the loss.
-    age_indices : np.ndarray of int
-        Indices into the N_ages axis that belong to this split
-        (train / val / test).
-    """
-
-    def __init__(
-        self,
-        cube: np.ndarray,
-        mask: np.ndarray,
-        age_indices: Sequence[int] | np.ndarray,
-    ) -> None:
-        if cube.ndim != 4 or cube.shape[1] != 2:
-            raise ValueError(
-                f"cube must have shape (N_ages, 2, n_lat, n_lon); got {cube.shape}"
-            )
-        self.cube = np.ascontiguousarray(cube, dtype=np.float32)
-        self.mask = np.ascontiguousarray(mask, dtype=bool)
-        self.age_indices = np.asarray(age_indices, dtype=np.int64)
-        # Pre-compute the mask tensor once; it is shared across samples.
-        self._mask_chan = torch.from_numpy(self.mask.astype(np.float32)).unsqueeze(0)
-
-    def __len__(self) -> int:
-        return len(self.age_indices)
-
-    def __getitem__(self, i: int) -> torch.Tensor:
-        a = int(self.age_indices[i])
-        field = torch.from_numpy(self.cube[a])  # (2, n_lat, n_lon)
-        return torch.cat([field, self._mask_chan], dim=0)  # (3, n_lat, n_lon)

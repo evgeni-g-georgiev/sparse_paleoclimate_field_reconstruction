@@ -1,4 +1,4 @@
-"""Tests for the Prior-cube loader and anomaly helpers (paleoreco.data.cube)."""
+"""Tests for the Prior-cube loader and its per-cell stats (paleoreco.data.cube)."""
 
 from __future__ import annotations
 
@@ -9,8 +9,6 @@ import pytest
 from paleoreco.data import (
     GRID_SHAPE,
     VARS,
-    PaleoFieldDataset,
-    apply_anomaly,
     build_prior_cube,
     compute_zscore_stats,
 )
@@ -59,33 +57,18 @@ def test_grid_and_vars_constants():
     assert VARS == ("mtco", "mtwa")
 
 
-def test_anomaly_centring_and_degenerate_masking(cube, valid):
-    # Make one cell constant across ages on the mtco channel -> degenerate std.
+def test_degenerate_cells_are_masked(cube, valid):
+    """A cell with no variance across the train ages is dropped from ``safe_valid``.
+
+    Normalised scoring divides by that std, so keeping the cell would put an infinity
+    into the innovation rather than leaving the cell unconstrained.
+    """
     cube = cube.copy()
     cube[:, 0, 2, 3] = -4.0
     train_idx = np.arange(cube.shape[0])
 
     stats = compute_zscore_stats(cube, train_idx, valid)
-    assert stats["safe_valid"][2, 3] == False  # noqa: E712 - degenerate cell dropped
+    assert not stats["safe_valid"][2, 3]
     assert stats["safe_valid"].sum() == valid.sum() - 1
-
-    a = apply_anomaly(cube, stats)
-    # Masked cell is zeroed in anomaly space.
-    assert np.allclose(a[:, 0, 2, 3], 0.0)
-    # Adding the climatology back recovers the original on safe cells.
-    safe = stats["safe_valid"]
-    recovered = a + stats["mean"]
-    assert np.allclose(recovered[:, 0, safe], cube[:, 0, safe], atol=1e-4)
-
-
-def test_dataset_returns_field_plus_mask(cube, valid):
-    train_idx = np.arange(cube.shape[0])
-    stats = compute_zscore_stats(cube, train_idx, valid)
-    a = apply_anomaly(cube, stats)
-    ds = PaleoFieldDataset(a, stats["safe_valid"], train_idx)
-
-    assert len(ds) == cube.shape[0]
-    sample = ds[0]
-    assert tuple(sample.shape) == (3, cube.shape[2], cube.shape[3])
-    # Third channel is the binary mask.
-    assert np.allclose(sample[2].numpy(), stats["safe_valid"].astype(np.float32))
+    # The climatology still describes every cell, masked or not.
+    assert np.allclose(stats["mean"][0, 2, 3], -4.0)
