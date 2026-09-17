@@ -7,8 +7,6 @@ Array-level building blocks:
 * :mod:`paleoreco.assim.scoring`      - raw / anomaly / normalised transforms.
 * :mod:`paleoreco.assim.background`   - background state and B from the Prior cube.
 * :mod:`paleoreco.assim.innovation`   - H on the grid, innovations, standardisation.
-* :mod:`paleoreco.assim.joint`        - pairwise whitened innovations for the 2D test.
-* :mod:`paleoreco.assim.compressors`  - encode/decode contract for latent assimilation.
 * :mod:`paleoreco.assim.ensrf`        - ensemble square-root gains for one covariance.
 * :mod:`paleoreco.assim.analog`       - choosing which prior states form an ensemble.
 
@@ -17,7 +15,6 @@ Methods and drivers, reached by submodule path rather than re-exported:
 * :mod:`paleoreco.assim.method`       - the Method / AnalysisResult contract.
 * :mod:`paleoreco.assim.priors`       - the Prior container and its tapers.
 * :mod:`paleoreco.assim.threedvar`    - gain-form pixel 3DVar.
-* :mod:`paleoreco.assim.latent`       - latent-space 3DVar.
 * :mod:`paleoreco.assim.hgaoenkf`     - hybrid gain analog offline EnKF.
 * :mod:`paleoreco.assim.experiments`  - PPE, trajectory and withholding lane runners.
 * :mod:`paleoreco.assim.reconstruction` - full age axis assimilated from a real network.
@@ -54,22 +51,6 @@ from paleoreco.assim.innovation import (
     predicted_sd,
     standardise,
 )
-from paleoreco.assim.joint import (
-    rank_pairs,
-    whitened_pair,
-)
-from paleoreco.assim.compressors import (
-    AECompressor,
-    Compressor,
-    PCACompressor,
-    VAECompressor,
-    latent_prior,
-)
-from paleoreco.assim.latent import (
-    LinearLatentVar,
-    TangentLinearLatentVar,
-    latent_var,
-)
 
 __all__ = [
     "attach_site_stats",
@@ -95,14 +76,4 @@ __all__ = [
     "obs_operator_scale",
     "predicted_sd",
     "standardise",
-    "rank_pairs",
-    "whitened_pair",
-    "Compressor",
-    "PCACompressor",
-    "AECompressor",
-    "VAECompressor",
-    "latent_prior",
-    "LinearLatentVar",
-    "TangentLinearLatentVar",
-    "latent_var",
 ]
