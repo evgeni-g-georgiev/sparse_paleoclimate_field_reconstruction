@@ -7,26 +7,12 @@
 numpy
 pandas
 matplotlib
-# Coastlines for report map figures (notebook 14). Downloads and caches
+# Coastlines for the report map figures. Downloads and caches
 # Natural Earth outlines on first use.
 cartopy==0.25.0
 scipy                 # Cholesky solve in assim/threedvar, normal CDF in eval/calibration
 scikit-image          # SSIM for field reconstructions (paleoreco.eval.da)
 
-# ---- Machine learning -------------------------------------------------------
-torch
-scikit-learn          # PCA, TruncatedSVD, KMeans in eval/
-
-# ---- Domain-specific --------------------------------------------------------
-xarray                # labelled grids for the downloaded CCSM4 run
-
-# ---- Data acquisition -------------------------------------------------------
-# Used only by paleoreco/data/download_ccsm4.py to pull the CCSM4 truth run from
-# ERDA; not imported by the rest of the package.
-fsspec[http]          # HTTP range reads of the remote run (pulls aiohttp)
-h5netcdf              # NetCDF engine for xarray.open_dataset (pulls h5py)
-
 # ---- Notebook + dev experience ---------------------------------------------
 ipykernel
-tqdm
 pytest                # unit + integration test suite (tests/)

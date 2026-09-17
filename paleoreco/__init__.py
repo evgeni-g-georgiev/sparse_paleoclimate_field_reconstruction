@@ -1,1 +1,1 @@
-"""paleoreco — source package for sparse paleoclimate field reconstruction."""
+"""paleoreco: source package for sparse paleoclimate field reconstruction."""
