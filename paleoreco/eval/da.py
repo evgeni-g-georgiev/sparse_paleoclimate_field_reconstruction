@@ -120,9 +120,15 @@ def lowpass_time(stack: np.ndarray, window_yr: float, step_yr: float) -> np.ndar
     Keeps variability slower than the window. A band is the difference of two of
     these, which is what separates skill at one timescale from skill inherited
     from a slower component that carries most of the variance.
+
+    The kernel is capped at the length of the series. ``np.convolve`` in ``"same"`` mode
+    returns the longer of its two arguments, so a window wider than the series would
+    otherwise come back longer than it went in, and differencing two such filters would
+    fail on a shape nothing upstream ever set. Whether a window that wide can be measured
+    at all is :func:`timescale_trim`'s question, not this one's.
     """
-    k = max(1, int(round(window_yr / step_yr)))
     x = np.asarray(stack, dtype=float)
+    k = max(1, min(int(round(window_yr / step_yr)), len(x)))
     if k <= 1:
         return x
     kernel = np.ones(k) / k

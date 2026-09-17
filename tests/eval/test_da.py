@@ -105,3 +105,31 @@ def test_bootstrap_covers_every_unit_exactly_once_in_the_point_estimate():
     point, _, _ = da.paired_block_bootstrap(lambda idx: float(np.sum(a[idx])), len(a),
                                             block=3, n_boot=5)
     assert point == pytest.approx(a.sum())
+
+
+def test_lowpass_keeps_the_length_of_a_series_shorter_than_its_window():
+    """A window wider than the series must not lengthen it.
+
+    ``np.convolve`` in "same" mode returns the longer of its two arguments, so an
+    unguarded kernel comes back longer than the series went in. Differencing two
+    low-passes then fails on a shape nothing upstream ever set, which is how a short run
+    breaks a band metric rather than simply having none.
+    """
+    stack = np.arange(6.0)[:, None, None] * np.ones((1, 3, 3))
+    for window_yr in (25.0, 100.0, 1000.0):
+        assert da.lowpass_time(stack, window_yr, 25.0).shape == stack.shape
+
+    # Two windows that both exceed the series still difference cleanly.
+    wide = da.lowpass_time(stack, 500.0, 25.0) - da.lowpass_time(stack, 1000.0, 25.0)
+    assert wide.shape == stack.shape
+
+
+def test_trim_drops_a_window_the_series_cannot_support():
+    """The trim, not the filter, is what decides a window is unmeasurable.
+
+    ``timescale_trim`` keeps the unclamped kernel, so a window wider than the series
+    leaves nothing after trimming and the caller emits no row for it.
+    """
+    n, step = 43, 25.0
+    assert n - 2 * da.timescale_trim(100.0, step) >= 3        # measurable
+    assert n - 2 * da.timescale_trim(2000.0, step) < 3        # not, and dropped
