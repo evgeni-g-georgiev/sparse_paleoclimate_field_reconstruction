@@ -18,7 +18,7 @@ from paleoreco.assim.threedvar import ThreeDVar
 def test_make_method_default_matches_explicit_threedvar(
     tmp_path, cube, ages, lats, lons, valid, obs_long
 ):
-    common = dict(n_shapes=3, n_select=2, n_noise=2, b_scales=(0.5, 1.0),
+    common = dict(b_scales=(0.5, 1.0), min_obs=4,
                   truth_stride=1, seed=0)
     df_default = ex.run_ppe(cube, ages, lats, lons, valid, obs_long,
                             str(tmp_path / "default"), **common)
@@ -32,7 +32,7 @@ def test_make_method_default_matches_explicit_threedvar(
 
 
 def test_space_label_only_relabels(tmp_path, cube, ages, lats, lons, valid, obs_long):
-    common = dict(n_shapes=3, n_select=2, n_noise=2, b_scales=(1.0,),
+    common = dict(b_scales=(1.0,), min_obs=4,
                   truth_stride=1, seed=0)
     base = ex.run_ppe(cube, ages, lats, lons, valid, obs_long,
                       str(tmp_path / "base"), **common)

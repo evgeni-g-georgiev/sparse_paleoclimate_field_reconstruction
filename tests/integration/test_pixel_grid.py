@@ -37,7 +37,7 @@ def test_run_ppe_pixel_grid_full_grid_and_winner(
     out = tmp_path / "pixel"
     df = ex.run_ppe_pixel_grid(
         cube, ages, lats, lons, valid, obs_long, str(out),
-        b_scales=(0.5, 1.0), n_shapes=3, n_select=2, n_noise=1, truth_stride=1, seed=0,
+        b_scales=(0.5, 1.0), truth_stride=1, min_obs=4, seed=0,
         **TINY_GRID,
     )
     tdv = df[df["method"] == "3dvar"]

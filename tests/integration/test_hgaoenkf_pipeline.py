@@ -47,7 +47,7 @@ def test_ppe_lane_runs_and_tags_its_rows(tmp_path, cube, ages, lats, lons, valid
     df = ex.run_ppe(cube, ages, lats, lons, valid, obs_long, str(tmp_path),
                     make_method=factory, estimator=ex.ESTIMATOR_HGAOENKF,
                     method_cols=ex.analog_cols(K, W), b_scales=B_SCALES,
-                    n_shapes=3, n_select=2, n_noise=1, truth_stride=1, seed=0)
+                    truth_stride=1, min_obs=4, seed=0)
 
     assert SCHEMA.issubset(set(df.columns))
     hg = df[df["method"] == "hgaoenkf"]
@@ -68,8 +68,7 @@ def test_trajectory_lane_runs_one_treatment_and_records_the_selection(
                            temporal_modes=(TEMPORAL_DEFLATE,), b_scales=B_SCALES,
                            lowpass_windows=(500,), bands=((500, 1000),), min_obs=2, seed=0)
 
-    assert set(df["method"]) == {"hgaoenkf_temporal_deflate", "hgaoenkf_ceiling",
-                                 "nearest", "idw"}
+    assert set(df["method"]) == {"hgaoenkf_temporal_deflate", "nearest", "idw"}
     z = np.load(tmp_path / "trajectory_analysis.npz")
     assert "analog_index" in z.files
     assert z["analog_index"].shape == (len(z["ages"]), K)
@@ -96,10 +95,9 @@ def test_trajectory_lane_runs_the_whole_staleness_ladder(
                            lowpass_windows=(500,), bands=((500, 1000),), min_obs=2, seed=0)
 
     assert set(df["method"]) == {"hgaoenkf", "hgaoenkf_temporal_add",
-                                 "hgaoenkf_temporal_deflate", "hgaoenkf_ceiling",
-                                 "nearest", "idw"}
+                                 "hgaoenkf_temporal_deflate", "nearest", "idw"}
     z = np.load(tmp_path / "trajectory_analysis.npz")
-    for key in ("recon_realistic", "recon_ceiling", "recon_hgaoenkf_temporal_add",
+    for key in ("recon_realistic", "recon_hgaoenkf_temporal_add",
                 "recon_hgaoenkf_temporal_deflate", "analog_index"):
         assert key in z.files
     # The alias is the uncorrected run, so it must not be the deflated one.
@@ -178,8 +176,7 @@ def test_ppe_grid_persists_a_winner_the_csv_re_derives(
 ):
     out = tmp_path / "hg"
     df = ex.run_hgaoenkf_ppe_grid(cube, ages, lats, lons, valid, obs_long, str(out),
-                                  b_scales=B_SCALES, n_shapes=3, n_select=2, n_noise=1,
-                                  truth_stride=1, seed=0, **TINY_GRID)
+                                  b_scales=B_SCALES, truth_stride=1, min_obs=4, seed=0, **TINY_GRID)
 
     hg = df[df["method"] == "hgaoenkf"]
     combos = hg[["analog_k", "hybrid_w"]].drop_duplicates()
@@ -263,7 +260,7 @@ def test_3dvar_rows_are_unchanged_by_the_estimator_parameters(
     Every 3DVar result on disk was written by these runners, so a drift in their defaults
     would silently unpair the comparison the new estimator exists for.
     """
-    kw = dict(b_scales=B_SCALES, n_shapes=3, n_select=2, n_noise=1, truth_stride=1, seed=0)
+    kw = dict(b_scales=B_SCALES, truth_stride=1, min_obs=4, seed=0)
     a = ex.run_ppe(cube, ages, lats, lons, valid, obs_long, str(tmp_path / "a"), **kw)
     b = ex.run_ppe(cube, ages, lats, lons, valid, obs_long, str(tmp_path / "b"),
                    estimator=ex.ESTIMATOR_3DVAR, method_cols=None, **kw)
@@ -282,7 +279,7 @@ def test_a_grid_tags_its_rows_with_the_estimator_it_was_given(
         estimator=ex.ESTIMATOR_HGAOENKF_MT, tendency_theta_grid=(1.0,),
         tendency_lag_yr_grid=(100.0,), tendency_extra_lags_yr=(200.0,),
         tendency_normalise=True, preserve_obs_trace=True,
-        b_scales=B_SCALES, n_shapes=3, n_select=2, n_noise=1, truth_stride=1, seed=0,
+        b_scales=B_SCALES, truth_stride=1, min_obs=4, seed=0,
         **TINY_GRID)
 
     assert ex.ESTIMATOR_HGAOENKF_MT in set(df["method"])
@@ -309,7 +306,7 @@ def test_a_zero_weight_grid_point_drops_the_stack_instead_of_failing_to_build(
         estimator=ex.ESTIMATOR_HGAOENKF_MT, tendency_theta_grid=(0.0, 1.0),
         tendency_lag_yr_grid=(100.0,), tendency_extra_lags_yr=(200.0,),
         tendency_normalise=True, preserve_obs_trace=True,
-        b_scales=B_SCALES, n_shapes=3, n_select=2, n_noise=1, truth_stride=1, seed=0,
+        b_scales=B_SCALES, truth_stride=1, min_obs=4, seed=0,
         **TINY_GRID)
 
     mt = df[df["method"] == ex.ESTIMATOR_HGAOENKF_MT]
