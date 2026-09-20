@@ -7,6 +7,7 @@ import pytest
 
 from paleoreco.assim.priors import (
     build_prior,
+    chord_km,
     coupling_taper,
     gaspari_cohn,
     great_circle_km,
@@ -39,6 +40,30 @@ def test_great_circle_quarter_circumference():
     assert d[0, 1] == pytest.approx(_R * np.pi / 2, rel=1e-6)
 
 
+def test_chord_is_the_straight_line_through_the_sphere():
+    """The chord saturates at the diameter, which is the whole reason the taper reads it.
+
+    Arc length keeps growing to 20015 km between antipodes, far enough for a 20000 km
+    Gaspari-Cohn support to wrap; the chord never exceeds 12742 km.
+    """
+    lat = np.array([0.0, 0.0, 0.0])
+    lon = np.array([0.0, 90.0, 180.0])
+    d = chord_km(lat, lon)
+    assert np.allclose(np.diag(d), 0.0, atol=1e-6)
+    assert np.allclose(d, d.T)
+    assert d[0, 1] == pytest.approx(_R * np.sqrt(2.0), rel=1e-6)   # quarter circumference
+    assert d[0, 2] == pytest.approx(2.0 * _R, rel=1e-6)            # antipodes: the diameter
+    assert d.max() <= 2.0 * _R + 1e-9
+
+
+def test_chord_and_great_circle_stay_consistent_through_the_half_angle():
+    """One haversine feeds both readings, so neither can drift without the other noticing."""
+    rng = np.random.default_rng(0)
+    lat, lon = rng.uniform(-90, 90, 40), rng.uniform(-180, 180, 40)
+    arc = great_circle_km(lat, lon)
+    assert np.allclose(chord_km(lat, lon), 2.0 * _R * np.sin(arc / (2.0 * _R)))
+
+
 def test_localization_taper_block_structure():
     lats = np.array([-30.0, 0.0, 30.0])
     lons = np.array([0.0, 120.0, 240.0])
@@ -51,6 +76,58 @@ def test_localization_taper_block_structure():
     assert np.allclose(T[:n, n:], spatial)
     assert np.allclose(T[n:, :n], spatial)
     assert np.allclose(np.diag(spatial), 1.0)            # self-correlation
+
+
+def test_the_localization_taper_is_read_on_the_chord_not_the_arc():
+    """Two cells a quarter circumference apart: 10008 km of arc, 9010 km of chord.
+
+    Both fall inside an 8000 km Gaspari-Cohn support, so the two readings give visibly
+    different weights (0.130 against 0.075) rather than agreeing by accident. Nothing
+    else in the suite would notice the metric reverting to arc length until a sweep
+    reached a lengthscale where B goes indefinite again.
+    """
+    lats, lons = np.array([0.0]), np.array([0.0, 90.0])
+    T = localization_taper(lats, lons, length_km=8000.0)
+    assert T[0, 1] == pytest.approx(gaspari_cohn(np.array([_R * np.sqrt(2.0)]), 8000.0)[0])
+    assert T[0, 1] != pytest.approx(gaspari_cohn(np.array([_R * np.pi / 2]), 8000.0)[0])
+
+
+def _antipodal_grid(n_lat=8, n_lon=16):
+    """A global grid whose cells reach exactly half the circumference apart.
+
+    Positive definiteness of a distance taper is a property of the whole point set, and a
+    regional grid never separates two cells far enough for the Gaspari-Cohn support to
+    wrap, so it cannot see the defect at all.
+    """
+    return np.linspace(-78.75, 78.75, n_lat), np.linspace(-180.0, 157.5, n_lon)
+
+
+def test_the_psd_grid_really_does_contain_an_antipodal_pair():
+    """Guards the test below, which is toothless on a grid that stays within a hemisphere."""
+    lats, lons = _antipodal_grid()
+    d = great_circle_km(np.repeat(lats, len(lons)), np.tile(lons, len(lats)))
+    assert d.max() == pytest.approx(np.pi * _R, rel=1e-9)
+
+
+@pytest.mark.parametrize("length_km", [5000.0, 8000.0, 12500.0, 20000.0, 25000.0, 35000.0])
+@pytest.mark.parametrize("shrinkage_lambda, alpha", [(0.0, 1.0), (0.5, 0.25)])
+def test_the_regularization_mask_is_psd_at_every_swept_lengthscale(length_km,
+                                                                  shrinkage_lambda, alpha):
+    """A Schur taper leaves B a covariance only if the taper is PSD, at every swept value.
+
+    Gaspari-Cohn is positive definite in R^3, but read on arc length it is positive
+    definite on the sphere only while its support stays inside half the circumference
+    (Gneiting 2013, Bernoulli 19(4), Thm 3), and the swept lengthscales run well past
+    that: on this grid the arc-length reading gives the composed mask a minimum
+    eigenvalue of -0.019 at 12500 km, -0.20 at 15000 km and -2.8 at 20000 km, so B stops
+    being a covariance at the operating point rather than at some extrapolated one.
+    Pure localization is the case that catches it, since shrinkage toward the diagonal
+    adds enough to the spectrum to hide a mildly indefinite taper.
+    """
+    lats, lons = _antipodal_grid()
+    mask = regularization_mask(lats, lons, localization_km=length_km,
+                               shrinkage_lambda=shrinkage_lambda, alpha=alpha)
+    assert np.linalg.eigvalsh(mask).min() > -1e-8
 
 
 def test_coupling_taper_scales_cross_channel_blocks():
@@ -132,6 +209,8 @@ def test_build_prior_alpha_zero_decouples_channels():
     dict(localization_km=None, shrinkage_lambda=0.4, alpha=1.0),
     dict(localization_km=None, shrinkage_lambda=0.0, alpha=0.25),
     dict(localization_km=9000.0, shrinkage_lambda=0.4, alpha=0.25),
+    # Past the chord's saturation, where the taper reaches zero nowhere on the sphere.
+    dict(localization_km=20000.0, shrinkage_lambda=0.0, alpha=1.0),
 ])
 def test_taper_obs_blocks_match_the_full_mask(taper):
     """The reduced blocks must equal the corresponding slices of the (D, D) mask.

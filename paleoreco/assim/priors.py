@@ -7,6 +7,11 @@ Gaspari-Cohn localization, uniform shrinkage toward the diagonal, and a
 cross-channel coupling taper. Each is a Hadamard mask with unit diagonal, so any
 combination preserves the well-estimated variances and stays symmetric PSD.
 
+What makes the Gaspari-Cohn factor PSD is the distance it is read on: the chord
+through the sphere rather than the arc along it. Gaspari-Cohn is positive definite
+in R^3, and on the chord that is the space it lives in, so the taper is a valid
+covariance at every lengthscale the grid sweeps.
+
 The state vector flattens one snapshot ``(2, n_lat, n_lon)`` in C order, channel
 ``mtco`` then ``mtwa``; distances between two state entries depend only on their
 grid cell, so the spatial tapers are built per cell and tiled across channels.
@@ -97,15 +102,13 @@ def gaspari_cohn(dist: np.ndarray, length_km: float) -> np.ndarray:
     return out
 
 
-def great_circle_km_between(
+def _haversine_h(
     lat_a: np.ndarray, lon_a: np.ndarray, lat_b: np.ndarray, lon_b: np.ndarray
 ) -> np.ndarray:
-    """Great-circle distances (km) from each point of A to each of B, ``(n_a, n_b)``.
+    """``sin^2(theta/2)`` for every pair in A x B, clipped to [0, 1], ``(n_a, n_b)``.
 
-    Cell-to-site geometry needs only this rectangular block. Reaching it by taking the
-    pairwise matrix over the concatenated sets also computes the cell-cell quadrant that
-    is then discarded, which is nearly all of the work when the grid greatly outnumbers
-    the observation network.
+    Arc length and chord are both one-liners over this quantity, so they share the
+    trigonometry rather than converting one into the other.
     """
     # Promote each coordinate pair to a common dtype before converting to radians: grid
     # axes are float32 and site coordinates float64, and rounding the grid to float32
@@ -118,7 +121,20 @@ def great_circle_km_between(
     dlat = la[:, None] - lb[None, :]
     dlon = lo_a[:, None] - lo_b[None, :]
     h = np.sin(dlat / 2) ** 2 + np.cos(la)[:, None] * np.cos(lb)[None, :] * np.sin(dlon / 2) ** 2
-    return 2.0 * _EARTH_RADIUS_KM * np.arcsin(np.sqrt(np.clip(h, 0.0, 1.0)))
+    return np.clip(h, 0.0, 1.0)
+
+
+def great_circle_km_between(
+    lat_a: np.ndarray, lon_a: np.ndarray, lat_b: np.ndarray, lon_b: np.ndarray
+) -> np.ndarray:
+    """Great-circle distances (km) from each point of A to each of B, ``(n_a, n_b)``.
+
+    Cell-to-site geometry needs only this rectangular block. Reaching it by taking the
+    pairwise matrix over the concatenated sets also computes the cell-cell quadrant that
+    is then discarded, which is nearly all of the work when the grid greatly outnumbers
+    the observation network.
+    """
+    return 2.0 * _EARTH_RADIUS_KM * np.arcsin(np.sqrt(_haversine_h(lat_a, lon_a, lat_b, lon_b)))
 
 
 def great_circle_km(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
@@ -126,16 +142,39 @@ def great_circle_km(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
     return great_circle_km_between(lat, lon, lat, lon)
 
 
+def chord_km_between(
+    lat_a: np.ndarray, lon_a: np.ndarray, lat_b: np.ndarray, lon_b: np.ndarray
+) -> np.ndarray:
+    """Chordal distances (km) from each point of A to each of B, ``(n_a, n_b)``.
+
+    The straight line ``2 R sin(theta/2)`` through the sphere, which is the Euclidean
+    distance in the R^3 embedding. A correlation function positive definite in R^3,
+    Gaspari-Cohn among them, stays positive definite read on the chord at every
+    lengthscale; read on arc length it is positive definite on the sphere only while its
+    support stays inside half the circumference (Gneiting 2013, Bernoulli 19(4), Thm 3).
+    """
+    return 2.0 * _EARTH_RADIUS_KM * np.sqrt(_haversine_h(lat_a, lon_a, lat_b, lon_b))
+
+
+def chord_km(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    """Pairwise chordal distances (km) between cells given by lat/lon (deg)."""
+    return chord_km_between(lat, lon, lat, lon)
+
+
 def localization_taper(lats: np.ndarray, lons: np.ndarray, length_km: float) -> np.ndarray:
     """Full ``(D, D)`` localization taper: a per-cell Gaspari-Cohn spatial taper
     tiled over channels.
+
+    Gaspari-Cohn is read on chordal distance, where it stays positive definite at every
+    lengthscale, so ``length_km`` is a chordal lengthscale: the 20015 km of arc between
+    antipodal cells is a 12742 km chord.
 
     The flattened spatial axis runs lat-major, lon-minor (cell s is lat ``s //
     n_lon``, lon ``s % n_lon``), matching the cube's C-order ravel.
     """
     lat_cell = np.repeat(lats, len(lons))
     lon_cell = np.tile(lons, len(lats))
-    spatial = gaspari_cohn(great_circle_km(lat_cell, lon_cell), length_km)
+    spatial = gaspari_cohn(chord_km(lat_cell, lon_cell), length_km)
     return np.block([[spatial, spatial], [spatial, spatial]])
 
 
@@ -212,9 +251,9 @@ def taper_obs_blocks(
     if localization_km is not None:
         lat_cell = np.repeat(lats, n_lon)
         lon_cell = np.tile(lons, n_lat)
-        dist = great_circle_km_between(lat_cell, lon_cell,
-                                       np.asarray(lats)[obs_cell // n_lon],
-                                       np.asarray(lons)[obs_cell % n_lon])
+        dist = chord_km_between(lat_cell, lon_cell,
+                                np.asarray(lats)[obs_cell // n_lon],
+                                np.asarray(lons)[obs_cell % n_lon])
         # Every column of the full localization taper repeats its spatial block across
         # both channels, so an observation's column is the same whichever channel it is in.
         spatial = gaspari_cohn(dist, localization_km)
