@@ -30,6 +30,7 @@ __pycache__/
 # --- Model outputs -----------------------------------------------------------
 # Trained checkpoints, generated figures, sweep logs. Re-derivable from code + data.
 /outputs/
+/outputs_geodesic_backup/
 
 # --- Personal notes and supervisor-provided PDFs -----------------------------
 # Kept locally; not committed (notes may contain in-progress thinking; PDFs are
