@@ -14,12 +14,15 @@ from paleoreco import paths
 from paleoreco.assim import experiments as ex
 
 # The pixel regularizer: distance taper, shrinkage toward the diagonal, channel coupling.
+# The lengthscales are chordal, so they span what the taper does across a 12742 km diameter
+# rather than what its nominal support is: 5000 reaches zero inside the sphere, 12500 leaves
+# 0.19 between antipodes, and 35000 leaves 0.82, which is nearly the untapered corner.
 GRID = dict(
-    localization_grid=(None, 5000.0, 7500.0, 10000.0, 12500.0, 15000.0, 20000.0),
+    localization_grid=(None, 5000.0, 8000.0, 12500.0, 20000.0, 25000.0, 35000.0),
     shrinkage_grid=(0.0, 0.25, 0.5, 0.75),
     alpha_grid=(0.0, 0.25, 0.5, 0.75, 1.0),
 )
-SMOKE_GRID = dict(localization_grid=(None, 15000.0), shrinkage_grid=(0.0,),
+SMOKE_GRID = dict(localization_grid=(None, 20000.0), shrinkage_grid=(0.0,),
                   alpha_grid=(1.0,))
 SMOKE_B = (1.0, 5.0)
 

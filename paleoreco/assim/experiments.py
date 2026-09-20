@@ -107,8 +107,10 @@ MethodFactory = Callable[[Prior, "tuple[int, int, int]"], Method]
 
 B_SCALES = (0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
 # Coarse tuning grid for the pixel regularizer (localization / shrinkage / channel
-# coupling); ``None`` localization is "off", the raw sample covariance.
-LOCALIZATION_KM_GRID = (None, 7500.0, 12500.0)
+# coupling); ``None`` localization is "off", the raw sample covariance. Lengthscales are
+# chordal, so they are read against the 12742 km diameter rather than the 20015 km of arc
+# between antipodes: a value above the diameter still damps, it just never reaches zero.
+LOCALIZATION_KM_GRID = (None, 12500.0, 20000.0)
 SHRINKAGE_GRID = (0.0, 0.25, 0.5)
 ALPHA_GRID = (0.0, 0.5, 1.0)
 SEL_TOL = 0.0   # 0 = pure argmin of selection RRMSE; >0 prefers the simpler config within this relative band
@@ -159,10 +161,9 @@ MT_STACKS = {
 EXCLUDE_YR = 1000.0
 EXCLUDE_YR_GRID = (0.0, 1000.0, 2000.0)
 # Lengthscales for the analog covariance's own taper, swept at a fixed (k, hybrid_w).
-# ``None`` is whatever the static covariance carries, which differs by lane, so the two
-# grids bracket both that value and the tighter one Sun et al. (2024) Table 2 predicts.
-ANALOG_LOCALIZATION_GRID_PPE = (None, 5000.0, 7500.0, 10000.0, 20000.0)
-ANALOG_LOCALIZATION_GRID_WH = (None, 5000.0, 10000.0, 15000.0)
+# ``None`` is whatever the static covariance carries, so the grid brackets both that value
+# and the tighter one Sun et al. (2024) Table 2 predicts as the ensemble shrinks.
+ANALOG_LOCALIZATION_GRID_PPE = (None, 5000.0, 8000.0, 12500.0, 20000.0)
 # Observations a borrowed network must carry to be drawn. The thinnest proxy ages hold a
 # handful of sites, and an analysis built on those says nothing about the estimator.
 MIN_OBS = 10
