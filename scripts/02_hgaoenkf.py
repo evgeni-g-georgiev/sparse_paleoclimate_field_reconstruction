@@ -64,7 +64,7 @@ def main() -> None:
 
     if stages.run(STAGES[2]):
         A.taper_sweep(point, cube=cube, ages=ages, lats=lats, lons=lons, valid=valid,
-                      long_ppe=long_ppe, out_dir=paths.ablation_dir("analog_taper"),
+                      long_ppe=long_ppe, out_dir=paths.ablation_dir("analog_taper_misfit"),
                       taper=taper_ppe, selection=RULE, lengthscales=lengthscales,
                       b_scales=b_scales)
 

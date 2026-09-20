@@ -64,7 +64,7 @@ once numpy is imported, which is why every script imports `_common` first.
 ```
 outputs/
   runs/<estimator>/{ppe,trajectory,withholding}/   metrics.csv, analysis npz, config.json
-  ablations/{analog_taper,mt_stack,rep_var}/       the same schema, one directory per question
+  ablations/{analog_taper_*,mt_stack,rep_var}/     the same schema, one directory per question
   product/{main,no_flow,exclude_0,...}/            reconstruction fields and config
   figures/report/                                  the figures the report prints
   tables/                                          printed tables, as CSV
