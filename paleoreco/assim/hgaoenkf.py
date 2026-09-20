@@ -57,6 +57,13 @@ than the static one as the ensemble shrinks; ``analog_localization_km`` is that 
 Their values are radians on another model, grid and network, so the schedule transfers but
 the number does not.
 
+Where the taper is applied is a departure from Sun et al. worth stating. Their Eq. 1 puts
+it on the gain, ``rho o K``, and they assimilate one observation at a time, so no
+observation-space covariance is ever tapered and the taper never has to be positive
+definite. Here both ``P H^T`` and ``H P H^T`` are tapered and the update is a batch one,
+which is what makes ``(I - KH) P`` a posterior covariance and the square-root update
+consistent, and which is why the taper has to be PSD in its own right.
+
 One property of Eq. 5 is worth knowing when reading the posterior spread: the deviations
 start from whatever built the analog covariance but are reduced by a gain that is part
 static, so the mean and the spread come from different mixtures. A square-root update guarantees the
@@ -209,9 +216,10 @@ class HGAOEnKF(Method):
         self.evidence_scale = float(evidence_scale)
         self.taper_meta = {key: taper_meta[key]
                            for key in ("localization_km", "shrinkage_lambda", "alpha")}
-        # Only the lengthscale is separable. Shrinkage and the channel coupling regularize
-        # the prior rather than answer Sun et al.'s ensemble-size question, so the analog
-        # covariance inherits them and the comparison stays one of estimators.
+        # Only the lengthscale is separable. Inheriting the shrinkage and the channel
+        # coupling is a tuning-cost decision rather than the better estimate: a k-member
+        # covariance is more undersampled than the static one, not less, so on sampling
+        # grounds it would want more shrinkage, not the same.
         self.analog_localization_km = analog_localization_km
         self.analog_taper_meta = dict(self.taper_meta)
         if analog_localization_km is not None:
