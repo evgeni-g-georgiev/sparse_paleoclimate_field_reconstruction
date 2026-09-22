@@ -840,10 +840,11 @@ def chapter6(inp: Inputs) -> None:
     # Shared inputs for Figures 6.1 and 6.2: the analog pool, the whitened spectrum of every
     # network the trajectory lane assimilates, and the spread each selection rule retains in it.
     #
-    # The pool is the trajectory lane's own, the older half of the archive. The prior is built
-    # untapered because only its climatology and valid mask are read below, and neither depends
-    # on the taper. Nothing below runs an estimator - the members are read from the stored
-    # `analog_index` of each lane, so this measures the ensembles that were actually placed.
+    # The pool and the taper are the trajectory lane's own: the older half of the archive under
+    # the taper that lane ran, read from its stored config so the whitened basis below is the
+    # one the estimators actually met rather than a restatement that can drift from it. Nothing
+    # below runs an estimator - the members are read from the stored `analog_index` of each
+    # lane, so this measures the ensembles that were actually placed.
     from types import SimpleNamespace
 
     from paleoreco.assim import experiments as ex
@@ -852,7 +853,9 @@ def chapter6(inp: Inputs) -> None:
     from paleoreco.assim.priors import build_prior
 
     PRIOR_IDX, _ = chronological_half_split(ages)
-    prior6 = build_prior(cube, ages, lats, lons, PRIOR_IDX, valid)
+    TAPER6 = C.inherited_taper(
+        paths.run_dir(ex.ESTIMATOR_HGAOENKF_MT, paths.LANE_TRAJECTORY) / "trajectory_config.json")
+    prior6 = build_prior(cube, ages, lats, lons, PRIOR_IDX, valid, **TAPER6)
     pool6 = (cube[PRIOR_IDX].reshape(len(PRIOR_IDX), -1).astype(np.float64)
              - prior6.clim_mean.ravel())
     safe_flat6 = np.broadcast_to(prior6.safe_valid, (2,) + prior6.safe_valid.shape).ravel()
