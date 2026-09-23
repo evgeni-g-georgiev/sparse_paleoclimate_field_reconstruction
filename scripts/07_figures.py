@@ -8,19 +8,9 @@ Figures are authored at their printed size. A 60-page A4 report with 2.5 cm marg
 text width of about 16 cm, so a figure drawn wide and scaled down would render 9 pt labels
 at roughly 4 pt. Everything below is sized for that width at 1:1.
 
-Chapters 7 and 8 are not drafted, and the figures they owe need artefacts this script
-already reads. They are recorded here so the list does not live only in a draft:
+Chapter 8 is not drafted, and the figures it owes need artefacts this script already reads.
+They are recorded here so the list does not live only in a draft:
 
-    7.1  test CE against b_scale per lane, each estimator at its own point
-    7.2  paired contrasts between estimators
-    7.3  PPE field gallery, HGAOEnKF-MT against pixel 3DVar
-    7.4  per-cell CE
-    7.5  realised error reduction beside claimed uncertainty reduction
-    7.6  PPE skill against distance to the nearest observation
-    7.7  withholding skill against distance to the nearest assimilated site
-    7.8  skill by timescale
-    7.9  one cell as a filtered time series
-    7.10 rRMSE against the number of timescale blocks
     8.1  sites assimilated per age, prior-only ages marked
     8.2  domain mean and one Nordic Seas cell, raw and smoothed, across b_scale
     8.3  posterior uncertainty: map, and domain-mean spread against age
@@ -58,6 +48,7 @@ from paleoreco.assim.observations import (
     sample_block_centres,
 )
 from paleoreco.data import VARS, build_prior_cube
+from paleoreco.eval import calibration, da
 from paleoreco.data.splits import DO_EVENT_WINDOWS, chronological_half_split
 
 # One house style for the whole report, so no figure is visually out of family.
@@ -273,7 +264,7 @@ def chapter1(inp: Inputs) -> None:
 
     draw_field(axes[2], lats, lons, masked(post_anom[CHAN_FIG11]), vmin=-V, vmax=V)
     axes[2].scatter(obs_lon, obs_lat, s=0.8, c="k", linewidth=0, transform=PLATE, zorder=3)
-    axes[2].set_title("(c) HGAOEnKF-MT posterior")
+    axes[2].set_title("(c) MTA-HGAOEnKF posterior")
 
     for i, ax in enumerate(axes):
         map_axes(ax, ylabel=(i == 0))
@@ -306,7 +297,7 @@ def chapter2() -> None:
 
     # Works are cited in the LaTeX caption, not in the boxes: the report numbers its references, so
     # an author-year list here buys nothing, and those long labels were what forced every collision
-    # the layout used to work around. HGAOEnKF and HGAOEnKF-MT straddle their shared column so the
+    # the layout used to work around. HGAOEnKF and MTA-HGAOEnKF straddle their shared column so the
     # connector between them has somewhere to go; everything else sits on its own tick.
     METHODS = [
         (0.00, 0, "3DVar", "published"),
@@ -314,7 +305,7 @@ def chapter2() -> None:
         (1.00, 0, "AOEnKF-B", "published"),
         (1.00, 2, "Analog offline EnKF", "published"),
         (0.55, 3, "HGAOEnKF", "published"),
-        (1.30, 3, "HGAOEnKF-MT\n(this work)", "ours"),
+        (1.30, 3, "MTA-HGAOEnKF\n(this work)", "ours"),
         (2.05, 3, "Online paleoDA", "published"),
         (3.00, 4, "Generative DA", "published"),
     ]
@@ -365,7 +356,7 @@ def chapter2() -> None:
     # The boxes are drawn above the connector, so none of it is visible inside them.
     BITE = 0.004
     _, hga_right = box_edges(boxes["HGAOEnKF"])
-    mt_left, _ = box_edges(boxes["HGAOEnKF-MT"])
+    mt_left, _ = box_edges(boxes["MTA-HGAOEnKF"])
 
     # The contribution keeps the analog mean and keeps the hybrid gain, so it belongs in the same
     # row and the same column band as the estimator it extends; only the content of the
@@ -1037,7 +1028,7 @@ def chapter6(inp: Inputs) -> None:
     ax.legend(loc="upper left", frameon=False, handlelength=1.8, bbox_to_anchor=(0.30, 1.03))
     save(fig, "fig06_02_stack_response")
 
-    # Figure 6.3 - HGAOEnKF-MT as a third row of Figure 5.1.
+    # Figure 6.3 - MTA-HGAOEnKF as a third row of Figure 5.1.
     #
     # A drawing, not an experiment, and the visual language is Figure 5.1's commitment rather
     # than a fresh choice: blue is the static archive-wide path, green the data-selected
@@ -1049,7 +1040,7 @@ def chapter6(inp: Inputs) -> None:
 
     fig, ax = plt.subplots(figsize=(REPORT_WIDTH, 1.62), constrained_layout=True)
     ax.set_xlim(0, 100); ax.set_ylim(-0.3, 13.2); ax.axis("off")
-    ax.text(0, 13.1, "(c)  HGAOEnKF-MT", fontsize=7.4, fontweight="bold", va="top")
+    ax.text(0, 13.1, "(c)  MTA-HGAOEnKF", fontsize=7.4, fontweight="bold", va="top")
 
     archive = stage(ax, 1, 12, ROW0, ROW1, "LOVECLIM\narchive", STATIC)
     select = stage(ax, 15, 31, ROW0, ROW1,
@@ -1131,14 +1122,471 @@ def chapter6(inp: Inputs) -> None:
     print(f"\n{near6.sum()} of {len(near6)} analyses lie within 300 yr of an interstadial onset")
 
 
+# ---------------------------------------------------------------------------
+# Chapter 7: three estimators, three lanes.
+# ---------------------------------------------------------------------------
+# One colour and one marker per estimator, fixed here and used by every figure below, so the
+# three read the same way throughout the chapter. Grey is the static analysis, blue is the
+# archive-wide path the schematics of Figures 2.1 and 5.1 already draw in blue, and orange is
+# Figure 2.1's "this work" colour.
+ESTIMATORS = (
+    (ex.ESTIMATOR_3DVAR, "3DVar", "#6b6b6b", "o"),
+    (ex.ESTIMATOR_HGAOENKF, "HGAOEnKF", "#3c5f8f", "s"),
+    (ex.ESTIMATOR_HGAOENKF_MT, "MTA-HGAOEnKF", "#c4692a", "D"),
+)
+# Blue where a comparator is better, orange where the contribution is, in the same two colours
+# the estimators carry everywhere else, so no reader has to consult a key to read the sign.
+DIFF_CMAP = plt.matplotlib.colors.LinearSegmentedColormap.from_list(
+    "mt_diff", ["#3c5f8f", "#eef1f4", "#f7f2ee", "#c4692a"])
+
+
+TAPER_COLS = ("localization_km", "shrinkage_lambda", "alpha")
+
+
+def _run(estimator, lane, name):
+    """One stored artefact of one (estimator, lane), by file name."""
+    path = paths.run_dir(estimator, lane) / name
+    return json.load(open(path)) if name.endswith(".json") else np.load(path)
+
+
+def _lane_rows(estimator, lane, file_lane, *, method, split="test", **fixed):
+    """Pooled, all-event metric rows of one lane, filtered to one method and split."""
+    M = pd.read_csv(paths.run_dir(estimator, lane) / "metrics.csv")
+    m = ((M.method == method) & (M.split == split) & (M.channel == "pooled")
+         & (M.do_event == "all") & (M.lane == file_lane))
+    for key, value in fixed.items():
+        m &= np.isclose(M[key], value)
+    return M[m]
+
+
+def _at_selected(M, cfg, b_scale):
+    """Mask of the rows a lane's config.json recorded as its winning configuration.
+
+    The taper is read from ``selected`` where the grid searched it and from the config's own
+    columns where it was inherited, so one mask serves a lane that gridded the regularizer and
+    a lane that was handed it. A key absent from ``selected`` is an axis the run never varied.
+    """
+    sel = cfg["selected"]
+    m = np.isclose(M["b_scale"], b_scale)
+    for key in TAPER_COLS:
+        value = sel.get(key, cfg.get(key))
+        m &= M[key].isna() if value is None else np.isclose(M[key], value)
+    for key in ("analog_k", "hybrid_w") + ex.TERM_KEYS:
+        if key in sel:
+            m &= np.isclose(M[key], sel[key])
+    return m
+
+
+def _bin_centres(edges):
+    """The midpoint of each distance bin, which is what the stored curve calls its centre.
+
+    Arithmetic rather than geometric: the innermost bin starts at zero, whose geometric
+    centre is zero and has no place on a log axis.
+    """
+    return 0.5 * (np.asarray(edges)[:-1] + np.asarray(edges)[1:])
+
+
+def _count_axis(ax, edges, counts):
+    """Bin populations as pale bars behind a skill curve, on their own right-hand axis.
+
+    A curve over unequal distance bins says nothing about how much of the domain each bin
+    holds, and on both lanes below that is exactly what decides how far the curve can be
+    trusted.
+    """
+    twin = ax.twinx()
+    twin.bar(edges[:-1], counts, width=np.diff(edges), align="edge",
+             color="0.90", edgecolor="white", linewidth=0.4, zorder=0)
+    twin.set_ylim(0, counts.max() * 3.1)
+    twin.set_yticks([])
+    twin.set_zorder(ax.get_zorder() - 1)
+    ax.patch.set_visible(False)
+    return twin
+
+
+def chapter7() -> None:
+    """Figures 7.1-7.5: three estimators across the three evaluation lanes."""
+    LANE_W = "withholding_random"
+    deflate = {e: ex.method_label(e, ex.TEMPORAL_DEFLATE) for e, *_ in ESTIMATORS}
+
+    # --- Figure 7.1: what the hybrid weight says the analog covariance is worth --------------
+    # The prior mean is the analog mean at every weight and only the covariance entering the
+    # gain moves, so the sweep separates the two things an analog prior supplies. At each
+    # weight the ensemble size and amplitude are the pair that weight's own selection split
+    # prefers, so no point on either curve is chosen on the split it is plotted from.
+    def alpha_profile(estimator, theta):
+        M = pd.read_csv(paths.run_dir(estimator, paths.LANE_PPE) / "metrics.csv")
+        base = ((M.method == ex.method_label(estimator)) & (M.lane == ex.LANE_PPE)
+                & (M.channel == "pooled") & (M.do_event == "all") & (M.metric == "rrmse")
+                & np.isclose(M.tendency_theta, theta))
+        sel, tst = M[base & (M.split == "selection")], M[base & (M.split == "test")]
+        rows = []
+        for w, g in sel.groupby("hybrid_w"):
+            win = g.loc[g.value.idxmin()]
+            hit = tst[np.isclose(tst.hybrid_w, w) & np.isclose(tst.analog_k, win.analog_k)
+                      & np.isclose(tst.b_scale, win.b_scale)]
+            rows.append((float(w), float(hit.value.iloc[0]), int(win.analog_k),
+                         float(win.b_scale)))
+        return np.array(sorted(rows))
+
+    three_cfg = _run(ex.ESTIMATOR_3DVAR, paths.LANE_PPE, "ppe_config.json")
+    three_M = pd.read_csv(paths.run_dir(ex.ESTIMATOR_3DVAR, paths.LANE_PPE) / "metrics.csv")
+    three_rrmse = float(three_M[(three_M.method == "3dvar") & (three_M.split == "test")
+                                & (three_M.channel == "pooled") & (three_M.do_event == "all")
+                                & (three_M.metric == "rrmse")
+                                & _at_selected(three_M, three_cfg,
+                                               three_cfg["selected"]["b_scale"])].value.iloc[0])
+
+    fig, ax = plt.subplots(figsize=(REPORT_WIDTH, 2.7), constrained_layout=True)
+    ax.axhline(three_rrmse, color="#6b6b6b", lw=0.9, ls=(0, (5, 3)), zorder=1)
+    ax.text(0.985, three_rrmse - 0.0012, "3DVar", color="#6b6b6b", fontsize=6.4,
+            ha="right", va="top")
+    for estimator, label, colour, marker in ESTIMATORS[1:]:
+        cfg = _run(estimator, paths.LANE_PPE, "ppe_config.json")
+        theta = cfg["selected"]["tendency_theta"]
+        prof = alpha_profile(estimator, theta)
+        ax.plot(prof[:, 0], prof[:, 1], marker + "-", ms=3.6, lw=1.3, color=colour, label=label,
+                zorder=3)
+        chosen = float(cfg["selected"]["hybrid_w"])
+        y = float(prof[np.isclose(prof[:, 0], chosen), 1][0])
+        ax.plot([chosen], [y], marker="o", ms=9.5, mfc="none", mec=colour, mew=1.2, zorder=4)
+        print(f"  7.1 {label:12s} theta={theta:g} alpha profile "
+              f"{dict(zip(prof[:, 0], np.round(prof[:, 1], 4)))}, selection chose alpha={chosen:g}")
+    ax.annotate("prior mean alone\n(static gain)", xy=(0.0, 0.5924), xytext=(0.095, 0.6065),
+                fontsize=6.3, color="0.35", ha="left", va="center",
+                arrowprops=dict(arrowstyle="-", lw=0.7, color="0.55",
+                                connectionstyle="arc3,rad=0.2"))
+    ax.annotate("analog covariance alone", xy=(1.0, 0.552), xytext=(0.80, 0.5645),
+                fontsize=6.3, color="0.35", ha="center", va="bottom",
+                arrowprops=dict(arrowstyle="-", lw=0.7, color="0.55",
+                                connectionstyle="arc3,rad=-0.25"))
+    ax.set_xlim(-0.07, 1.07)
+    ax.set_ylim(0.549, 0.619)
+    ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
+    ax.set_xlabel(r"hybrid weight $\alpha$ on the analog covariance")
+    ax.set_ylabel("test relative RMSE\n(snapshot lane)")
+    ax.legend(loc="lower left", frameon=False, handlelength=1.6, borderpad=0.15,
+              labelspacing=0.25)
+    save(fig, "fig07_01_hybrid_weight")
+
+    # --- Figure 7.2: where in space the estimators separate ----------------------------------
+    # The snapshot lane alone. The withholding lane carries the same statistic and it is
+    # computed below, but it is reported as numbers rather than drawn: its curves lie on top of
+    # one another at every distance, which is a null the prose states in one sentence and a
+    # panel spends a third of a figure failing to show.
+    fig, ax = plt.subplots(figsize=(REPORT_WIDTH, 2.6), constrained_layout=True)
+    for estimator, label, colour, marker in ESTIMATORS:
+        cfg = _run(estimator, paths.LANE_PPE, "ppe_config.json")
+        z = _run(estimator, paths.LANE_PPE, "ppe_skill_vs_distance.npz")
+        bj = int(np.argmin(np.abs(z["b_scales"] - cfg["selected"]["b_scale"])))
+        edges, counts = z["edges"], z["count"]
+        # The widest bin holds a few hundred points against hundreds of thousands elsewhere,
+        # so it is a handful of cells in the Pacific and Southern Ocean voids rather than a
+        # measurement; it is dropped rather than drawn with an interval nothing supports.
+        keep = counts > 1000 if (counts > 1000).any() else counts > 0
+        centres = _bin_centres(edges)
+        ax.plot(centres[keep], z["ce"][bj][keep], marker + "-", ms=3.8, lw=1.3, color=colour,
+                label=label, zorder=3)
+        if estimator == ex.ESTIMATOR_3DVAR:
+            _count_axis(ax, edges[:keep.sum() + 1], counts[keep] / 1e3)
+        print(f"  7.2 {label:12s} CE by distance {np.round(z['ce'][bj][keep], 4)}")
+    mt = _run(ex.ESTIMATOR_HGAOENKF_MT, paths.LANE_PPE, "ppe_skill_vs_distance.npz")
+    base = _run(ex.ESTIMATOR_HGAOENKF, paths.LANE_PPE, "ppe_skill_vs_distance.npz")
+    for tag, other in (("3DVar", ex.ESTIMATOR_3DVAR), ("HGAOEnKF", ex.ESTIMATOR_HGAOENKF)):
+        o = _run(other, paths.LANE_PPE, "ppe_skill_vs_distance.npz")
+        oc = _run(other, paths.LANE_PPE, "ppe_config.json")["selected"]["b_scale"]
+        mc = _run(ex.ESTIMATOR_HGAOENKF_MT, paths.LANE_PPE, "ppe_config.json")["selected"]["b_scale"]
+        gap = (mt["ce"][int(np.argmin(np.abs(mt["b_scales"] - mc)))]
+               - o["ce"][int(np.argmin(np.abs(o["b_scales"] - oc)))])
+        print(f"  7.2 MT - {tag:9s} gain by distance {np.round(gap[keep], 4)}")
+    ax.set_xscale("log")
+    ax.set_xlim(200, 8200)
+    ax.set_xticks([250, 500, 1000, 2000, 5000])
+    ax.set_xticklabels(["250", "500", "1000", "2000", "5000"])
+    ax.set_xlabel("distance to the nearest observation (km)")
+    ax.set_ylabel("coefficient of efficiency\n(snapshot lane)")
+    ax.legend(loc="lower left", frameon=False, handlelength=1.6, borderpad=0.15,
+              labelspacing=0.25)
+    save(fig, "fig07_02_skill_vs_distance")
+
+    # The same statistic on the real proxies, printed rather than plotted. Section 7.6 quotes
+    # these, and they are what says the lane sits in the interpolation regime: the withheld
+    # samples sit close to the data, and the three estimators are indistinguishable at every
+    # distance they do reach.
+    W_EDGES = np.array([0.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0])
+    for estimator, label, _, _ in ESTIMATORS:
+        cfg = _run(estimator, paths.LANE_WITHHOLDING, "withholding_random_config.json")
+        z = _run(estimator, paths.LANE_WITHHOLDING, "withholding_random_predictions.npz")
+        bj = int(np.argmin(np.abs(z["b_scales"] - cfg["selected"]["b_scale"])))
+        actual = z["actual"]
+        curve = da.skill_vs_distance(actual, z[f"climatological_pred_{deflate[estimator]}"][bj],
+                                     np.zeros_like(actual), z["distance_km"], W_EDGES)
+        if estimator == ex.ESTIMATOR_3DVAR:
+            print(f"  7.6 withheld-sample distance: median "
+                  f"{np.median(z['distance_km']):.0f} km, "
+                  f"{100 * float((z['distance_km'] <= 2000).mean()):.1f}% within 2000 km; "
+                  f"bins {W_EDGES.astype(int)} hold {curve['count']}")
+        print(f"  7.6 {label:12s} withholding CE by distance {np.round(curve['ce'], 4)}")
+
+    # --- Figure 7.3: the same comparison cell by cell ----------------------------------------
+    # The snapshot lane's stored fields are the analyses the chapter reports: that lane writes
+    # one amplitude and it is the selected one, so no map here is drawn at a configuration the
+    # tables do not quote.
+    ppe = {e: _run(e, paths.LANE_PPE, "ppe_analysis.npz") for e, *_ in ESTIMATORS}
+    ref = ppe[ex.ESTIMATOR_3DVAR]
+    lats7, lons7 = ref["lats"], ref["lons"]
+    truth7 = ref["truth_anom"].astype(np.float64)
+    zero7 = np.zeros_like(truth7[0])
+    ce = {e: da.ce_map(truth7, ppe[e]["recon_climatological"].astype(np.float64), zero7)
+          for e in ppe}
+    mt_ce = ce[ex.ESTIMATOR_HGAOENKF_MT]
+    # Symmetric and clipped at a round value just past the 98th percentile of the absolute
+    # difference: a handful of cells in which the truth barely varies reach several CE units
+    # and would otherwise set a scale on which nothing else is visible.
+    DIFF_LIM = 0.25
+    COLS = [("MTA-HGAOEnKF", mt_ce, dict(vmin=0.0, vmax=1.0, cmap="viridis"), "min", "CE"),
+            ("minus 3DVar", mt_ce - ce[ex.ESTIMATOR_3DVAR],
+             dict(vmin=-DIFF_LIM, vmax=DIFF_LIM, cmap=DIFF_CMAP), "both", r"$\Delta$CE"),
+            ("minus HGAOEnKF", mt_ce - ce[ex.ESTIMATOR_HGAOENKF],
+             dict(vmin=-DIFF_LIM, vmax=DIFF_LIM, cmap=DIFF_CMAP), "both", r"$\Delta$CE")]
+
+    fig, axes = plt.subplots(2, 3, figsize=(REPORT_WIDTH, 2.60),
+                             subplot_kw={"projection": PLATE}, constrained_layout=True)
+    for j, (label, field, kw, extend, unit) in enumerate(COLS):
+        for c, name in enumerate(VARS):
+            mesh = draw_field(axes[c, j], lats7, lons7, field[c], **kw)
+            axes[c, j].set_title(f"({'adbecf'[2 * j + c]}) {name.upper()} {label}", fontsize=6.8)
+            map_axes(axes[c, j], ylabel=(j == 0))
+        cb = fig.colorbar(mesh, ax=axes[:, j], orientation="horizontal", shrink=0.92, pad=0.02,
+                          aspect=22, extend=extend)
+        cb.set_label(unit, fontsize=6.8)
+        cb.ax.tick_params(labelsize=6, length=2)
+    save(fig, "fig07_03_percell_ce")
+
+    for a, b, tag in ((ex.ESTIMATOR_HGAOENKF_MT, ex.ESTIMATOR_3DVAR, "MT - 3DVar"),
+                      (ex.ESTIMATOR_HGAOENKF_MT, ex.ESTIMATOR_HGAOENKF, "MT - HGAOEnKF"),
+                      (ex.ESTIMATOR_HGAOENKF, ex.ESTIMATOR_3DVAR, "HGAOEnKF - 3DVar")):
+        d = ce[a] - ce[b]
+        by_lat = [(lo, hi, float(d[:, (lats7 >= lo) & (lats7 < hi)].mean()))
+                  for lo, hi in ((-90, -45), (-45, 0), (0, 45), (45, 90))]
+        print(f"  7.3 {tag:16s} median {np.median(d):+.4f}, better in {100 * (d > 0).mean():.1f}% "
+              f"of cells | MTCO {np.median(d[0]):+.4f} ({100 * (d[0] > 0).mean():.1f}%) "
+              f"MTWA {np.median(d[1]):+.4f} ({100 * (d[1] > 0).mean():.1f}%) | "
+              + " ".join(f"{lo}..{hi}:{v:+.4f}" for lo, hi, v in by_lat)
+              + f" | clipped {100 * (np.abs(d) > DIFF_LIM).mean():.1f}%")
+
+    # --- Figure 7.4: where in time the analog estimators separate ----------------------------
+    # Every point comes from the metrics CSV, which carries the timescale rows at every
+    # amplitude, so the lane can be read at whichever one it is reported at. That is the one its
+    # config selected, which is also what the operating-point table quotes and what the stored
+    # fields carry, so this figure, that table and any map of this lane describe one analysis.
+    # Reading each treatment's own selected amplitude instead would report the corrected
+    # analysis at a point three different treatments each chose differently.
+    #
+    # The figure draws the two analog estimators alone: what it is read for is what the flow
+    # stack does to the scheme it extends, and a third line answering a different question
+    # crowds two panels that are already dense. 3DVar is still scored and still printed below,
+    # because Section 7.5 quotes its band values in the prose, where the comparison against a
+    # static analysis belongs.
+    band_x = np.arange(len(ex.BANDS), dtype=float)
+    windows = np.array(ex.LOWPASS_WINDOWS, dtype=float)
+    fig, axes = plt.subplots(1, 2, figsize=(REPORT_WIDTH, 2.5), constrained_layout=True)
+    for estimator, label, colour, marker in ESTIMATORS:
+        cfg = _run(estimator, paths.LANE_TRAJECTORY, "trajectory_config.json")
+        method = deflate[estimator]
+        b = cfg["selected"]["b_scale"]
+        rows = _lane_rows(estimator, paths.LANE_TRAJECTORY, ex.LANE_TRAJECTORY,
+                          method=method, b_scale=b).set_index("metric")["value"]
+
+        def read(*names):
+            return np.array([float(rows.get(n, np.nan)) for n in names])
+
+        band_ce = read(*(f"ce_bp{lo}_{hi}" for lo, hi in ex.BANDS))
+        band_amp = read(*(f"amp_bp{lo}_{hi}" for lo, hi in ex.BANDS))
+        band_r = read(*(f"corr_bp{lo}_{hi}" for lo, hi in ex.BANDS))
+        lp_ce = read(*(f"ce_lp{int(w)}" for w in windows))
+        if estimator != ex.ESTIMATOR_3DVAR:
+            kw = dict(ms=3.4, lw=1.2, color=colour)
+            axes[0].plot(band_x, band_ce, marker + "-", label=label, **kw)
+            axes[1].plot(windows, lp_ce, marker + "-", label=label, **kw)
+        print(f"  7.4 {label:12s} c={b:g} band CE {np.round(band_ce, 4)} | "
+              f"lowpass CE {np.round(lp_ce, 4)} | band amp {np.round(band_amp, 4)} | "
+              f"band r {np.round(band_r, 4)}")
+    axes[0].axhline(0.0, color="0.45", lw=0.7)
+    axes[0].text(4.35, 0.02, "climatology", fontsize=6.2, color="0.45", ha="right", va="bottom")
+    axes[0].set_ylim(-0.66, 0.88)
+    axes[0].set_ylabel("coefficient of efficiency")
+    axes[0].set_xlabel("band (yr)")
+    axes[0].text(0.02, 1.02, "(a) by band", transform=axes[0].transAxes, fontsize=7.0,
+                 fontweight="bold", va="bottom")
+    axes[0].legend(loc="upper left", frameon=False, handlelength=1.5, borderpad=0.1,
+                   labelspacing=0.22, fontsize=6.5, bbox_to_anchor=(-0.01, 0.97))
+    axes[1].set_ylim(0.46, 0.82)
+    axes[1].set_ylabel("coefficient of efficiency")
+    axes[1].set_xlabel("everything slower than (yr)")
+    axes[1].text(0.02, 1.02, "(b) cumulative", transform=axes[1].transAxes, fontsize=7.0,
+                 fontweight="bold", va="bottom")
+    # A band is named by the band it is, since a tick at its geometric centre reads as a
+    # timescale the metric never isolated; the cumulative panel keeps the window itself.
+    BAND_TICKS = ["25-100", "100-250", "250-500", "500-1k", "1k-2k"]
+    axes[0].set_xlim(-0.35, len(ex.BANDS) - 0.65)
+    axes[0].set_xticks(band_x)
+    axes[0].set_xticklabels(BAND_TICKS, fontsize=6.0, rotation=38, ha="right",
+                            rotation_mode="anchor")
+    axes[1].set_xscale("log")
+    axes[1].set_xlim(19, 2700)
+    axes[1].set_xticks([25, 100, 250, 500, 1000, 2000])
+    axes[1].set_xticklabels(["25", "100", "250", "500", "1k", "2k"])
+    save(fig, "fig07_04_timescale")
+
+    # --- Figure 7.5: whether the stated uncertainty matches the errors -----------------------
+    # The networks are identical across the three runs, so the distance to the nearest
+    # observation is a property of the lane rather than of an estimator and is built once.
+    obs_n = ref["obs_n"]
+    dist = np.stack([da.nearest_obs_distance(lats7, lons7, ref["obs_lat"][ti, :n],
+                                             ref["obs_lon"][ti, :n])
+                     for ti, n in enumerate(obs_n)])
+    shape7 = truth7.shape
+    dist_full = np.broadcast_to(dist.reshape(shape7[0], 1, shape7[2], shape7[3]),
+                                shape7).ravel()
+    edges7 = _run(ex.ESTIMATOR_3DVAR, paths.LANE_PPE, "ppe_skill_vs_distance.npz")["edges"]
+    counts7 = _run(ex.ESTIMATOR_3DVAR, paths.LANE_PPE,
+                   "ppe_skill_vs_distance.npz")["count"]
+    keep7 = counts7 > 1000 if (counts7 > 1000).any() else counts7 > 0
+    which = np.digitize(dist_full, edges7) - 1
+
+    fig, axes = plt.subplots(1, 2, figsize=(REPORT_WIDTH, 2.45), constrained_layout=True)
+    axes[0].axhline(1.0, color="0.45", lw=0.8, ls=(0, (4, 3)))
+    axes[0].text(7800, 1.02, "honest", fontsize=6.2, color="0.45", ha="right", va="bottom")
+    for estimator, label, colour, marker in ESTIMATORS:
+        z = ppe[estimator]
+        resid = ((truth7 - z["recon_climatological"].astype(np.float64))
+                 / np.sqrt(z["post_var"].astype(np.float64))).ravel()
+        disp = np.array([calibration.rcrv(resid[which == b], np.zeros(int((which == b).sum())),
+                                          np.ones(int((which == b).sum())))[1]
+                         if (which == b).sum() > 1 else np.nan
+                         for b in range(len(edges7) - 1)])
+        axes[0].plot(_bin_centres(edges7)[keep7], disp[keep7], marker + "-", ms=3.4, lw=1.2,
+                     color=colour, label=label, zorder=3)
+        # Residuals past the window are dropped rather than clipped: piling them on the end
+        # bins draws a spike that is an artefact of the axis, not of the posterior. At most
+        # 2.2% of any estimator's residuals fall outside it.
+        axes[1].hist(resid, bins=np.linspace(-5, 5, 121), density=True, histtype="step",
+                     lw=1.1, color=colour, label=label)
+        print(f"  7.5 {label:12s} dispersion by distance {np.round(disp[keep7], 3)} | "
+              f"pooled {np.std(resid):.3f}")
+    axes[0].set_xscale("log")
+    axes[0].set_xlim(200, 8200)
+    axes[0].set_xticks([250, 500, 1000, 2000, 5000])
+    axes[0].set_xticklabels(["250", "500", "1000", "2000", "5000"])
+    axes[0].set_ylim(0.75, 2.62)
+    axes[0].set_xlabel("distance to the nearest observation (km)")
+    axes[0].set_ylabel("dispersion $d$")
+    axes[0].legend(loc="upper left", frameon=False, handlelength=1.6, borderpad=0.15,
+                   fontsize=6.6)
+    axes[0].text(0.02, 1.02, "(a) by distance", transform=axes[0].transAxes, fontsize=7.0,
+                 fontweight="bold", va="bottom")
+    grid7 = np.linspace(-5, 5, 400)
+    axes[1].plot(grid7, stats.norm.pdf(grid7), color="0.25", lw=0.9, ls=(0, (4, 3)),
+                 label="honest posterior")
+    axes[1].set_xlim(-5, 5)
+    axes[1].set_xlabel("standardised residual $z$")
+    axes[1].set_ylabel("density")
+    axes[1].legend(loc="upper left", frameon=False, handlelength=1.6, borderpad=0.15,
+                   fontsize=6.6)
+    axes[1].text(0.02, 1.02, "(b) pooled", transform=axes[1].transAxes, fontsize=7.0,
+                 fontweight="bold", va="bottom")
+    save(fig, "fig07_05_calibration")
+
+
+    # --- Figure 7.6: how far each prior can be trusted -----------------------------------------
+    # Every lane scores its estimators at all ten amplitudes, so the sweep is a read rather than
+    # a re-run. Only c varies along each curve: the taper, the ensemble size and the hybrid
+    # weight are held at the values Table 7.1 records, so the curve is one estimator being
+    # trusted further and further rather than a different estimator at each point.
+    SWEEP = ((("a"), "snapshot", paths.LANE_PPE, ex.LANE_PPE, "ppe_config.json",
+              ex.TEMPORAL_OFF, False),
+             (("b"), "time series", paths.LANE_TRAJECTORY, ex.LANE_TRAJECTORY,
+              "trajectory_config.json", ex.TEMPORAL_DEFLATE, False),
+             (("c"), "withholding", paths.LANE_WITHHOLDING, LANE_W,
+              "withholding_random_config.json", ex.TEMPORAL_DEFLATE, True))
+
+    fig, axes = plt.subplots(1, 3, figsize=(REPORT_WIDTH, 2.35), constrained_layout=True)
+    for ax, (tag, title, dirname, lanecol, cfgname, treat, by_fold) in zip(axes, SWEEP):
+        for estimator, label, colour, marker in ESTIMATORS:
+            cfg = _run(estimator, dirname, cfgname)
+            M = pd.read_csv(paths.run_dir(estimator, dirname) / "metrics.csv")
+            m = ((M.method == ex.method_label(estimator, treat)) & (M.lane == lanecol)
+                 & (M.split == "test") & (M.channel == "pooled") & (M.do_event == "all")
+                 & (M.metric == "ce"))
+            if by_fold:
+                m &= (M.fold == -1)
+            # The run directories hold a whole grid, so the sweep is pinned to the configuration
+            # the lane selected and only the amplitude is left free.
+            sel = cfg["selected"]
+            for key in TAPER_COLS:
+                value = sel.get(key, cfg.get(key))
+                m &= M[key].isna() if value is None else np.isclose(M[key], value)
+            for key in ("analog_k", "hybrid_w") + ex.TERM_KEYS:
+                if key in sel and M[key].notna().any():
+                    m &= np.isclose(M[key], sel[key])
+            curve = M[m].set_index("b_scale")["value"].sort_index()
+            static = estimator == ex.ESTIMATOR_3DVAR
+            ax.plot(curve.index, curve.values, marker=marker, ms=3.2, lw=1.3, color=colour,
+                    ls=(0, (3.2, 1.8)) if static else "-", label=label,
+                    zorder=5 if static else 3)
+            b = sel["b_scale"]
+            ax.plot([b], [curve.loc[b]], marker="o", ms=8.5, mfc="none", mec=colour, mew=1.1,
+                    zorder=6 if static else 4)
+            print(f"  7.6 {title:12s} {label:12s} chosen c={b:<5g} CE "
+                  + " ".join(f"{k:g}:{v:.3f}" for k, v in curve.items()))
+        ax.axhline(0.0, color="0.45", lw=0.7)
+        ax.set_xscale("log")
+        ax.set_xlim(0.07, 150)
+        ax.set_xticks([0.1, 1, 10, 100])
+        ax.set_xticklabels(["0.1", "1", "10", "100"])
+        ax.set_xlabel(r"background amplitude $c$")
+        ax.text(0.02, 1.02, f"({tag}) {title} lane", transform=ax.transAxes, fontsize=7.0,
+                fontweight="bold", va="bottom")
+    axes[0].set_ylabel("test coefficient of efficiency")
+    axes[0].text(0.082, 0.025, "climatology", fontsize=6.2, color="0.45", ha="left",
+                 va="bottom")
+    axes[0].legend(loc="lower left", frameon=False, handlelength=1.5, borderpad=0.1,
+                   labelspacing=0.22, fontsize=6.4)
+    save(fig, "fig07_06_amplitude_sweep")
+
+    # The headline the chapter's tables print, read off the same artefacts the figures are.
+    for estimator, label, _, _ in ESTIMATORS:
+        cfg = _run(estimator, paths.LANE_PPE, "ppe_config.json")
+        M = pd.read_csv(paths.run_dir(estimator, paths.LANE_PPE) / "metrics.csv")
+        b = cfg["selected"]["b_scale"]
+        row = M[(M.method == ex.method_label(estimator)) & (M.split == "test")
+                & (M.channel == "pooled") & (M.do_event == "all")
+                & _at_selected(M, cfg, b)].set_index("metric")["value"]
+        wcfg = _run(estimator, paths.LANE_WITHHOLDING, "withholding_random_config.json")
+        wrow = _lane_rows(estimator, paths.LANE_WITHHOLDING, LANE_W, method=deflate[estimator],
+                          b_scale=wcfg["selected"]["b_scale"], fold=-1).set_index("metric")["value"]
+        tcfg = _run(estimator, paths.LANE_TRAJECTORY, "trajectory_config.json")
+        trow = _lane_rows(estimator, paths.LANE_TRAJECTORY, ex.LANE_TRAJECTORY,
+                          method=deflate[estimator],
+                          b_scale=tcfg["selected"]["b_scale"]).set_index("metric")["value"]
+        print(f"  T7.2 {label:12s} snapshot CE {row['ce']:.4f} amp {row['amplitude']:.3f} "
+              f"ssim {row['ssim']:.3f} | time series CE {trow['ce']:.4f} amp "
+              f"{trow['amplitude']:.3f} | withholding CE {wrow['ce']:.4f} amp "
+              f"{wrow['amplitude']:.3f}")
+        print(f"  T7.3 {label:12s} d {row['rcrv_dispersion']:.2f}/{trow['rcrv_dispersion']:.2f}/"
+              f"{wrow['rcrv_dispersion']:.2f}  crps {row['crps']:.3f}/{trow['crps']:.3f}/"
+              f"{wrow['crps']:.3f}  cov {row['coverage90']:.3f}/{trow['coverage90']:.3f}/"
+              f"{wrow['coverage90']:.3f}")
+
+
 def main() -> None:
     smoke = C.smoke()
-    stages = C.Stages("07_figures", [f"chapter {n}" for n in (1, 2, 3, 4, 5, 6)])
+    stages = C.Stages("07_figures", [f"chapter {n}" for n in (1, 2, 3, 4, 5, 6, 7)])
     inp = load_inputs(C.SMOKE_AGES if smoke else None)
     for n, fn in ((1, chapter1), (2, chapter2), (3, chapter3),
-                  (4, chapter4), (5, chapter5), (6, chapter6)):
+                  (4, chapter4), (5, chapter5), (6, chapter6), (7, chapter7)):
         if stages.run(f"chapter {n}"):
-            fn() if fn in (chapter2, chapter4) else fn(inp)
+            fn() if fn in (chapter2, chapter4, chapter7) else fn(inp)
     stages.done()
 
 
