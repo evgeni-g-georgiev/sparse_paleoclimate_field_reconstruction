@@ -22,7 +22,9 @@ from paleoreco.assim.reconstruction import run_reconstruction
 
 RULE = ANALOG_EVIDENCE
 ESTIMATOR = ex.ESTIMATOR_HGAOENKF_MT
-B_SCALES = (1.0, 5.0, 10.0)
+# Reported side by side rather than selected between: nothing here can score an
+# amplitude, so the product brackets the ones the lanes chose against a truth.
+B_SCALES = (0.3, 1.0, 2.0, 5.0, 10.0)
 STAGES = ["product", "sensitivity variants"]
 
 

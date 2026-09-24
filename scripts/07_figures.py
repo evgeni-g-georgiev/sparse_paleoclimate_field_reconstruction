@@ -7,15 +7,6 @@ analog ensembles Chapter 6 anatomises.
 Figures are authored at their printed size. A 60-page A4 report with 2.5 cm margins has a
 text width of about 16 cm, so a figure drawn wide and scaled down would render 9 pt labels
 at roughly 4 pt. Everything below is sized for that width at 1:1.
-
-Chapter 8 is not drafted, and the figures it owes need artefacts this script already reads.
-They are recorded here so the list does not live only in a draft:
-
-    8.1  sites assimilated per age, prior-only ages marked
-    8.2  domain mean and one Nordic Seas cell, raw and smoothed, across b_scale
-    8.3  posterior uncertainty: map, and domain-mean spread against age
-    8.4  D-O composite warming and the seasonal contrast
-    8.5  Desroziers amplitude balance
 """
 
 from __future__ import annotations
@@ -46,10 +37,15 @@ from paleoreco.assim.observations import (
     observations_at_age,
     representativeness_variance,
     sample_block_centres,
+    temporal_terms,
 )
 from paleoreco.data import VARS, build_prior_cube
 from paleoreco.eval import calibration, da
-from paleoreco.data.splits import DO_EVENT_WINDOWS, chronological_half_split
+from paleoreco.data.splits import (
+    DO_EVENT_WINDOWS,
+    DO_ONSET_BP,
+    chronological_half_split,
+)
 
 # One house style for the whole report, so no figure is visually out of family.
 REPORT_WIDTH = 6.3      # inches; the text width at 2.5 cm margins on A4
@@ -1579,12 +1575,717 @@ def chapter7() -> None:
               f"{wrow['coverage90']:.3f}")
 
 
+# ---------------------------------------------------------------------------
+# Chapter 8: the product.
+# ---------------------------------------------------------------------------
+# The reconstruction is orange and the simulation it was built on blue, in the same two
+# colours Figure 2.1 gives "this work" and the archive-wide path.
+PRODUCT_C, SIM_C = "#c4692a", "#3c5f8f"
+# Where a panel separates the two channels rather than the two fields, it needs colours that
+# carry neither of the meanings above.
+CHANNEL_C = ("#1b7837", "#762a83")
+# The amplitude the maps and tables are quoted at. Nothing stored selects one, so the product
+# is published as a band across them all and this is the member Figure 1.1 also draws.
+B_REFERENCE = 5.0
+# Liu et al. (2026) Sect. 2.4 take each event as the interval from 300 yr before its onset to
+# 600 yr after. Ages run backwards, so the interstadial half is the younger one.
+DO_POST_YR, DO_PRE_YR = 600, 300
+# The timescale the product is read at, which is the fastest band Chapter 7 finds it beats a
+# climatology over.
+SMOOTH_YR = 250.0
+# Northern extratropics: the band Liu et al. report their MTCO-to-MTWA ratio over, and their
+# Table 3 maximum-likelihood slope with its 95% interval.
+NET_LAT = 23.5
+LIU_NET_SLOPE, LIU_NET_CI = 2.9, (2.0, 3.8)
+# Resampling the sites, not the rows: a site contributes thousands of correlated rows, so a
+# row bootstrap would report an interval far tighter than the network supports. The count
+# matches the redraws Section 7.2 reports.
+N_BOOT = 5000
+
+
+def _area_weights(lats, lons):
+    """Cosine-latitude weights over the grid, so a mean does not over-count the poles."""
+    return np.broadcast_to(np.cos(np.deg2rad(np.asarray(lats, dtype=float)))[:, None],
+                           (len(lats), len(lons)))
+
+
+def _area_mean(field, weights):
+    """Weighted mean over the trailing two axes."""
+    return (field * weights).sum(axis=(-2, -1)) / weights.sum()
+
+
+def _event_halves(ages, onset):
+    """``(interstadial, stadial)`` age masks for one onset, the younger half first."""
+    return ((ages >= onset - DO_POST_YR) & (ages <= onset),
+            (ages >= onset) & (ages <= onset + DO_PRE_YR))
+
+
+def _do_composite(field, ages, onsets):
+    """Interstadial-minus-stadial difference per event, stacked on a leading event axis.
+
+    Both halves are means rather than endpoint reads: a single 25-yr state either side of an
+    onset carries one network's analysis noise, and the product is not claimed at that
+    resolution anyway.
+    """
+    out = []
+    for onset in onsets:
+        warm, cold = _event_halves(ages, onset)
+        if warm.any() and cold.any():
+            out.append(field[warm].mean(axis=0) - field[cold].mean(axis=0))
+    return np.asarray(out)
+
+
+def _site_composite(long, onsets, value):
+    """Interstadial-minus-stadial at the proxy sites, per event, as ``(n_events, n_channels)``.
+
+    The estimator every source in Figure 8.4(f) is put through: one mean per site per half of
+    an event window, differenced, then averaged over the site-event pairs that report both
+    channels. Reading a gridded field through it, rather than area-averaging the field, is
+    what makes the field and the pollen comparable at all: the sites are a biased sample of
+    the band, so the two estimators answer different questions over the same region.
+    """
+    rows = []
+    for onset in onsets:
+        halves = []
+        for lo_, hi_ in ((onset - DO_POST_YR, onset), (onset, onset + DO_PRE_YR)):
+            d = long[(long["age"] >= lo_) & (long["age"] <= hi_)].copy()
+            d["v"] = value(d)
+            halves.append(d.groupby(["site", "channel", "lat"])["v"].mean())
+        d = (halves[0] - halves[1]).dropna().reset_index()
+        d = d[d["lat"] > NET_LAT]
+        pair = d.pivot_table(index="site", columns="channel", values="v").dropna()
+        rows.append([pair[v].mean() if v in pair else np.nan for v in VARS])
+    return np.asarray(rows)
+
+
+def _product_variants():
+    """``{name: npz}`` for every stored product directory, the shipped one first."""
+    found = {}
+    for d in sorted(paths.PRODUCT.iterdir() if paths.PRODUCT.is_dir() else []):
+        f = d / "reconstruction_fields.npz"
+        if f.is_file():
+            found[d.name] = np.load(f)
+    return {"main": found.pop("main"), **found} if "main" in found else found
+
+
+def _spread(sd):
+    """One number for how wide a posterior is over a field: the rms of its per-cell s.d."""
+    return np.sqrt((np.asarray(sd) ** 2).mean(axis=(-2, -1)))
+
+
+def _contrast_sd(post_var, cross_var):
+    """Stated s.d. of ``MTCO - MTWA``, which needs the posterior covariance between them.
+
+    Adding the two channel variances instead would overstate it wherever the analysis leaves
+    the two channels positively correlated, which over this grid it mostly does.
+    """
+    v = np.asarray(post_var, dtype=np.float64)
+    return np.sqrt(np.maximum(v[..., 0, :, :] + v[..., 1, :, :]
+                              - 2.0 * np.asarray(cross_var, dtype=np.float64), 0.0))
+
+
+def _structure_function(inp):
+    """The lag structure function and per-cell variance of the whole archive, built once.
+
+    Deterministic and cheap, and the same call the observation model of Section 5.3 makes,
+    so reading it here keeps the figure script free of any estimator.
+    """
+    from paleoreco.assim.background import temporal_structure_function
+    return temporal_structure_function(
+        inp.cube, np.arange(len(inp.ages)),
+        max_lag=int(inp.recon_cfg["max_block_lag_steps"]))
+
+
+def _withheld_identity(inp, safe_valid):
+    """``(age, gather index, block centre)`` of every pooled test row of the withholding lane.
+
+    The lane stores what each held-out prediction was and what it should have been, but not
+    which age it sat at, so a second predictor cannot be scored on the same rows without
+    rebuilding that. The rebuild is a permutation, not an analysis: it replays the lane's own
+    fold partition and age loop over the proxy table and reads nothing from an estimator. The
+    caller checks it against the stored arrays and drops the comparison rather than trusting
+    an order that no longer matches.
+
+    ``cell_observed`` marks the rows whose own grid cell also carried an assimilated
+    observation at that age. The lane's stored ``distance_km`` measures proximity in
+    kilometres; this measures it in the only unit the analysis can actually resolve, since a
+    withheld sample sharing a cell with an assimilated one is predicted from a cell the
+    update has already been told the value of.
+    """
+    cfg = _run(ex.ESTIMATOR_HGAOENKF_MT, paths.LANE_WITHHOLDING,
+               "withholding_random_config.json")
+    lats, lons = inp.lats, inp.lons
+    # The lane saw only the ages its own archive spanned, and the fold partition is drawn
+    # from the sites that survive that filter, so a reduced run has to be narrowed the same
+    # way before the order can match. On the full archive this drops nothing.
+    long = inp.long[inp.long["age"].isin({int(a) for a in inp.ages})]
+    n_cells = len(lats) * len(lons)
+    safe_flat = np.broadcast_to(safe_valid, (len(VARS), len(lats), len(lons))).ravel()
+    dated = sample_block_centres(long)
+    obs_ages = np.intersect1d(long["age"].unique(), inp.ages)
+    folds = [set(f.tolist()) for f in ex._site_folds(
+        long, int(cfg["k_folds"]), cfg["fold_kind"], int(cfg["seed"]))]
+    every = set(long["site"].unique().tolist())
+    rows = []
+    for fold in folds:
+        assimilated = every - fold
+        for age in obs_ages:
+            o = observations_at_age(dated, int(age))
+            g = obs_cell_index(o["lat"], o["lon"], o["channel"], lats, lons)
+            usable = safe_flat[g] & (o["sse"] > 0) & np.isfinite(o["my"])
+            given = usable & np.array([s in assimilated for s in o["site"]])
+            held = usable & np.array([s in fold for s in o["site"]])
+            if not given.any() or not held.any():
+                continue
+            given_cells = set(g[given].tolist())
+            rows.append(pd.DataFrame({
+                "age": int(age), "gather": g[held], "centre": o["centre"][held],
+                "site": o["site"][held], "channel": g[held] // n_cells,
+                "actual": o["y"][held] - o["my"][held], "sse": o["sse"][held],
+                "cell_observed": [c in given_cells for c in g[held]]}))
+    return pd.concat(rows, ignore_index=True)
+
+
+def _loveclim_at_sites(inp, ident, structure):
+    """The simulation read as a predictor of the withheld pollen, two ways.
+
+    ``raw`` is the simulation's own anomaly at the site's cell and the age being predicted.
+    ``deflated`` multiplies it by the same lag correlation the estimators' predictions carry,
+    which is what makes the two comparable: a held-out sample reports a state some way off in
+    time, so every predictor of it is attenuated by the same factor. ``at_centre`` instead
+    reads the simulation at the sample's own block midpoint, which is the most the simulation
+    could know if its chronology were exactly right.
+    """
+    cube, ages = inp.cube, inp.ages
+    step_yr = float(inp.recon_cfg["step_yr"])
+    gather = ident["gather"].to_numpy()
+    age, centre = ident["age"].to_numpy(), ident["centre"].to_numpy()
+    rho, _ = temporal_terms(*structure, gather, np.abs(age - centre), step_yr)
+    anom = (cube.astype(np.float64) - inp.recon["clim_mean"]).reshape(len(ages), -1)
+    index = {int(a): i for i, a in enumerate(ages)}
+    at_age = anom[np.array([index[a] for a in age]), gather]
+    near = np.clip(np.searchsorted(ages, centre), 0, len(ages) - 1)
+    near = np.where((near > 0) & (np.abs(ages[near] - centre)
+                                  > np.abs(ages[near - 1] - centre)), near - 1, near)
+    return {"raw": at_age, "deflated": rho * at_age, "at_centre": anom[near, gather]}
+
+
+def _ce_against_climatology(truth, pred):
+    """The withholding lane's own CE: the reference is a zero anomaly, not a fitted mean."""
+    return float(1.0 - np.sum((truth - pred) ** 2) / np.sum(truth ** 2))
+
+
+def _site_bootstrap_dce(truth, better, worse, site, n_boot=N_BOOT, seed=0):
+    """``(dCE, lo, hi)`` for two predictors, resampling whole sites with replacement.
+
+    Every draw scores both predictors on the same redrawn rows, so the interval is on the
+    paired difference rather than on either score.
+    """
+    codes, index = pd.factorize(site)
+    n = len(index)
+    parts = np.stack([np.bincount(codes, (truth - better) ** 2, n),
+                      np.bincount(codes, (truth - worse) ** 2, n),
+                      np.bincount(codes, truth ** 2, n)])
+    counts = np.random.default_rng(seed).multinomial(n, np.full(n, 1.0 / n), size=n_boot)
+    totals = counts @ parts.T
+    draws = (totals[:, 1] - totals[:, 0]) / totals[:, 2]
+    lo, hi = np.percentile(draws, [2.5, 97.5])
+    return (_ce_against_climatology(truth, better) - _ce_against_climatology(truth, worse),
+            float(lo), float(hi))
+
+
+# Progressively stricter exclusions of withheld rows that sit close to an assimilated site.
+# Overlapping rather than nested: the first is every row, the second drops rows whose own grid
+# cell also carried an assimilated observation, and the rest cut on great-circle distance. They
+# are read for how the interval behaves as the test is made harder, not as a monotone series.
+VOID_TESTS = (("all rows", None), ("different cell", "cell"),
+              ("> 250 km", 250.0), ("> 500 km", 500.0), ("> 1000 km", 1000.0))
+
+
+def _withheld_mask(kind, distance_km, cell_observed):
+    """Row mask for one entry of :data:`VOID_TESTS`."""
+    if kind is None:
+        return np.ones(len(distance_km), dtype=bool)
+    if kind == "cell":
+        return ~cell_observed
+    return np.nan_to_num(distance_km, nan=-1.0) > float(kind)
+
+
+def chapter8(inp: Inputs) -> None:
+    """Figures 8.1-8.4: the MIS3 reconstruction, what it rests on, and what it shows."""
+    cube, ages, lats, lons = inp.cube, inp.ages, inp.lats, inp.lons
+    recon, cfg = inp.recon, inp.recon_cfg
+
+    b_scales = recon["b_scales"]
+    bi = int(np.argmin(np.abs(b_scales - B_REFERENCE)))
+    b_ref = float(b_scales[bi])
+    prior_only = recon["prior_only"]
+    scored = ~prior_only
+    step_yr = float(cfg["step_yr"])
+    # The simulation in the product's own anomaly frame, so the two are directly comparable.
+    sim = cube.astype(np.float64) - recon["clim_mean"]
+    post = recon["mean_anom"].astype(np.float64)
+    back = recon["prior_mean_anom"].astype(np.float64)
+    w = _area_weights(lats, lons)
+    net = np.broadcast_to(np.asarray(lats, float)[:, None] > NET_LAT, (len(lats), len(lons)))
+    net_w = np.where(net, w, 0.0)
+    onsets = [a for a in sorted(DO_ONSET_BP.values()) if ages.min() <= a <= ages.max()]
+
+    n_cells = len(lats) * len(lons)
+    site_cell = obs_cell_index(inp.long["lat"].to_numpy(), inp.long["lon"].to_numpy(),
+                               inp.long["channel"].to_numpy(), lats, lons) % n_cells
+    reached = np.zeros(n_cells, dtype=bool)
+    reached[np.unique(site_cell)] = True
+    reached = reached.reshape(len(lats), len(lons))
+    sites = inp.long.groupby("site")[["lat", "lon"]].first()
+    # Every proxy row placed on the grid and on the age axis, so a field can be read through
+    # the network the same way the pollen is. Rows off this archive's age span are dropped,
+    # which is what a reduced run leaves behind.
+    structure = _structure_function(inp)
+    dated = sample_block_centres(inp.long)
+    gather_all = obs_cell_index(dated["lat"].to_numpy(), dated["lon"].to_numpy(),
+                                dated["channel"].to_numpy(), lats, lons)
+    rho_all, _ = temporal_terms(*structure, gather_all,
+                                np.abs(dated["age"] - dated["centre"]).to_numpy(), step_yr)
+    at_grid = dated.assign(cell=gather_all % n_cells, chan=gather_all // n_cells,
+                           rho=rho_all)
+    at_grid = at_grid.assign(ti=at_grid["age"].map(
+        {int(a): i for i, a in enumerate(ages)})).dropna(subset=["ti"])
+    at_grid["ti"] = at_grid["ti"].astype(int)
+    n_lon = len(lons)
+    at_site = lambda field: (lambda d: field[d["ti"].to_numpy(), d["chan"].to_numpy(),
+                                             d["cell"].to_numpy() // n_lon,
+                                             d["cell"].to_numpy() % n_lon])
+
+    print(f"  8.0 {cfg['n_ages']} ages, {cfg['n_prior_only_ages']} prior-only, "
+          f"{int(recon['n_obs'].sum())} rows; amplitudes {list(b_scales)}, quoted at c={b_ref:g}")
+    print(f"  8.0 sites per age median {int(np.median(recon['n_sites'][scored]))} "
+          f"(range {int(recon['n_sites'][scored].min())}-{int(recon['n_sites'].max())}); "
+          f"{len(onsets)} D-O onsets in range; network reaches {int(reached.sum())} of "
+          f"{n_cells} cells")
+    # Every published amplitude's distance from the simulation it was built on, which is the
+    # measure Section 8.1 quotes when it calls the product a derived analysis.
+    print("  8.0 corr(product, simulation state) over scored ages: "
+          + ", ".join(f"c={float(bb):g}: "
+                      f"{np.corrcoef(post[j][scored].ravel(), sim[scored].ravel())[0, 1]:.4f}"
+                      for j, bb in enumerate(b_scales)))
+
+    # --- Figure 8.1: one state of the product, with what it publishes beside it ------------
+    # A reader who never sees a field cannot judge the object. The window is the interstadial
+    # half of the strongest event, read as a mean over its 600 yr rather than at one 25-yr
+    # state, because Section 8.3 finds nothing is resolved below 250 yr.
+    events = [e for e in sorted(DO_ONSET_BP) if DO_ONSET_BP[e] in onsets]
+    if not events:
+        print("  8.1 skipped: no D-O onset falls inside this archive")
+        return
+    comp_p, comp_s = _do_composite(post[bi], ages, onsets), _do_composite(sim, ages, onsets)
+    net_p = np.array([[_area_mean(e[r], net_w) for r in range(len(VARS))] for e in comp_p])
+    net_s = np.array([[_area_mean(e[r], net_w) for r in range(len(VARS))] for e in comp_s])
+    lead = int(np.argmax(net_p[:, 0]))
+    onset = DO_ONSET_BP[events[lead]]
+    warm, _ = _event_halves(ages, onset)
+    state = post[bi][warm].mean(axis=0)
+    # The lower row is a property of the whole product rather than of this window, and it is
+    # read as a fraction of the archive's own per-cell spread rather than in degrees: the
+    # spread itself ranges over an order of magnitude across the grid, so degrees would put
+    # the whole map in the bottom fifth of a colour bar and say nothing about what was learnt.
+    kept = (np.sqrt(recon["post_var"].astype(np.float64)[bi][scored]).mean(axis=0)
+            / np.sqrt(recon["prior_var"].astype(np.float64)))
+    print(f"  8.1 GI-{events[lead]} onset {onset} yr BP; interstadial window "
+          f"{int(ages[warm].min())}-{int(ages[warm].max())} yr BP, {int(warm.sum())} states")
+
+    fig, axes = plt.subplots(2, 2, figsize=(REPORT_WIDTH, 3.55), constrained_layout=True,
+                             subplot_kw={"projection": PLATE})
+    # One scale across both channels here, unlike Figure 8.4: this panel pair is read for how
+    # much larger the winter field is than the summer one at the same moment.
+    lim = float(np.ceil(np.percentile(np.abs(state), 99.5)))
+    for r, channel in enumerate(VARS):
+        ax = axes[0, r]
+        mesh = draw_field(ax, lats, lons, state[r], vmin=-lim, vmax=lim, cmap="RdBu_r")
+        ax.scatter(sites["lon"], sites["lat"], s=1.0, c="k", linewidth=0, transform=PLATE,
+                   zorder=3)
+        map_axes(ax, ylabel=(r == 0))
+        ax.set_title(f"({'ab'[r]}) {channel.upper()} anomaly", fontsize=6.8)
+        print(f"  8.1 {channel} state {state[r].min():+.2f} to {state[r].max():+.2f} degC, "
+              f"scale +-{lim:g}, {100 * float((np.abs(state[r]) > lim).mean()):.1f}% clipped")
+    cb = fig.colorbar(mesh, ax=axes[0, :], shrink=0.86, pad=0.012, aspect=13, extend="both")
+    cb.set_label("anomaly (°C)", fontsize=6.5)
+    cb.ax.tick_params(labelsize=6, length=2)
+
+    for r, channel in enumerate(VARS):
+        ax = axes[1, r]
+        mesh = draw_field(ax, lats, lons, kept[r], vmin=0.0, vmax=2.0, cmap="PuOr_r")
+        ax.scatter(sites["lon"], sites["lat"], s=1.0, c="#1b7837", linewidth=0,
+                   transform=PLATE, zorder=3)
+        map_axes(ax, xlabel=True, ylabel=(r == 0))
+        ax.set_title(f"({'cd'[r]}) {channel.upper()} s.d. / archive s.d.", fontsize=6.8)
+    cb = fig.colorbar(mesh, ax=axes[1, :], shrink=0.86, pad=0.012, aspect=13, extend="max",
+                      ticks=[0.0, 0.5, 1.0, 1.5, 2.0])
+    cb.set_label("posterior / climatological spread", fontsize=6.5)
+    cb.ax.tick_params(labelsize=6, length=2)
+    # The stated spread on the seasonal contrast needs the posterior covariance between the
+    # channels, which the product stores and which no other figure reads.
+    pv = recon["post_var"].astype(np.float64)[bi][scored]
+    print(f"  8.1 contrast s.d. median {np.median(_contrast_sd(pv, recon['post_cross_var'][bi][scored])):.4f} "
+          f"degC against {np.median(np.sqrt(pv[:, 0] + pv[:, 1])):.4f} ignoring the "
+          f"cross-covariance; median posterior channel correlation "
+          f"{np.median(recon['post_cross_var'].astype(np.float64)[bi][scored] / np.sqrt(pv[:, 0] * pv[:, 1])):.4f}")
+    save(fig, "fig08_01_reconstruction_field")
+
+    # --- Figure 8.2: the reconstruction against the simulation, through time ----------------
+    # Two places, because a domain mean over a grid that is 94.5% unobserved and antiphased
+    # between the hemispheres hides most of what the product does; the archive's most active
+    # cell is where the D-O signal it was built to carry actually lives.
+    hot = np.unravel_index(int(np.argmax(cube[:, 0].std(axis=0))), (len(lats), len(lons)))
+    hot_lon = ((float(lons[hot[1]]) + 180.0) % 360.0) - 180.0
+    hot_has_site = bool(reached[hot])
+    places = ((f"{NET_LAT:g}°N–90°N", lambda f: _area_mean(f, net_w)),
+              (f"{float(lats[hot[0]]):.0f}°N {abs(hot_lon):.0f}°"
+               f"{'E' if hot_lon >= 0 else 'W'}"
+               f"{'' if hot_has_site else ', no site'}", lambda f: f[..., hot[0], hot[1]]))
+    smooth = lambda s: da.lowpass_time(np.asarray(s, float)[:, None], SMOOTH_YR, step_yr)[:, 0]
+    # A low-pass zero-pads, so its first and last window is pulled towards zero; those ages
+    # are dropped rather than drawn, as the timescale metrics of Chapter 7 drop them.
+    trim = da.timescale_trim(SMOOTH_YR, step_yr)
+    edge = np.ones(len(ages), dtype=bool)
+    if trim:
+        edge[:trim] = edge[-trim:] = False
+    shown = scored & edge
+    gap = np.where(shown, 1.0, np.nan)
+
+    fig, axes = plt.subplots(2, 2, figsize=(REPORT_WIDTH, 3.45), sharex=True,
+                             constrained_layout=True)
+    for r, channel in enumerate(VARS):
+        for c, (where, take) in enumerate(places):
+            ax = axes[r, c]
+            for o in onsets:
+                ax.axvspan((o - DO_POST_YR) / 1000, (o + DO_PRE_YR) / 1000,
+                           color="0.92", lw=0, zorder=0)
+            band = np.array([smooth(take(post[j, :, r])) for j in range(len(b_scales))])
+            sim_s, x = smooth(take(sim[:, r])), ages / 1000
+            ax.axhline(0.0, color="0.65", lw=0.5, zorder=1)
+            ax.fill_between(x, band.min(axis=0) * gap, band.max(axis=0) * gap, color=PRODUCT_C,
+                            alpha=0.22, lw=0, zorder=2)
+            ax.plot(x, take(post[bi, :, r]) * np.where(scored, 1.0, np.nan), color=PRODUCT_C,
+                    lw=0.3, alpha=0.45, zorder=3)
+            ax.plot(x, sim_s * np.where(edge, 1.0, np.nan), color=SIM_C, lw=1.0,
+                    ls=(0, (4, 2.5)), zorder=4, label="LOVECLIM")
+            ax.plot(x, band[bi] * gap, color=PRODUCT_C, lw=1.2, zorder=5,
+                    label=f"reconstruction ($c = {b_ref:g}$)")
+            ax.set_title(f"({'acbd'[2 * c + r]}) {channel.upper()}, {where}", fontsize=7.0)
+            if c == 0:
+                ax.set_ylabel(f"{channel.upper()} anomaly (°C)")
+            if r == len(VARS) - 1:
+                ax.set_xlabel("Age (ka BP)")
+            raw, ref = take(post[bi, :, r])[scored], take(sim[:, r])[scored]
+            # How much of the plotted spread the amplitude band accounts for, which is what
+            # the caption claims and Section 8.3 qualifies.
+            half = (band.max(axis=0) - band.min(axis=0))[shown] / 2.0
+            print(f"  8.2 {channel} {where:18s}: product s.d. {raw.std():.3f} degC, LOVECLIM "
+                  f"{ref.std():.3f}, r {np.corrcoef(raw, ref)[0, 1]:+.3f}; at {SMOOTH_YR:.0f} yr "
+                  f"product {band[bi][shown].std():.3f}, LOVECLIM {sim_s[shown].std():.3f}, "
+                  f"r {np.corrcoef(band[bi][shown], sim_s[shown])[0, 1]:+.3f}; band half-width "
+                  f"median {np.median(half):.3f} degC ({100 * np.median(half) / band[bi][shown].std():.0f}% "
+                  f"of the series s.d.), max {half.max():.3f}, extremes correlate "
+                  f"{np.corrcoef(band[0][shown], band[-1][shown])[0, 1]:.4f}")
+    axes[0, 0].legend(loc="upper left", frameon=False, handlelength=1.8, borderpad=0.1,
+                      labelspacing=0.2, fontsize=6.4)
+    # Older on the left, as Figure 3.2(b) draws the same axis.
+    axes[0, 0].set_xlim(ages.max() / 1000, ages.min() / 1000)
+    if prior_only.any():
+        for ax in axes.ravel():
+            ax.axvspan(ages[prior_only].min() / 1000, ages[prior_only].max() / 1000,
+                       color="C3", alpha=0.14, lw=0, zorder=0)
+        axes[0, 0].annotate(f"{int(prior_only.sum())} ages without pollen",
+                            xy=(ages[prior_only].max() / 1000, 0.97),
+                            xycoords=("data", "axes fraction"), textcoords="offset points",
+                            xytext=(-3, 0), fontsize=6.0, color="C3", ha="right", va="top")
+    save(fig, "fig08_02_reconstruction_series")
+
+    # --- Figure 8.3: why not just read the simulation ---------------------------------------
+    # The only measurement in the project that answers that question without using the pollen
+    # twice, its honest qualification, and what the improvement consists of where it survives.
+    method = ex.method_label(ex.ESTIMATOR_HGAOENKF_MT, ex.TEMPORAL_DEFLATE)
+    zw = _run(ex.ESTIMATOR_HGAOENKF_MT, paths.LANE_WITHHOLDING,
+              "withholding_random_predictions.npz")
+    truth = zw["actual"]
+    ident = _withheld_identity(inp, recon["safe_valid"])
+    aligned = (len(ident) == len(truth)
+               and np.allclose(ident["actual"].to_numpy(), truth)
+               and np.array_equal(ident["site"].to_numpy(), zw["site"])
+               and np.array_equal(ident["channel"].to_numpy(), zw["channel"]))
+    print(f"  8.3 withheld rows {len(truth)} from {len(np.unique(zw['site']))} sites; "
+          f"rebuilt identity aligned: {aligned}")
+    wb = list(zw["b_scales"])
+    wj = int(np.argmin(np.abs(np.asarray(wb) - b_ref)))
+    product = zw[f"climatological_pred_{method}"][wj]
+    lc = _loveclim_at_sites(inp, ident, structure) if aligned else None
+    # The bars carry only the two predictors the comparison turns on. The prior-free
+    # references and the unattenuated simulation are still scored, because the prose quotes
+    # them, but a five-bar chart buried the one contrast it exists to show.
+    for name, pred in (("the climatology", np.zeros_like(truth)),
+                       ("nearest", zw["naive_nearest"]), ("idw", zw["naive_idw"])):
+        print(f"  8.3 held-out CE {_ce_against_climatology(truth, pred):+.4f}  {name}")
+    if aligned:
+        for name, pred in (("LOVECLIM, at the analysis age", lc["raw"]),
+                           ("LOVECLIM, at the block centre", lc["at_centre"])):
+            print(f"  8.3 held-out CE {_ce_against_climatology(truth, pred):+.4f}  {name}")
+    entries = [("LOVECLIM", lc["deflated"], SIM_C)] if aligned else []
+    entries += [(f"the product, $c = {float(wb[wj]):g}$", product, PRODUCT_C)]
+    values = [_ce_against_climatology(truth, p) for _, p, _ in entries]
+    # What any predictor could reach: the withheld value is itself a measurement, and the
+    # observation model says how much of its variance is that measurement's own error.
+    noise = float((zw["sse"] + zw["rep_var"] + zw["resid_var"]).mean())
+    ceiling = 1.0 - noise / float((truth ** 2).mean())
+
+    fig, axes = plt.subplots(1, 2, figsize=(REPORT_WIDTH, 1.85), constrained_layout=True,
+                             gridspec_kw={"width_ratios": [1.0, 1.06]})
+    ypos = np.arange(len(entries), dtype=float)
+    axes[0].barh(ypos, values, height=0.34, color=[c for _, _, c in entries], zorder=3)
+    axes[0].set_yticks(ypos)
+    axes[0].set_yticklabels([n for n, _, _ in entries], fontsize=6.0)
+    axes[0].set_ylim(len(entries) - 0.5, -0.5)
+    axes[0].set_xlabel("coefficient of efficiency")
+    axes[0].set_xlim(min(-0.01, 1.15 * min(values)), 1.30 * max(values))
+    axes[0].axvline(0.0, color="0.45", lw=0.7, zorder=2)
+    axes[0].text(0.0, 1.03, "(a) predicting withheld pollen", transform=axes[0].transAxes,
+                 fontsize=7.0, fontweight="bold", va="bottom")
+    for name, value in zip([n for n, _, _ in entries], values):
+        print(f"  8.3 held-out CE {value:+.4f}  {name}")
+    print(f"  8.3 attainable CE {ceiling:.4f} (mean assumed noise variance {noise:.3f} of "
+          f"{float((truth ** 2).mean()):.3f} degC^2; sse {float(zw['sse'].mean()):.3f}, rep "
+          f"{float(zw['rep_var'].mean()):.3f}, temporal {float(zw['resid_var'].mean()):.3f})")
+
+    # Panel (b): the same difference under progressively stricter exclusions of withheld rows
+    # that sit close to an assimilated one. Folds are random over sites rather than
+    # geographic, so this is where the lane's residual dependence is measured rather than
+    # asserted.
+    if aligned:
+        cell_obs = ident["cell_observed"].to_numpy().astype(bool)
+        print(f"  8.3 withheld rows whose own cell also carried an assimilated observation: "
+              f"{int(cell_obs.sum())} of {len(cell_obs)} ({100 * cell_obs.mean():.1f}%), "
+              f"{len(np.unique(zw['site'][cell_obs]))} sites; median distance to the nearest "
+              f"assimilated site {np.nanmedian(zw['distance_km']):.0f} km")
+        # Drawn horizontally, like panel (a), so the category names read straight and the
+        # interval that matters is the one the eye already scans left to right.
+        ys, ds, los, his, labels = [], [], [], [], []
+        for label, kind in VOID_TESTS:
+            m = _withheld_mask(kind, zw["distance_km"], cell_obs)
+            if m.sum() < 50 or len(np.unique(zw["site"][m])) < 5:
+                continue
+            d, lo, hi = _site_bootstrap_dce(truth[m], product[m], lc["deflated"][m],
+                                            zw["site"][m])
+            ys.append(float(len(ys)))
+            ds.append(d); los.append(lo); his.append(hi); labels.append(label)
+            print(f"  8.3 {label:15s} rows {int(m.sum()):6d} sites "
+                  f"{len(np.unique(zw['site'][m])):3d} product "
+                  f"{_ce_against_climatology(truth[m], product[m]):+.4f} LOVECLIM "
+                  f"{_ce_against_climatology(truth[m], lc['deflated'][m]):+.4f} dCE {d:+.4f} "
+                  f"[{lo:+.4f}, {hi:+.4f}]")
+        ys = np.asarray(ys)
+        axes[1].axvline(0.0, color="0.45", lw=0.7, zorder=1)
+        axes[1].errorbar(ds, ys, xerr=[np.array(ds) - np.array(los),
+                                       np.array(his) - np.array(ds)],
+                         fmt="o", ms=3.2, lw=1.0, capsize=2.0, color=PRODUCT_C, zorder=3)
+        axes[1].set_yticks(ys)
+        axes[1].set_yticklabels(labels, fontsize=6.0)
+        axes[1].set_ylim(len(ys) - 0.5, -0.5)
+        axes[1].set_xlabel("$\\Delta$CE, product $-$ LOVECLIM")
+    else:
+        # The rebuilt row identity is what lets a second predictor be scored on these rows, so
+        # without it there is no comparison to draw. A reduced run lands here; an empty frame
+        # with default ticks would read as a failed plot rather than an absent one.
+        axes[1].set_axis_off()
+        axes[1].text(0.5, 0.5, "row identity could not be\nrebuilt for this run",
+                     transform=axes[1].transAxes, fontsize=6.2, color="0.45",
+                     ha="center", va="center")
+    axes[1].text(0.0, 1.03, "(b) how much is proximity?", transform=axes[1].transAxes,
+                 fontsize=7.0, fontweight="bold", va="bottom")
+
+    # The seasonal statistic itself is reported in the text and in the chain below rather
+    # than drawn: with the composite maps of Figure 8.4 beside it, a third panel of eight
+    # points earned less than the space it cost.
+    for tag, value in (("pollen", lambda d: (d["y"] - d["my"]).to_numpy()),
+                       ("LOVECLIM", at_site(sim)), ("reconstruction", at_site(post[bi]))):
+        m = np.nanmean(_site_composite(at_grid, onsets, value), axis=0)
+        print(f"  8.3 site composite, {tag:14s}: dMTCO {m[0]:+.4f} dMTWA {m[1]:+.4f} "
+              f"ratio {m[0] / m[1]:.4f}")
+    save(fig, "fig08_03_evidence")
+
+    # --- Figure 8.4: the D-O composite ------------------------------------------------------
+    mean_p, mean_s = comp_p.mean(axis=0), comp_s.mean(axis=0)
+
+    fig, maps = plt.subplots(2, 2, figsize=(REPORT_WIDTH, 3.55), constrained_layout=True,
+                             subplot_kw={"projection": PLATE})
+    # One scale per channel, not one for the figure: the MTCO composite reaches 16 degC and
+    # the MTWA one 5, so a shared scale would saturate the first and flatten the second. The
+    # limit is the wider of the two fields' 99.5th percentiles, which keeps the clipped
+    # fraction under half a per cent in every panel; taking the 99th instead saturated the
+    # whole Arctic of the simulation's MTWA, where a solid block reads as uniform warming
+    # rather than as off-scale.
+    for r, channel in enumerate(VARS):
+        lim = float(np.ceil(max(np.percentile(np.abs(mean_p[r]), 99.5),
+                                np.percentile(np.abs(mean_s[r]), 99.5))))
+        for c, (field, label) in enumerate(((mean_p[r], "reconstruction"),
+                                            (mean_s[r], "LOVECLIM"))):
+            ax = maps[r, c]
+            mesh = draw_field(ax, lats, lons, field, vmin=-lim, vmax=lim, cmap="RdBu_r")
+            if c == 0:
+                ax.scatter(sites["lon"], sites["lat"], s=1.1, c="k", linewidth=0,
+                           transform=PLATE, zorder=3)
+            map_axes(ax, xlabel=(r == len(VARS) - 1), ylabel=(c == 0))
+            ax.set_title(f"({'abcd'[2 * r + c]}) {channel.upper()} {label}", fontsize=6.8)
+        cb = fig.colorbar(mesh, ax=maps[r, :], shrink=0.88, pad=0.015, aspect=14,
+                          extend="both")
+        cb.set_label("interstadial − stadial (°C)", fontsize=6.5)
+        cb.ax.tick_params(labelsize=6, length=2)
+        slope, icpt = np.polyfit(mean_s[r].ravel(), mean_p[r].ravel(), 1)
+        resid = mean_p[r] - (slope * mean_s[r] + icpt)
+        print(f"  8.4 {channel} map scale ±{lim:g} degC; product range "
+              f"{mean_p[r].min():+.2f} to {mean_p[r].max():+.2f}, LOVECLIM "
+              f"{mean_s[r].min():+.2f} to {mean_s[r].max():+.2f}; clipped "
+              f"{100 * float((np.abs(mean_p[r]) > lim).mean()):.2f}% of the product, "
+              f"{100 * float((np.abs(mean_s[r]) > lim).mean()):.2f}% of LOVECLIM")
+        print(f"  8.4 {channel}: corr(product, LOVECLIM) "
+              f"{np.corrcoef(mean_p[r].ravel(), mean_s[r].ravel())[0, 1]:.3f}, slope {slope:.2f}, "
+              f"intercept {icpt:+.3f}, residual rms {resid.std():.3f} degC "
+              f"({100 * resid.std() / mean_p[r].std():.0f}% of the product's own composite "
+              f"s.d. {mean_p[r].std():.3f})")
+    save(fig, "fig08_04_do_composite")
+
+    # --- The chain from the background the analysis starts at to the observations it fits ---
+    # Five sources, one estimator, the same sites and windows. The deflated row is what the
+    # analysis is actually fitting: Section 5.3 divides each observation by its own lag
+    # correlation before assimilating it, and that correction is larger in winter.
+    chain = (("the analog background", at_site(back)),
+             ("LOVECLIM", at_site(sim)),
+             ("the pollen", lambda d: (d["y"] - d["my"]).to_numpy()),
+             ("the pollen / rho", lambda d: ((d["y"] - d["my"]) / d["rho"]).to_numpy()),
+             (f"the product, c={b_ref:g}", at_site(post[bi])))
+    for tag, value in chain:
+        m = np.nanmean(_site_composite(at_grid, onsets, value), axis=0)
+        print(f"  T8.3 {tag:24s} dMTCO {m[0]:+.4f} dMTWA {m[1]:+.4f} ratio {m[0] / m[1]:.4f}")
+    for channel in VARS:
+        print(f"  T8.3 median rho, {channel}: "
+              f"{float(np.median(at_grid.loc[at_grid['channel'] == channel, 'rho'])):.4f}")
+    for j, bb in enumerate(b_scales):
+        s = np.nanmean(_site_composite(at_grid, onsets, at_site(post[j])), axis=0)
+        print(f"  8.3 c={float(bb):<5g} site ratio {s[0] / s[1]:.4f}")
+
+    # Two regions the prose names: the one Liu et al. report as a model-data disagreement,
+    # and the one where the network reports a signal the reconstruction does not carry. Read
+    # through the site estimator of Figure 8.3(c), restricted to the sites inside each box.
+    lon180 = ((at_grid["lon"] + 180.0) % 360.0) - 180.0
+    boxes = (("western North America", (at_grid["lat"] > 30) & (at_grid["lat"] < 62)
+              & (lon180 > -170) & (lon180 < -100)),
+             ("the tropics", at_grid["lat"].abs() < NET_LAT))
+    for name, inside in boxes:
+        sub = at_grid[inside]
+        if not len(sub):
+            continue
+        # The site estimator keeps the northern extratropics; inside a box the latitude cut
+        # would empty it, so the box itself is the selection.
+        region = sub.assign(lat=NET_LAT + 1.0)
+        for tag, value in (("pollen", lambda d: (d["y"] - d["my"]).to_numpy()),
+                           ("LOVECLIM", at_site(sim)),
+                           ("product", at_site(post[bi]))):
+            m = np.nanmean(_site_composite(region, onsets, value), axis=0)
+            print(f"  8.3 {name:22s} {sub['site'].nunique():3d} sites, {tag:9s} "
+                  f"dMTCO {m[0]:+.4f} dMTWA {m[1]:+.4f}")
+
+    # Where the composite is consistent across events, and where it reaches without data.
+    for r, channel in enumerate(VARS):
+        t = comp_p[:, r].mean(0) / (comp_p[:, r].std(0, ddof=1) / np.sqrt(len(comp_p)))
+        print(f"  8.4 {channel} across-event |t|: median {np.median(np.abs(t)):.3f}")
+    for i, e in enumerate(events):
+        print(f"  T8.x GI-{e:<3d} {DO_ONSET_BP[e]:6d} | product {net_p[i, 0]:+6.2f} "
+              f"{net_p[i, 1]:+6.2f} | LOVECLIM {net_s[i, 0]:+6.2f} {net_s[i, 1]:+6.2f}")
+    for tag, pts in (("product", net_p), ("LOVECLIM", net_s)):
+        m, d_ = pts.mean(axis=0), pts[:, 0] - pts[:, 1]
+        se = d_.std(ddof=1) / np.sqrt(len(d_)) if len(d_) > 1 else np.nan
+        print(f"  8.3 NET {tag:9s} mean {m[0]:+.3f}/{m[1]:+.3f}, contrast {d_.mean():+.3f} "
+              f"+-{se:.3f} (s.e. over {len(d_)} events), ratio of means {m[0] / m[1]:.4f}")
+    for tag, mask in (("observed", net & reached), ("unobserved", net & ~reached)):
+        if not mask.any():
+            continue
+        mw = np.where(mask, w, 0.0)
+        ratio = lambda f: _area_mean(f[0], mw) / _area_mean(f[1], mw)
+        print(f"  8.3 NET {tag:11s} ({int(mask.sum()):4d} cells): dMTCO "
+              f"{_area_mean(mean_p[0], mw):+.3f} vs LOVECLIM {_area_mean(mean_s[0], mw):+.3f}; "
+              f"ratio {ratio(mean_p):.4f} vs {ratio(mean_s):.4f}")
+
+    # --- What the product claims to know, and where it should not be believed ---------------
+    post_sd = np.sqrt(recon["post_var"].astype(np.float64))
+    arch_sd = np.sqrt(recon["prior_var"].astype(np.float64))
+    kept = post_sd[bi][scored].mean(axis=0) / arch_sd
+    for r, channel in enumerate(VARS):
+        print(f"  8.5 {channel}: posterior s.d. median "
+              f"{np.median(post_sd[bi][scored][:, r]):.4f} degC; archive rms "
+              f"{_spread(arch_sd[r]):.4f}; keeps {np.median(kept[r]):.4f} of the "
+              f"climatological spread, {np.median(kept[r][reached]):.4f} where the network "
+              f"reaches and {np.median(kept[r][~reached]):.4f} elsewhere; wider than the "
+              f"archive at {100 * float((post_sd[bi][scored][:, r] > arch_sd[r]).mean()):.1f}% "
+              f"of cells")
+    for j, bb in enumerate(b_scales):
+        print(f"  T8.2 c={float(bb):<5g} median posterior s.d. over both channels "
+              f"{np.median(post_sd[j][scored]):.4f} degC")
+    if prior_only.any():
+        print(f"  8.5 pollen-free ages: MTCO posterior rms s.d. "
+              f"{_spread(post_sd[bi][prior_only][:, 0]).mean():.4f} degC against the "
+              f"archive's {_spread(arch_sd[0]):.4f}; anomaly max "
+              f"{np.abs(post[bi][prior_only]).max():.3g}")
+    spread_rms = np.sqrt((((post[:, scored].max(axis=0)
+                            - post[:, scored].min(axis=0)) / 2) ** 2).mean())
+    print(f"  8.5 across the band: rms half-range {spread_rms:.4f} degC, rms(c_min - c_max) "
+          f"{np.sqrt(((post[0, scored] - post[-1, scored]) ** 2).mean()):.4f}, extremes "
+          f"correlate {np.corrcoef(post[0, scored].ravel(), post[-1, scored].ravel())[0, 1]:.4f}; "
+          f"stated posterior rms s.d. at c={b_ref:g} "
+          f"{np.sqrt((post_sd[bi][scored] ** 2).mean()):.4f} degC; field s.d. "
+          f"{post[bi][scored].std():.4f}")
+    dist = np.abs(ages[recon["analog_index"][scored]] - ages[scored][:, None])
+    print(f"  8.5 analogs: median distance {np.median(dist):.0f} yr, closest {dist.min():.0f}, "
+          f"median within-analysis spread {np.median(ages[recon['analog_index'][scored]].std(axis=1)):.0f} yr, "
+          f"{len(np.unique(recon['analog_index'][scored]))} of {len(ages)} states drawn")
+    south = np.broadcast_to(np.asarray(lats, float)[:, None] < sites["lat"].min(),
+                            (len(lats), len(lons)))
+    if south.any():
+        sw = np.where(south, w, 0.0)
+        print(f"  8.5 south of {sites['lat'].min():.1f}N ({int(south.sum())} cells): product "
+              f"dMTCO {_area_mean(mean_p[0], sw):+.3f} vs LOVECLIM "
+              f"{_area_mean(mean_s[0], sw):+.3f}")
+    hottest = np.unravel_index(int(np.argmax(mean_p[0])), mean_p[0].shape)
+    over = mean_p[0] > 12.0
+    if over.any():
+        la = np.broadcast_to(np.asarray(lats, float)[:, None], mean_p[0].shape)[over]
+        print(f"  8.5 {int(over.sum())} cells above +12 degC dMTCO, latitudes {la.min():.1f} "
+              f"to {la.max():.1f} N, any with a site: {bool((reached & over).any())}")
+    print(f"  8.5 peak product dMTCO {mean_p[0][hottest]:+.3f} at "
+          f"{lats[hottest[0]]:.1f}N {lons[hottest[1]]:.1f}E; LOVECLIM there "
+          f"{mean_s[0][hottest]:+.3f}")
+
+    # --- Appendix table: how far the field moves when a design choice is reversed ------------
+    for name, z in _product_variants().items():
+        if name == "main":
+            continue
+        k = int(np.argmin(np.abs(z["b_scales"] - b_ref)))
+        other = z["mean_anom"].astype(np.float64)[k]
+        d = (post[bi] - other)[scored]
+        rms = float(np.sqrt((d ** 2).mean()))
+        cv = _do_composite(other, ages, onsets).mean(axis=0)
+        site = np.nanmean(_site_composite(at_grid, onsets, at_site(other)), axis=0)
+        print(f"  T8.4 {name:18s} (c={float(z['b_scales'][k]):g}) rms diff {rms:.4f} degC "
+              f"({100 * rms / post[bi][scored].std():.0f}% of field s.d.), field s.d. "
+              f"{other[scored].std():.4f}, NET ratio "
+              f"{_area_mean(cv[0], net_w) / _area_mean(cv[1], net_w):.4f}, site ratio "
+              f"{site[0] / site[1]:.4f}")
+
+
 def main() -> None:
     smoke = C.smoke()
-    stages = C.Stages("07_figures", [f"chapter {n}" for n in (1, 2, 3, 4, 5, 6, 7)])
+    stages = C.Stages("07_figures", [f"chapter {n}" for n in (1, 2, 3, 4, 5, 6, 7, 8)])
     inp = load_inputs(C.SMOKE_AGES if smoke else None)
-    for n, fn in ((1, chapter1), (2, chapter2), (3, chapter3),
-                  (4, chapter4), (5, chapter5), (6, chapter6), (7, chapter7)):
+    for n, fn in ((1, chapter1), (2, chapter2), (3, chapter3), (4, chapter4),
+                  (5, chapter5), (6, chapter6), (7, chapter7), (8, chapter8)):
         if stages.run(f"chapter {n}"):
             fn() if fn in (chapter2, chapter4, chapter7) else fn(inp)
     stages.done()

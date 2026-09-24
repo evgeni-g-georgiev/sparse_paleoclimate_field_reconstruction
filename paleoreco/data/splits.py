@@ -43,6 +43,10 @@ DO_EVENT_WINDOWS: dict[int, tuple[int, int]] = {
     for event, b2k in _GI_ONSET_B2K.items()
 }
 
+# The onsets themselves in yr BP, which is what a composite aligned on the
+# transition needs, as opposed to the padded analysis window around it.
+DO_ONSET_BP: dict[int, int] = {event: b2k - 50 for event, b2k in _GI_ONSET_B2K.items()}
+
 # Recognised D-O event indices, ascending. Order is load-bearing:
 # overlapping windows in assign_event_label are resolved in this order.
 DO_EVENT_NUMBERS: tuple[int, ...] = tuple(sorted(DO_EVENT_WINDOWS))
