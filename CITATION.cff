@@ -7,6 +7,7 @@ authors:
     given-names: Evgeni Galinov
 repository-code: "https://github.com/evgeni-g-georgiev/sparse_paleoclimate_field_reconstruction"
 version: 1.0.0
+date-released: "2026-09-28"
 preferred-citation:
   type: thesis
   thesis-type: "MSc thesis"
