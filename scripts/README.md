@@ -4,15 +4,19 @@ Sparse paleoclimate field reconstruction by data assimilation: three evaluation 
 over four estimators, the reconstruction they select, and the report figures.
 
 ```
-make test     # unit and integration suite, ~30 s
-make smoke    # every stage at reduced size into outputs/_smoke, a few minutes
-make all      # the full pipeline, ~15-16 h
+make test     # unit and integration suite
+make smoke    # every stage at reduced size into outputs/_smoke
+make all      # the full pipeline
 ```
+
+Runtimes below are for the machine the thesis ran on, a 2020 MacBook Air (M1), where
+`make test` takes about 30 s, `make smoke` a few minutes and `make all` about 16 h. The work
+runs on one core per stage, so expect times to scale with single-core speed.
 
 ## Inputs
 
-Neither raw file can be fetched automatically; `00_check_data.py` reports what is
-missing and where it goes.
+Both files come from one Zenodo record; the top-level README gives the download commands.
+`00_check_data.py` reports what is missing and where it goes.
 
 | file | what it is |
 |---|---|
@@ -27,7 +31,7 @@ The order is forced by what each stage inherits. `01` selects the regularizer th
 analog estimator holds fixed, so it runs first; `06` needs `04`'s operating point; the
 results notebook reads all of them.
 
-| # | stage | ~runtime | inherits from |
+| # | stage | ~runtime (M1) | inherits from |
 |---|---|---|---|
 | 00 | `00_check_data.py` | seconds | |
 | 01 | `01_3dvar.py` | **~3.8 h** | |
@@ -35,11 +39,12 @@ results notebook reads all of them.
 | 03 | `03_hgaoenkf_evidence.py` | ~2.0 h | 01 |
 | 04 | `04_hgaoenkf_mt.py` | **~6.5 h** | 01 |
 | 05 | `05_ablations.py` | ~10 min | 01 |
-| 06 | `06_product.py` | ~15 min | 04 |
+| 06 | `06_product.py` | ~25 min | 04 |
 | | `notebooks/final_results.ipynb` (`make figures`) | ~1 min | 01-06 |
 
 Stages 02, 03, 04 and 05 depend only on 01, so they can run concurrently given the cores.
-Runtimes are extrapolated from measured per-call costs and are worth about +-30%.
+Runtimes are extrapolated from measured per-call costs and are good to about +-30% on that
+machine.
 
 Every stage prints a linear-rate ETA inside its loops, and a `[3/5]` banner between them.
 
@@ -50,7 +55,7 @@ operating points already stored. The stage names are the ones each script lists 
 starts; an unrecognised name is refused rather than silently running nothing.
 
 `make trajectories` is the common case: it re-runs the trajectory lane for all four
-estimators and then the figures, about an hour, leaving every grid untouched.
+estimators and then the figures, about an hour on the M1, leaving every grid untouched.
 
 ## Threading
 

@@ -1,8 +1,7 @@
 """Check the raw inputs are present and shaped as the pipeline expects.
 
-Neither file can be fetched automatically: the proxy reconstructions are Liu et al.
-(2026) supplementary data and the prior is a LOVECLIM transient run supplied by the
-project. This reports what is missing and where it goes.
+Both files come from the Liu (2026) Zenodo record; the top-level README gives the
+download commands. This reports what is missing and where it goes.
 """
 
 from __future__ import annotations
