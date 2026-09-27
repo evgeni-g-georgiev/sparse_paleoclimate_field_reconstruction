@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you refer to this work, please cite it as below."
+type: software
+title: "Sparse paleoclimate field reconstruction"
+authors:
+  - family-names: Georgiev
+    given-names: Evgeni Galinov
+repository-code: "https://github.com/evgeni-g-georgiev/sparse_paleoclimate_field_reconstruction"
+version: 1.0.0
+preferred-citation:
+  type: thesis
+  thesis-type: "MSc thesis"
+  title: "Multiscale Tendency Augmentation for a Hybrid Gain Analog Offline EnKF in Paleoclimate Data Assimilation: Spatially Complete Reconstruction of Dansgaard-Oeschger Temperature Fields across Marine Isotope Stage 3"
+  authors:
+    - family-names: Georgiev
+      given-names: Evgeni Galinov
+  institution:
+    name: "Imperial College London"
+  department: "Department of Computing"
+  year: 2026
+  url: "https://github.com/evgeni-g-georgiev/sparse_paleoclimate_field_reconstruction"
