@@ -24,8 +24,8 @@ The cube is parsed once and cached under `data/cache/`, so only the first run pa
 ## Order and cost
 
 The order is forced by what each stage inherits. `01` selects the regularizer that every
-analog estimator holds fixed, so it runs first; `06` needs `04`'s operating point; `07`
-reads all of them.
+analog estimator holds fixed, so it runs first; `06` needs `04`'s operating point; the
+results notebook reads all of them.
 
 | # | stage | ~runtime | inherits from |
 |---|---|---|---|
@@ -36,7 +36,7 @@ reads all of them.
 | 04 | `04_hgaoenkf_mt.py` | **~6.5 h** | 01 |
 | 05 | `05_ablations.py` | ~10 min | 01 |
 | 06 | `06_product.py` | ~15 min | 04 |
-| 07 | `07_figures.py` | ~10 min | 01, 02, 04, 06 |
+| | `notebooks/final_results.ipynb` (`make figures`) | ~1 min | 01-06 |
 
 Stages 02, 03, 04 and 05 depend only on 01, so they can run concurrently given the cores.
 Runtimes are extrapolated from measured per-call costs and are worth about +-30%.
@@ -74,5 +74,6 @@ outputs/
 
 ## Reading the results
 
-`notebooks/results_summary.ipynb` reads these directories and nothing else. It writes
-nothing that ships: anything the report prints is produced by `07_figures.py`.
+`notebooks/final_results.ipynb` holds every figure, table and number the report prints, in
+report order. It reads these directories and the raw inputs, runs no estimator, and writes the
+report figures to `outputs/figures/report/`. `make figures` executes it in place.

@@ -15,4 +15,5 @@ scikit-image          # SSIM for field reconstructions (paleoreco.eval.da)
 
 # ---- Notebook + dev experience ---------------------------------------------
 ipykernel
+nbconvert             # executes notebooks/final_results.ipynb for `make figures`
 pytest                # unit + integration test suite (tests/)
