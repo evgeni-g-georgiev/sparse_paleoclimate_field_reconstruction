@@ -23,7 +23,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from cartopy.mpl.ticker import LatitudeFormatter, LongitudeFormatter
-from matplotlib.patches import FancyBboxPatch
+from matplotlib.lines import Line2D
+from matplotlib.patches import Circle, Ellipse, FancyBboxPatch
 from scipy import stats
 
 from paleoreco import paths
@@ -125,8 +126,8 @@ def map_axes(ax, *, xlabel=False, ylabel=True, coastlines=True):
 # A drawing, not an experiment. The four roles below are the visual language Chapter 6's
 # panel (c) has to be drawn in, so they are named here rather than inlined: blue is the
 # static archive-wide path, green the data-selected flow-dependent one, grey the observations
-# and whatever consumes them directly, white the analysis. Orange is Figure 2.1's "this work"
-# colour and is deliberately absent, because nothing in this chapter is ours.
+# and whatever consumes them directly, white the analysis. Orange marks this project's own
+# method, as in Figure 2.1, and is deliberately absent, because nothing in this chapter is ours.
 
 STATIC = ("#dce6f2", "#3c5f8f")
 FLOW = ("#d9e8d3", "#4a7a3f")
@@ -212,22 +213,19 @@ def load_inputs(n_ages: int | None = None) -> Inputs:
     return inp
 
 def chapter1(inp: Inputs) -> None:
-    """Figure 1.1: the reconstruction problem, and what this produces."""
+    """Figure 1.1: the reconstruction problem."""
     cube, ages, lats, lons = inp.cube, inp.ages, inp.lats, inp.lons
     long, recon = inp.long, inp.recon
 
     AGE_FIG11 = 38175          # onset of D-O event 8, on the archive's own age axis
     CHAN_FIG11 = 0             # MTCO
-    B_FIG11 = 5.0              # the product's operating point
 
     ti = int(np.argmin(np.abs(recon["ages"] - AGE_FIG11)))
-    bi = int(np.argmin(np.abs(recon["b_scales"] - B_FIG11)))
     age = int(recon["ages"][ti])
     safe_valid, clim = recon["safe_valid"], recon["clim_mean"]
 
-    # The simulation's own state at this age, in the same anomaly frame as the posterior.
+    # The simulation's own state at this age, in the product's anomaly frame.
     sim_anom = cube[np.searchsorted(ages, age)].astype(np.float64) - clim
-    post_anom = recon["mean_anom"][bi, ti]
 
     # The proxies at this age, in each site's own anomaly frame.
     o = observations_at_age(long, age)
@@ -247,7 +245,7 @@ def chapter1(inp: Inputs) -> None:
 
     # Panel titles carry identity only; what each panel means belongs in the LaTeX caption,
     # where it can be read at full size rather than squeezed into a 2-inch column.
-    fig, axes = plt.subplots(1, 3, figsize=(REPORT_WIDTH, 1.45), subplot_kw={"projection": PLATE},
+    fig, axes = plt.subplots(1, 2, figsize=(REPORT_WIDTH, 1.95), subplot_kw={"projection": PLATE},
                              constrained_layout=True)
 
     mesh = draw_field(axes[0], lats, lons, masked(sim_anom[CHAN_FIG11]), vmin=-V, vmax=V)
@@ -257,10 +255,6 @@ def chapter1(inp: Inputs) -> None:
     axes[1].scatter(obs_lon, obs_lat, c=obs_anom, s=7, cmap="RdBu_r", vmin=-V, vmax=V,
                     edgecolor="k", linewidth=0.2, transform=PLATE, zorder=3)
     axes[1].set_title("(b) pollen reconstructions")
-
-    draw_field(axes[2], lats, lons, masked(post_anom[CHAN_FIG11]), vmin=-V, vmax=V)
-    axes[2].scatter(obs_lon, obs_lat, s=0.8, c="k", linewidth=0, transform=PLATE, zorder=3)
-    axes[2].set_title("(c) MTA-HGAOEnKF posterior")
 
     for i, ax in enumerate(axes):
         map_axes(ax, ylabel=(i == 0))
@@ -301,7 +295,7 @@ def chapter2() -> None:
         (1.00, 0, "AOEnKF-B", "published"),
         (1.00, 2, "Analog offline EnKF", "published"),
         (0.55, 3, "HGAOEnKF", "published"),
-        (1.30, 3, "MTA-HGAOEnKF\n(this work)", "ours"),
+        (1.30, 3, "MTA-HGAOEnKF", "ours"),
         (2.05, 3, "Online paleoDA", "published"),
         (3.00, 4, "Generative DA", "published"),
     ]
@@ -588,6 +582,166 @@ def chapter3(inp: Inputs) -> None:
     _zero = int(np.argmax(svc <= 0)) * 25
     print(f"state-vector correlation falls below 1/e at {_efold} yr and reaches zero at {_zero} yr")
 
+    # ------------------------------------------------------------------------------
+    # Figure 3.4: the four leading principal components of the archive, one univariate
+    # distribution each, against the Gaussian that carries the same mean and variance.
+    #
+    # A Gaussian prior asserts that every one-dimensional projection of the state is
+    # Gaussian, and by Cramer-Wold the converse holds too, so a single non-Gaussian
+    # projection is enough to place the joint distribution outside the family. These
+    # four hold 92.5% of the archive's variance between them, which is where whatever
+    # structure a background covariance can express actually lives.
+    #
+    # Cells are area-weighted by sqrt(cos(lat)) before the decomposition, so a 5.625 deg
+    # cell beside the pole does not count as heavily as one at the equator. The cosine is
+    # clipped at zero first: the grid's last row sits at exactly +90 deg, where cos
+    # returns a small negative number in floating point and its square root is NaN.
+    # Dropping the weighting raises PC1's share to 60.5% and moves its excess kurtosis
+    # from -0.98 to -1.01, so the weighting sets the axis numbers and carries none of
+    # the argument.
+    # ------------------------------------------------------------------------------
+    N_PC = 4
+    anom = (cube - cube.mean(axis=0, keepdims=True)).reshape(len(ages), -1).astype(np.float64)
+    lat_w = np.sqrt(np.clip(np.cos(np.radians(lats.astype(np.float64))), 0.0, None))
+    cell_w = np.broadcast_to(lat_w[None, :, None], (len(VARS), len(lats), len(lons))).ravel()
+    U_pc, S_pc, Vt_pc = np.linalg.svd(anom * cell_w, full_matrices=False)
+    pc_share = S_pc ** 2 / (S_pc ** 2).sum()
+
+    # A principal component's sign is arbitrary. Orienting each so that its
+    # largest-magnitude loading is positive is deterministic and stays well defined for
+    # PC3 and PC4, which barely correlate with the domain-mean anomaly (+0.24, -0.13)
+    # and would flip unpredictably under the more readable "positive is warmer" rule.
+    # Of the statistics reported below, only the skewness changes sign with this choice.
+    lead = Vt_pc[:N_PC]
+    orient = np.sign(lead[np.arange(N_PC), np.abs(lead).argmax(axis=1)])
+    pc_scores = (U_pc[:, :N_PC] * S_pc[:N_PC]) * orient
+
+    fig, axes = plt.subplots(2, 2, figsize=(REPORT_WIDTH, 3.70), constrained_layout=True)
+    for i, ax in enumerate(axes.ravel()):
+        z = pc_scores[:, i]
+        lim = float(np.abs(z).max()) * 1.06
+        # 32 bins puts about 25 of the 804 states in each, which resolves the flat top and
+        # the gap between the lumps without turning either into bin noise.
+        ax.hist(z, bins=np.linspace(-lim, lim, 33), density=True, color="#4a7fb5",
+                label=f"{len(ages)} LOVECLIM states" if i == 0 else None)
+        grid = np.linspace(-lim, lim, 512)
+        ax.plot(grid, stats.norm.pdf(grid, z.mean(), z.std()), lw=1.1, ls="--",
+                color="#c4692a", label="Gaussian, same mean and variance" if i == 0 else None)
+        ax.axvline(z.mean(), color="k", lw=0.7)
+        ax.set_xlim(-lim, lim)
+        ax.set_title(f"({'abcd'[i]}) PC{i + 1}")
+        if i >= 2:
+            ax.set_xlabel("Projection onto the component (°C)")
+        if i % 2 == 0:
+            ax.set_ylabel("Density")
+        ax.text(0.03, 0.96,
+                f"skew {stats.skew(z):+.2f}\nexcess kurtosis {stats.kurtosis(z):+.2f}",
+                transform=ax.transAxes, va="top", ha="left", fontsize=6.3,
+                bbox=dict(boxstyle="round,pad=0.30", facecolor="white", edgecolor="0.8",
+                          linewidth=0.6))
+    # One legend for the whole figure: the two series are the same in every panel, and an
+    # in-panel legend collides with the statistics box wherever it is put.
+    fig.legend(*axes[0, 0].get_legend_handles_labels(), loc="outside lower center", ncols=2,
+               frameon=False)
+    save(fig, "fig03_04_prior_principal_components")
+
+    print("--- Figure 3.4: leading principal components of the archive ---")
+    for i in range(N_PC):
+        z = pc_scores[:, i]
+        print(f"PC{i + 1}: {pc_share[i]:.1%} of variance, s.d. {z.std():.2f}, "
+              f"skew {stats.skew(z):+.3f}, excess kurtosis {stats.kurtosis(z):+.3f}, "
+              f"correlation with age {np.corrcoef(z, ages.astype(np.float64))[0, 1]:+.3f}")
+    print(f"PC1-{N_PC} together hold {pc_share[:N_PC].sum():.1%} of the archive's variance")
+
+    # ------------------------------------------------------------------------------
+    # Figure 3.5: the simulation as a time series, which is what licenses treating any
+    # archive state as a candidate for any age.
+    #
+    # The pooled archive is only a sensible prior for a single age if the record is
+    # cyclical rather than segregated: were it cold throughout one half and warm
+    # throughout the other, the pooled spread would be the wrong belief at every age in
+    # it. The two panels separate the two things the simulation does at once. The North
+    # Atlantic winter index alternates between two levels the whole way through and a
+    # linear trend in age explains only 3% of its variance; the global mean does little
+    # but drift, the trend taking 39% of MTCO's variance and 85% of MTWA's. The
+    # recurrence Section 3.5 appeals to is in the first panel, and the orbital and
+    # ice-sheet forcing that costs the archive its stationarity is in the second.
+    #
+    # The shaded intervals are where the 400 yr running mean of the winter index sits
+    # above its own median, so a warm fraction of 0.50 over the whole record is true by
+    # construction and says nothing. What does say something is the split between the
+    # halves, 0.59 and 0.41: neither half is regime-pure, which is the claim the
+    # exchangeability argument actually needs.
+    # ------------------------------------------------------------------------------
+    cyc_lat, cyc_lon = np.meshgrid(lats, lons, indexing="ij")
+    natl_box = ((cyc_lat >= 55) & (cyc_lat <= 80)
+                & (np.abs(((cyc_lon + 180) % 360) - 180) <= 40))
+    area_w = _area_weights(lats, lons)
+
+    def _anom_index(channel, weights):
+        """Area-weighted mean of one channel over the weighted cells, as an anomaly."""
+        v = _area_mean(cube[:, channel].astype(np.float64), weights)
+        return v - v.mean()
+
+    natl_idx = [_anom_index(c, area_w * natl_box) for c in range(len(VARS))]
+    glob_idx = [_anom_index(c, area_w) for c in range(len(VARS))]
+
+    step_yr = float(np.diff(ages)[0])
+    k_smooth = int(400.0 / step_yr) | 1
+    smoothed = np.convolve(np.pad(natl_idx[0], (k_smooth // 2, k_smooth // 2), mode="edge"),
+                           np.ones(k_smooth) / k_smooth, "valid")[:len(ages)]
+    warm = smoothed > np.median(smoothed)
+    breaks = np.flatnonzero(np.diff(warm.astype(int)) != 0) + 1
+
+    ka = ages / 1000.0
+    fig, (axa, axb) = plt.subplots(2, 1, figsize=(REPORT_WIDTH, 3.25), sharex=True,
+                                   gridspec_kw={"height_ratios": [1.5, 1.0]},
+                                   constrained_layout=True)
+    for i0, i1 in zip(np.r_[0, breaks], np.r_[breaks, len(ages)]):
+        if warm[i0]:
+            axa.axvspan(ka[i0], ka[i1 - 1], color="0.87", lw=0, zorder=0)
+    for c, col in zip(range(len(VARS)), ("#2b6cb0", "#c4692a")):
+        axa.plot(ka, natl_idx[c], lw=0.7, color=col, label=VARS[c].upper())
+    axa.axhline(0.0, color="k", lw=0.6)
+    axa.set_ylabel("Anomaly (°C)")
+    axa.legend(loc="upper right", ncols=2)
+    axa.set_title("(a) the North Atlantic, 55–80°N and 40°W–40°E, where the D–O signal is "
+                  "largest; interstadials shaded")
+
+    trend_basis = np.vander((ages - ages.mean()) / ages.std(), 2)
+    for c, col in zip(range(len(VARS)), ("#2b6cb0", "#c4692a")):
+        v = glob_idx[c]
+        fit = trend_basis @ np.linalg.lstsq(trend_basis, v, rcond=None)[0]
+        axb.plot(ka, v, lw=0.6, color=col, alpha=0.8)
+        axb.plot(ka, fit, lw=1.1, ls="--", color=col, label=f"{VARS[c].upper()} trend")
+    axb.axhline(0.0, color="k", lw=0.6)
+    axb.set_xlim(ka.max(), ka.min())
+    axb.set_xlabel("Age (ka BP)")
+    axb.set_ylabel("Anomaly (°C)")
+    # Lower left: the global series runs from warm at the old end to cold at the young one,
+    # so that corner is the only one both curves stay clear of.
+    axb.legend(loc="lower left", ncols=1, framealpha=0.92)
+    axb.set_title("(b) the global mean, where the orbital and ice-sheet drift sits")
+    save(fig, "fig03_05_simulation_timeseries")
+
+    older = ages >= ages[len(ages) // 2]
+    onsets_i = breaks[warm[breaks]]
+    print("--- Figure 3.5: the simulation as a time series ---")
+    print(f"North Atlantic box: {int(natl_box.sum())} cells; MTCO s.d. "
+          f"{natl_idx[0].std():.2f} degC, range [{natl_idx[0].min():+.2f}, {natl_idx[0].max():+.2f}]")
+    for name, series in (("North Atlantic", natl_idx), ("global mean", glob_idx)):
+        for c in range(len(VARS)):
+            v = series[c]
+            fit = trend_basis @ np.linalg.lstsq(trend_basis, v, rcond=None)[0]
+            print(f"  {name} {VARS[c]}: s.d. {v.std():.2f} degC, linear trend "
+                  f"{100 * fit.var() / v.var():.1f}% of variance, total change "
+                  f"{fit[0] - fit[-1]:+.2f} degC across the record")
+    print(f"warm fraction: older half {warm[older].mean():.2f}, younger half "
+          f"{warm[~older].mean():.2f} (0.50 over the whole record by construction)")
+    print(f"{len(onsets_i)} warmings, {(ages[onsets_i] >= ages[len(ages) // 2]).sum()} in the older "
+          f"half and {(ages[onsets_i] < ages[len(ages) // 2]).sum()} in the younger; "
+          f"intervals {np.diff(np.sort(ages[onsets_i]))} yr")
+
     D = len(VARS) * len(lats) * len(lons)
     samples = collapse_to_samples(long)          # one row per (site, channel, sample)
 
@@ -820,7 +974,7 @@ def chapter5(inp: Inputs) -> None:
           f"at 1000 yr {np.interp(1000, lag_yr, q50):.2f}")
 
 def chapter6(inp: Inputs) -> None:
-    """Figures 6.1-6.3: what the flow stack does, and why."""
+    """Figures 6.1-6.4: what the flow stack does, and why."""
     cube, ages, lats, lons, valid = inp.cube, inp.ages, inp.lats, inp.lons, inp.valid
     long, raw = inp.long, inp.raw
 
@@ -1034,44 +1188,134 @@ def chapter6(inp: Inputs) -> None:
     # from that cell so a box of a given height renders at the same physical size in all three
     # panels.
 
-    fig, ax = plt.subplots(figsize=(REPORT_WIDTH, 1.62), constrained_layout=True)
-    ax.set_xlim(0, 100); ax.set_ylim(-0.3, 13.2); ax.axis("off")
-    ax.text(0, 13.1, "(c)  MTA-HGAOEnKF", fontsize=7.4, fontweight="bold", va="top")
+    # The orange connector needs a lane of its own between the flow and the observations, so
+    # this panel is taller than Figure 5.1's; the height grows with the y-range to keep the scale.
+    Y_TOP = 14.3
+    OBS_LO, OBS_HI = 11.7, 14.0
+    OBS_MID = (OBS_LO + OBS_HI) / 2
+    LANE = 10.8                     # the time-ordering connector, between the two
+    fig, ax = plt.subplots(figsize=(REPORT_WIDTH, 1.62 * (Y_TOP + 0.3) / 13.5),
+                           constrained_layout=True)
+    ax.set_xlim(0, 100); ax.set_ylim(-0.3, Y_TOP); ax.axis("off")
+    ax.text(0, Y_TOP - 0.1, "(c)  MTA-HGAOEnKF", fontsize=7.4, fontweight="bold", va="top")
 
     archive = stage(ax, 1, 12, ROW0, ROW1, "LOVECLIM\narchive", STATIC)
-    select = stage(ax, 15, 31, ROW0, ROW1,
-                    "score every state by\nits evidence;\nkeep the best $k$", DATA, fs=6.3)
+    # Scoring every state and keeping k is HGAOEnKF's and stays grey; only the rule it scores
+    # by is ours, so the orange is confined to the rule's name inside the box.
+    select = stage(ax, 15, 31, ROW0, ROW1, "", DATA)
+    ax.text(23, 8.2, "score every state by", fontsize=6.3, ha="center", va="center", zorder=4)
+    ax.text(23, 7.1, "the evidence rule", fontsize=6.3, ha="center", va="center", zorder=4,
+            bbox=dict(boxstyle="round,pad=0.18,rounding_size=0.5", facecolor=OURS[0],
+                      edgecolor=OURS[1], linewidth=0.7))
+    ax.text(23, 6.0, "keep the best $k$", fontsize=6.3, ha="center", va="center", zorder=4)
     augment = stage(ax, 34, 54, 7.5, 9.9,
                      "add the archive's flow\nat nine timescales", OURS, fs=6.3)
     cov_flow = stage(ax, 57, 71, 7.5, 9.9, "flow-dependent\ncovariance", FLOW, fs=6.3)
     cov_static = stage(ax, 57, 71, 3.5, 5.9, "static covariance $\\mathbf{B}$", STATIC, fs=6.3)
     gain = stage(ax, 74, 88, ROW0, ROW1, "two gains,\nsummed at $\\alpha$", STATIC)
     out = stage(ax, 90, 100, ROW0, ROW1, "analysis", ANALYSIS)
-    obs = stage(ax, 32, 62, OBS0, OBS1, "observations $\\mathbf{y}$, $\\mathbf{R}$", DATA)
+    obs = stage(ax, 44, 74, OBS_LO, OBS_HI, "observations $\\mathbf{y}$, $\\mathbf{R}$", DATA)
 
     flow(ax, (archive[1], MID), (select[0], MID))
-    flow(ax, (38, OBS0), (25, ROW1))                  # the observations drive selection
-    flow(ax, (56, OBS0), (81, ROW1))                  # and the innovation
+    # The observations drive selection and the innovation. Both leave the box sideways and
+    # drop straight down, so neither cuts across a box on the way.
+    route(ax, [obs[0], 23], [OBS_MID, OBS_MID])
+    flow(ax, (23, OBS_MID), (23, ROW1))
+    route(ax, [obs[1], 81], [OBS_MID, OBS_MID])
+    flow(ax, (81, OBS_MID), (81, ROW1))
     flow(ax, (select[1], 7.6), (augment[0], 8.7), color=FLOW[1])
     flow(ax, (augment[1], 8.7), (cov_flow[0], 8.7), color=OURS[1])
     # The augmentation reads the archive's time ordering and never passes through the scoring
-    # box, so its connector leaves the archive before it and stays clear of the observations.
-    route(ax, [6.5, 6.5, 41], [ROW1, 10.15, 10.15], color=OURS[1], ls=DASHED)
-    flow(ax, (41, 10.15), (41, 9.9), color=OURS[1], ls=DASHED)
-    ax.text(21, 10.3, "the archive's time ordering", fontsize=6.0, color=OURS[1],
+    # box, so its connector leaves the archive before it. It has to cross the selection arrow,
+    # and a short white gap under that arrow makes the crossing read as a bridge.
+    route(ax, [6.5, 6.5, 44], [ROW1, LANE, LANE], color=OURS[1], ls=DASHED)
+    ax.plot([21.9, 24.1], [LANE, LANE], color="white", lw=2.5, zorder=1.5,
+            solid_capstyle="butt")
+    flow(ax, (44, LANE), (44, augment[3]), color=OURS[1], ls=DASHED)
+    ax.text(33.5, LANE + 0.15, "the archive's time ordering", fontsize=6.0, color=OURS[1],
             ha="center", va="bottom")
-    # The static covariance never sees the selection either.
-    route(ax, [6.5, 6.5, 55, 55], [ROW0, 2.0, 2.0, 4.7])
+    # The static covariance never sees the selection either. Its connector runs high enough
+    # to clear the prior-mean label below it.
+    route(ax, [6.5, 6.5, 55, 55], [ROW0, 2.9, 2.9, 4.7])
     flow(ax, (55, 4.7), (cov_static[0], 4.7))
     flow(ax, (cov_flow[1], 8.7), (gain[0], 7.9), color=FLOW[1])
     flow(ax, (cov_static[1], 4.7), (gain[0], 6.3))
     flow(ax, (gain[1], MID), (out[0], MID))
     route(ax, [23, 23, 95], [ROW0, MEAN_Y, MEAN_Y], color=FLOW[1], ls=DASHED)
     flow(ax, (95, MEAN_Y), (95, ROW0), color=FLOW[1], ls=DASHED)
-    ax.text(59, MEAN_Y + 0.55, "prior mean: the mean of the $k$ selected states, unchanged",
+    ax.text(59, MEAN_Y + 0.45, "prior mean: the mean of the $k$ selected states, unchanged",
             fontsize=6.3, color=FLOW[1], ha="center", va="bottom")
 
     save(fig, "fig06_03_estimator_schematic")
+
+    # Figure 6.4 - the two selection rules as regions, in the whitened coordinates of
+    # eq:mt-misfit.
+    #
+    # A drawing, not a measurement: the cloud is sampled from the geometry those coordinates
+    # impose rather than read from a run. Writing q = U^T R^-1/2 (y - H x) puts the observation
+    # at the origin and gives the pool covariance lambda, so the cloud's elongation IS the
+    # eigenvalue ratio rather than an artistic choice, and both rules are level sets of
+    # quadratic forms on it: a circle for the misfit, an ellipse with semi-axes
+    # sqrt(s (1 + kappa lambda_p)) for the evidence. Only two of the m directions are drawn,
+    # one well-explained and one barely, and the pair is far milder than the spectrum the
+    # rules actually meet (the line printed below quotes both), so the figure understates the
+    # anisotropy rather than flattering it. Colours and the kappa parameterisation are
+    # Figure 6.1's, which is where the same two rules were first separated.
+    LAM_DRAWN = np.array([6.0, 0.30])
+    KAPPA_DRAWN, N_DRAWN, K_DRAWN = 1.0, 400, 100
+    INNOVATION_DRAWN = np.array([0.60, 0.18])       # the prior mean's own whitened misfit
+    rng6 = np.random.default_rng(7)
+    q6 = INNOVATION_DRAWN + rng6.normal(size=(N_DRAWN, 2)) * np.sqrt(LAM_DRAWN)
+
+    misfit6 = (q6 ** 2).sum(axis=1)
+    evidence6 = (q6 ** 2 / (KAPPA_DRAWN * LAM_DRAWN + 1.0)).sum(axis=1)
+    take_m6 = misfit6 <= np.sort(misfit6)[K_DRAWN - 1]
+    take_e6 = evidence6 <= np.sort(evidence6)[K_DRAWN - 1]
+    radius6 = np.sqrt(np.sort(misfit6)[K_DRAWN - 1])
+    semi6 = np.sqrt(np.sort(evidence6)[K_DRAWN - 1] * (KAPPA_DRAWN * LAM_DRAWN + 1.0))
+
+    fig, ax = plt.subplots(figsize=(4.75, 2.85), constrained_layout=True)
+    ax.axhline(0.0, color="0.88", lw=0.5, zorder=0)
+    ax.axvline(0.0, color="0.88", lw=0.5, zorder=0)
+    # The cloud's own 1- and 2-sigma contours: context for why a ball is the wrong cut. Left
+    # unlabelled, since a leader to them would cross the regions they explain.
+    for n_sd, alpha in ((1.0, 0.6), (2.0, 0.32)):
+        ax.add_patch(Ellipse(INNOVATION_DRAWN, *(2 * n_sd * np.sqrt(LAM_DRAWN)), fill=False,
+                             color="0.55", lw=0.55, ls=(0, (1, 1.6)), alpha=alpha, zorder=1))
+    # Colour marks disagreement, neutral grey agreement, so the eye lands on what moves.
+    classes6 = ((~take_m6 & ~take_e6, "0.80", 6.5, "kept by neither"),
+                (take_m6 & take_e6, "0.38", 8.0, "kept by both"),
+                (take_m6 & ~take_e6, "#3c5f8f", 11.0, "misfit only"),
+                (take_e6 & ~take_m6, "#c4692a", 11.0, "evidence only"))
+    for mask, colour, size, _ in classes6:
+        ax.scatter(q6[mask, 0], q6[mask, 1], s=size, color=colour, lw=0, zorder=3)
+    ax.add_patch(Circle((0, 0), radius6, fill=False, color="#3c5f8f", lw=1.1, zorder=5))
+    ax.add_patch(Ellipse((0, 0), *(2 * semi6), fill=False, color="#c4692a", lw=1.1, zorder=5))
+    ax.plot(0, 0, marker="+", ms=5.5, mew=1.1, color="0.15", zorder=6)
+
+    # Both boundaries carry their own rule, so identity never rests on colour alone.
+    ax.annotate(r"$\lVert\mathbf{q}\rVert^{2}\leq r^{2}$".replace("lVert", "|")
+                .replace("rVert", "|"), xy=(0.12, radius6), xytext=(-24, 15),
+                textcoords="offset points", fontsize=6.4, color="#3c5f8f", ha="center",
+                arrowprops=dict(arrowstyle="-", lw=0.5, color="#3c5f8f", shrinkB=1.5))
+    ax.annotate(r"$\sum_p q_p^{2}/(1+\kappa\lambda_p)\leq s$",
+                xy=(semi6[0] * 0.80, -semi6[1] * 0.62), xytext=(14, -24),
+                textcoords="offset points", fontsize=6.4, color="#c4692a", ha="left",
+                arrowprops=dict(arrowstyle="-", lw=0.5, color="#c4692a", shrinkB=1.5))
+
+    ax.set_aspect("equal")                  # a ball drawn oval would make the section false
+    ax.set_xlim(-2.85, 2.85); ax.set_ylim(-1.68, 1.68)
+    ax.set_xlabel(r"$q_1$   (large $\lambda_1$: the prior spreads here)")
+    ax.set_ylabel(r"$q_2$   (small $\lambda_2$)")
+    ax.legend(handles=[Line2D([], [], color=c, marker="o", ms=2.8, lw=0, label=lab)
+                       for _, c, _, lab in classes6],
+              loc="lower left", ncol=2, frameon=False, handlelength=1.0, borderpad=0.1,
+              labelspacing=0.2, columnspacing=1.0, handletextpad=0.35, fontsize=6.2)
+    print(f"  6.4 drawn at lambda ratio {LAM_DRAWN[0] / LAM_DRAWN[1]:.0f}, against a measured "
+          f"median lambda_max over median lambda of "
+          f"{np.median(lam_max6) / np.median(spectrum6):.0f}; "
+          f"{int((take_m6 & ~take_e6).sum())} of {K_DRAWN} members differ between the rules")
+    save(fig, "fig06_04_whitened_geometry")
 
     # Section 6.6's numbers: what each prior carries along the archive's regime axis.
     #
@@ -1123,8 +1367,8 @@ def chapter6(inp: Inputs) -> None:
 # ---------------------------------------------------------------------------
 # One colour and one marker per estimator, fixed here and used by every figure below, so the
 # three read the same way throughout the chapter. Grey is the static analysis, blue is the
-# archive-wide path the schematics of Figures 2.1 and 5.1 already draw in blue, and orange is
-# Figure 2.1's "this work" colour.
+# archive-wide path the schematics of Figures 2.1 and 5.1 already draw in blue, and orange
+# marks this project's own method, as in Figure 2.1.
 ESTIMATORS = (
     (ex.ESTIMATOR_3DVAR, "3DVar", "#6b6b6b", "o"),
     (ex.ESTIMATOR_HGAOENKF, "HGAOEnKF", "#3c5f8f", "s"),
@@ -1543,7 +1787,7 @@ def chapter7() -> None:
         ax.set_xlabel(r"background amplitude $c$")
         ax.text(0.02, 1.02, f"({tag}) {title} lane", transform=ax.transAxes, fontsize=7.0,
                 fontweight="bold", va="bottom")
-    axes[0].set_ylabel("test coefficient of efficiency")
+    axes[0].set_ylabel("CE")
     axes[0].text(0.082, 0.025, "climatology", fontsize=6.2, color="0.45", ha="left",
                  va="bottom")
     axes[0].legend(loc="lower left", frameon=False, handlelength=1.5, borderpad=0.1,
@@ -1579,7 +1823,7 @@ def chapter7() -> None:
 # Chapter 8: the product.
 # ---------------------------------------------------------------------------
 # The reconstruction is orange and the simulation it was built on blue, in the same two
-# colours Figure 2.1 gives "this work" and the archive-wide path.
+# colours Figure 2.1 gives this project's method and the archive-wide path.
 PRODUCT_C, SIM_C = "#c4692a", "#3c5f8f"
 # Where a panel separates the two channels rather than the two fields, it needs colours that
 # carry neither of the meanings above.
