@@ -1,10 +1,8 @@
 """HGAOEnKF-evidence: the analog ensemble chosen by marginal likelihood.
 
-The published rule scores a candidate's residual against R alone. This one scores it
-against ``c H B H' + R``, so selection stops spending its budget on the directions the
-update will fix and buys ensemble span with what it saves. It also carries the tendency
-term, whose weight the grid sweeps down to zero, so the published estimator is the
-grid's own corner rather than a separate run.
+The published rule scores a candidate's residual against R alone; the evidence rule
+scores it against ``c H B H^T + R``, which trades a slightly worse prior mean for a wider
+ensemble. The grid also sweeps a single-lag tendency term, whose zero weight is off.
 """
 
 from __future__ import annotations

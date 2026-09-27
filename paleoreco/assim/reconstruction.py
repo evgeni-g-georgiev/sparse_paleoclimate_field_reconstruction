@@ -1,17 +1,12 @@
-"""Reconstruction of a full age axis from a real proxy network.
+"""The reconstruction: one analysis per age of the archive, from the real proxy network.
 
-The evaluation lanes score an estimator against a truth. This produces the reconstruction
-itself: one analysis per age, with no truth, no split and no metrics. What rides alongside
-the fields is what a reader needs to interpret them, since the network varies from nothing
-to the whole archive of sites: the count assimilated at each age, and innovation
-diagnostics that say whether the assumed observation error matches the residuals.
+There is no truth, split or metric here. Alongside the fields the output records how many
+observations each age assimilated, and innovation diagnostics that check the assumed
+observation error against the residuals.
 
-Observations enter in anomaly space against each site's own climatology, and the state in
-anomaly space against the prior's, so a proxy's offset from the model cancels. The
-background is climatological at every age. Where the estimator draws an analog ensemble
-that ensemble's mean is the background the analysis updates, so a per-age background would
-hand the analysis the archive's own state at the target age, which is what an exclusion
-band exists to prevent.
+Observations are anomalies about each site's own climatology and the state about the
+prior's, so a proxy's offset from the model cancels. The background is climatological at
+every age; an analog estimator updates its ensemble mean instead.
 """
 
 from __future__ import annotations
@@ -45,9 +40,8 @@ from paleoreco.assim.priors import build_prior
 from paleoreco.assim.threedvar import ThreeDVar
 
 LANE_RECONSTRUCTION = "reconstruction"
-# The amplitude at which the gain vanishes, so the analysis returns its own background. It
-# rides along with every sweep rather than being solved for separately, which is what makes
-# the prior mean and the analysis share one ensemble and so one innovation.
+# An amplitude small enough that the analysis returns its own background, added to every
+# sweep so the prior mean comes from the same ensemble as the analysis.
 PRIOR_LIMIT = 1e-9
 NO_ANALOG = -1
 
@@ -57,9 +51,8 @@ def _network_at_age(long: pd.DataFrame, age: int, lats: np.ndarray, lons: np.nda
                     min_obs: int) -> dict | None:
     """Assimilable observations at one age, or ``None`` where the network is too thin.
 
-    An observation is usable where its cell survives the prior's mask, its stated error
-    variance is positive, and its site has a climatology to take an anomaly against. A
-    missing climatology would otherwise carry a NaN through the gain to the whole field.
+    An observation is usable where its cell is valid, its error variance is positive and
+    its site has a climatology; a missing climatology would spread NaN through the field.
     """
     o = observations_at_age(long, int(age))
     if not len(o.get("age", [])):
@@ -83,8 +76,7 @@ def _network_at_age(long: pd.DataFrame, age: int, lats: np.ndarray, lons: np.nda
 def _desroziers(d_b: np.ndarray, d_a: np.ndarray, r: np.ndarray) -> float:
     """Desroziers (2005) ratio: ``E[d_a d_b'] = R`` holds where the assumed R is right.
 
-    Needs no truth, so with the innovation chi-squares it is the only check on the amplitude
-    balance a reconstruction from real proxies has.
+    Needs no truth, so it can check a reconstruction from real proxies.
     """
     return float((d_a * d_b).mean() / r.mean())
 
@@ -92,9 +84,7 @@ def _desroziers(d_b: np.ndarray, d_a: np.ndarray, r: np.ndarray) -> float:
 def _reduced_chi2(d: np.ndarray, r: np.ndarray) -> float:
     """Innovation whitened by R, which is the norm the gain actually shrinks.
 
-    The unweighted residual is not monotone in the background amplitude once R varies
-    between observations, so a per-observation weighting is what makes the two columns
-    comparable across the sweep.
+    Whitening makes the value comparable across the amplitude sweep when R varies.
     """
     return float(((d ** 2) / r).mean())
 
@@ -102,8 +92,7 @@ def _reduced_chi2(d: np.ndarray, r: np.ndarray) -> float:
 def _json_scalar(value):
     """A numpy scalar as something ``json.dump`` will emit as valid JSON.
 
-    A column that does not apply to an estimator arrives as NaN, which serialises to a bare
-    ``NaN`` token that only Python reads back.
+    NaN becomes ``None``, since a bare ``NaN`` token is not valid JSON.
     """
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
@@ -134,13 +123,10 @@ def run_reconstruction(
 ) -> dict:
     """Assimilate the real network at every age and write the reconstruction.
 
-    The prior, its climatology and the temporal structure function all come from every age:
-    there is no held-out model state here, so the operator and the covariance describe the
-    same archive the analysis draws on. ``b_scales`` are reported side by side rather than
-    selected between, since nothing here can score them.
-
-    Ages whose network is thinner than ``min_obs`` carry the prior instead of an analysis,
-    flagged so a reader can tell a reconstruction from a climatology.
+    The prior, climatology and temporal structure function use every age, since no model
+    state is held out. ``b_scales`` are published side by side, since nothing here can
+    choose between them. Ages with fewer than ``min_obs`` observations carry the prior and
+    are flagged in ``prior_only``.
     """
     if min_obs < 1:
         raise ValueError(f"an analysis needs at least one observation; got {min_obs}")
@@ -193,10 +179,8 @@ def run_reconstruction(
         geom = _network_at_age(long, int(age), lats, lons, safe_flat, n_cells,
                                rep_lookup, min_obs)
         if geom is None:
-            # Selection reads the observations, so with none there is no ensemble to draw
-            # and no analysis to form. This branch has to come before the gain is prepared:
-            # an empty network factorizes without complaint and would return a plausible
-            # field built on whichever candidates the ranking left first.
+            # Must come before the gain is prepared: an empty network would still return a
+            # plausible field.
             prior_only[i] = True
             for bj, b in enumerate(b_scales):
                 post_var[bj, i] = b * prior_var
@@ -206,8 +190,7 @@ def run_reconstruction(
         g = geom["gather"]
         rho, resid = temporal_terms(S, prior_var_cell, g, geom["lag"], step_yr)
         yv, r = apply_temporal_error(geom["y_anom"], geom["sse"], rho, resid, temporal_mode)
-        # The age reaches the estimator because the archive spans it, so an analog step
-        # could otherwise select the simulation's own state at the target.
+        # The age drives the analog exclusion band, since this prior spans it.
         gain = tv.prepare_sweep(g, r, sweep, age=int(age))
         res = tv.apply_sweep(gain, yv, zero_bg)
 
@@ -243,8 +226,7 @@ def run_reconstruction(
         "desroziers_r": desroziers_r, "chi2_bg": chi2_bg,
         "chi2_an": chi2_an, "innov_r_mean": innov_r_mean,
     }
-    # Both ride along only where the estimator produced one, so a reader cannot mistake a
-    # filled default for a reported quantity.
+    # Written only where the estimator produced them.
     if has_cross:
         npz_arrays["post_cross_var"] = post_cross_var
     if analog_index is not None:
@@ -262,8 +244,7 @@ def run_reconstruction(
         "n_ages": int(n_ages),
         "n_prior_only_ages": int(prior_only.sum()),
         "prior_only_ages": [int(a) for a in ages_i[prior_only]],
-        # An observation age off the archive's axis is never reached by the loop, and
-        # nothing in the fields would say so.
+        # Observation ages off the archive's axis, which the loop never reaches.
         "n_obs_ages_off_axis": int(len(np.setdiff1d(long["age"].unique(), ages_i))),
     }
     if method_cols:

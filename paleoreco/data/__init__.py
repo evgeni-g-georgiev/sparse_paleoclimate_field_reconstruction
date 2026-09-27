@@ -1,11 +1,7 @@
-"""Data substrate: the Prior cube, CV splits, and the constant-CO2 model run.
+"""The prior cube and splits of its age axis.
 
-The cube loader is the heavily-used public surface, so it is re-exported here:
-``from paleoreco.data import build_prior_cube`` resolves directly. The split
-utilities stay an explicit submodule to keep this namespace focused:
-
-* :mod:`paleoreco.data.cube`        - Prior.csv -> dense cube and per-cell stats.
-* :mod:`paleoreco.data.splits`      - train/val/test and blocked CV over the age axis.
+* :mod:`paleoreco.data.cube`   - Prior.csv to a dense cube, and per-cell statistics.
+* :mod:`paleoreco.data.splits` - age-axis splits and the D-O event windows.
 """
 
 from __future__ import annotations

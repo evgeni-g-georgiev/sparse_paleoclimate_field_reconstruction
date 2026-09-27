@@ -14,8 +14,8 @@ Methods and drivers, reached by submodule path rather than re-exported:
 
 * :mod:`paleoreco.assim.method`       - the Method / AnalysisResult contract.
 * :mod:`paleoreco.assim.priors`       - the Prior container and its tapers.
-* :mod:`paleoreco.assim.threedvar`    - gain-form pixel 3DVar.
-* :mod:`paleoreco.assim.hgaoenkf`     - hybrid gain analog offline EnKF.
+* :mod:`paleoreco.assim.threedvar`    - gain-form 3DVar.
+* :mod:`paleoreco.assim.hgaoenkf`     - HGAOEnKF and MTA-HGAOEnKF.
 * :mod:`paleoreco.assim.experiments`  - PPE, trajectory and withholding lane runners.
 * :mod:`paleoreco.assim.reconstruction` - full age axis assimilated from a real network.
 """

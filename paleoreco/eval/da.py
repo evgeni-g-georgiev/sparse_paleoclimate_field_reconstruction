@@ -1,10 +1,9 @@
 """Skill metrics for data-assimilation reconstructions.
 
-Metrics are method-agnostic: they take numpy arrays of truth, reconstruction, and
-(for the uncertainty maps) posterior variance, so 3DVar, EnKF, and a generative
-posterior score identically. Reconstructions are scored over the valid field,
-unweighted by cell area, so the high-latitude variance carrying the D-O signal keeps
-its weight.
+Metrics take numpy arrays of truth, reconstruction and, for the uncertainty maps,
+posterior variance, so every estimator is scored the same way. Fields are scored over the
+valid grid, unweighted by cell area, so the high-latitude variance carrying the D-O signal
+keeps its weight.
 
 Skill: coefficient of efficiency (CE, the headline, with a built-in climatology
 baseline), Pearson correlation, degC RMSE, RMSE normalised by the truth std (RRMSE),

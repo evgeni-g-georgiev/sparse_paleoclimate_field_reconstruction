@@ -88,8 +88,8 @@ def main() -> None:
         wh = json.load(open(paths.run_dir(ESTIMATOR, paths.LANE_WITHHOLDING)
                             / "withholding_random_config.json"))
         taper_wh = {k: wh[k] for k in C.TAPER_KEYS}
-        # The band the report quotes, narrowed only where the archive is too short to leave
-        # an ensemble's worth of candidates outside it.
+        # A 2000 yr band, narrowed only where the archive is too short to leave enough
+        # candidates outside it.
         span = float(ages[-1] - ages[0])
         wide = min(2000.0, span / 10.0)
         for name, (over, note) in variants(wide, int(wh["selected"]["analog_k"])).items():

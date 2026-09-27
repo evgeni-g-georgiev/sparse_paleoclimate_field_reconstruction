@@ -77,8 +77,7 @@ class Method(ABC):
     ) -> list[AnalysisResult]:
         """Analyses for several backgrounds that share one observation network.
 
-        The default reuses :meth:`analyze`; a method whose operators do not depend
-        on the background (a fixed-gain 3DVar) overrides this to factorize once and
-        apply many, which is the common case when comparing first guesses.
+        The default calls :meth:`analyze` per background; a method whose gain does not
+        depend on the background can override it to factorize once.
         """
         return [self.analyze(obs, bg) for bg in backgrounds]

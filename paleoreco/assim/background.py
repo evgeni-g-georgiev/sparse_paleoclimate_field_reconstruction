@@ -44,7 +44,7 @@ def background_covariance(cube: np.ndarray, age_indices: np.ndarray) -> np.ndarr
 
 
 def background_variance(cov: np.ndarray) -> np.ndarray:
-    """Per-cell background variance, the diagonal of B the marginal test needs."""
+    """Per-cell background variance, the diagonal of B."""
     return np.diag(cov).copy()
 
 

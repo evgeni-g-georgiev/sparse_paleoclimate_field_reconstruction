@@ -1,4 +1,4 @@
-"""Pixel 3DVar across the three lanes.
+"""3DVar across the three lanes.
 
 Runs first. The regularizer it selects on the same-model lane is inherited by every
 analog estimator there, and the one it selects on the real-proxy lane is inherited by

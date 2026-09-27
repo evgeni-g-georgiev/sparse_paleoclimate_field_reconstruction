@@ -1,9 +1,8 @@
 """HGAOEnKF: the published hybrid gain analog offline EnKF (Sun et al. 2024).
 
-The baseline the contribution is measured against. It also runs the two readings of Sun
-et al.'s own selection rule, which is what licenses ranking analogs by R-weighted misfit
-instead, and the sweep over the analog covariance's own lengthscale, which is what
-licenses tapering it exactly as the static one is tapered.
+The baseline MTA-HGAOEnKF is measured against, selecting by R-weighted misfit. Also runs
+the two readings of Sun et al.'s correlation rule, for comparison with the misfit rule, and
+a sweep over the analog covariance's own localization lengthscale.
 """
 
 from __future__ import annotations

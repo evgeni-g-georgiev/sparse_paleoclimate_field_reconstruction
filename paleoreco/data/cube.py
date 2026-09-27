@@ -1,16 +1,10 @@
-"""Data loading, caching, and per-cell statistics for the Prior cube.
+"""Loading, caching and per-cell statistics for the prior cube.
 
-Turns ``Prior.csv`` (~1.6M rows in long format) into a dense
-``(N_ages, 2, n_lat, n_lon)`` cube of ``[mtco, mtwa]`` channels and caches it as
-``.npz`` for reuse. The Prior here is a LOVECLIM transient climate simulation;
-the loader is agnostic to the engine.
-
-Key invariants
---------------
-* The Prior has no missing cells; the only mask that does anything is
-  ``safe_valid``, which drops cells with degenerate std (e.g. permanent ice).
-* Per-cell stats use **train ages only** to avoid leakage; ``mean`` centres
-  the cube to anomaly, and ``std`` is kept for the assimilation's normalised path.
+Turns ``Prior.csv`` (about 1.6M rows in long format) into a dense
+``(N_ages, 2, n_lat, n_lon)`` cube of ``[mtco, mtwa]`` channels, cached as ``.npz``. The
+prior has no missing cells; ``safe_valid`` only drops cells with degenerate variability.
+Per-cell statistics are computed over a given subset of ages, so a held-out half never
+informs them.
 """
 
 from __future__ import annotations
@@ -37,41 +31,22 @@ def build_prior_cube(
     cache_path: str | None = "data/cache/prior_cube.npz",
     force_rebuild: bool = False,
 ) -> dict:
-    """Pivot ``Prior.csv`` into a dense (N_ages, 2, n_lat, n_lon) cube.
+    """Pivot ``Prior.csv`` into a dense ``(N_ages, 2, n_lat, n_lon)`` cube.
 
-    Parameters
-    ----------
-    prior_csv : str
-        Path to the raw Prior CSV.
-    cache_path : str or None
-        Where to read/write the cached npz; ``None`` disables caching.
-    force_rebuild : bool
-        Rebuild from CSV even if a cache exists.
-
-    Returns
-    -------
-    dict with keys:
-        cube  : (N_ages, 2, n_lat, n_lon) float32, channels (mtco, mtwa).
-        ages  : (N_ages,) int64, sorted ascending (yr BP).
-        lats  : (n_lat,) float32, sorted ascending.
-        lons  : (n_lon,) float32, sorted ascending.
-        valid : (n_lat, n_lon) bool. True where the cube is finite for
-                every age and both channels.
+    Returns a dict of ``cube`` (float32), ascending ``ages`` (yr BP), ``lats`` and ``lons``,
+    and ``valid``, true where a cell is finite at every age. ``cache_path=None`` disables
+    caching.
     """
-    # Use the cache when it is available and no rebuild was asked for.
     if cache_path is not None and os.path.exists(cache_path) and not force_rebuild:
         with np.load(cache_path) as z:
             return {k: z[k] for k in z.files}
 
-    # usecols keeps memory bounded on the 1.6M-row CSV.
     df = pd.read_csv(prior_csv, usecols=["lon", "lat", "age", "mtco", "mtwa"])
 
-    # Sorted unique axes define the cube's coordinate system.
     ages = np.sort(df["age"].unique())
     lats = np.sort(df["lat"].unique())
     lons = np.sort(df["lon"].unique())
 
-    # Vectorised index lookup via searchsorted into the sorted unique axes.
     age_idx = np.searchsorted(ages, df["age"].to_numpy())
     lat_idx = np.searchsorted(lats, df["lat"].to_numpy())
     lon_idx = np.searchsorted(lons, df["lon"].to_numpy())
@@ -81,8 +56,7 @@ def build_prior_cube(
     cube[age_idx, 0, lat_idx, lon_idx] = df["mtco"].to_numpy(dtype=np.float32)
     cube[age_idx, 1, lat_idx, lon_idx] = df["mtwa"].to_numpy(dtype=np.float32)
 
-    # Fail loud rather than silently zero-fill: a real 0 °C reading is
-    # indistinguishable from a missing cell that defaulted to NaN -> 0.
+    # Fail rather than zero-fill: a filled cell would be indistinguishable from 0 °C.
     n_missing = int(np.isnan(cube).sum())
     if n_missing:
         raise ValueError(
@@ -90,8 +64,7 @@ def build_prior_cube(
             "Decide explicitly how to handle this before proceeding."
         )
 
-    # A cell is geographically "valid" iff both channels are finite for every age.
-    # For the Prior this is uniformly True (see verify_mask_constant_across_ages).
+    # True everywhere for this prior, which has no missing cells.
     valid = np.isfinite(cube).all(axis=(0, 1))
 
     result = {
@@ -115,43 +88,19 @@ def compute_zscore_stats(
     valid: np.ndarray,
     eps: float = 1e-6,
 ) -> dict:
-    """Compute per-cell mean and std from train ages only.
+    """Per-cell ``mean``, ``std`` and ``safe_valid`` over the ages at ``train_age_indices``.
 
-    Cells with degenerate std (below ``eps``) on either channel are
-    excluded from the training mask. This handles the "permanent ice
-    cell with no variability" case.
-
-    Parameters
-    ----------
-    cube : (N_ages, 2, n_lat, n_lon) float32
-    train_age_indices
-        Indices into the N_ages axis (not ages themselves).
-    valid : (n_lat, n_lon) bool
-        Per-cell geographic validity from ``build_prior_cube``.
-    eps : float
-        Std threshold below which a cell is treated as degenerate.
-
-    Returns
-    -------
-    dict with keys:
-        mean       : (2, n_lat, n_lon) float32. Per-cell train mean.
-        std        : (2, n_lat, n_lon) float32. Per-cell train std,
-                     clamped to 1.0 on masked cells so division stays safe.
-        safe_valid : (n_lat, n_lon) bool. The loss/mask channel used
-                     downstream: geographically valid AND both channels
-                     have non-degenerate variability.
+    ``safe_valid`` drops cells whose std on either channel is below ``eps``, such as
+    permanent ice; their std is set to 1.0 so dividing by it stays finite.
     """
     train_age_indices = np.asarray(train_age_indices, dtype=np.int64)
     sub = cube[train_age_indices]  # (n_train, 2, n_lat, n_lon)
     mean = sub.mean(axis=0)         # (2, n_lat, n_lon)
     std = sub.std(axis=0)           # (2, n_lat, n_lon)
 
-    # A cell is degenerate if EITHER channel has near-zero std on train ages.
     degenerate = (std < eps).any(axis=0)              # (n_lat, n_lon)
     safe_valid = valid & ~degenerate                  # (n_lat, n_lon)
 
-    # Where the cell is masked, replace std with 1.0 so (x - mean) / std doesn't
-    # explode. The mask channel will zero those cells out anyway.
     std_safe = np.where(safe_valid[None], std, 1.0).astype(np.float32)
 
     return {

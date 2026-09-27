@@ -28,10 +28,9 @@ def _terms(point: dict) -> dict:
 
 
 def _stack_for(point: dict, stack: dict) -> dict:
-    """The flow stack, or nothing where the weight that switches it on is zero.
+    """The MTA stack, or nothing where its weight is zero.
 
-    The estimator rejects a stack it cannot use, so the weight-zero corner drops it
-    rather than failing to build. That corner is the ablation the grid is read for.
+    The estimator rejects a stack at zero weight, so that corner drops it.
     """
     return stack if point["tendency_theta"] > 0.0 else {}
 
@@ -60,9 +59,8 @@ def withholding(point, *, cube, ages, lats, lons, valid, long_wh, out_dir, taper
                 selection, estimator=None, b_scales, stack=None, progress_every=1):
     """The real-proxy lane at the same-model operating point, not re-gridded.
 
-    The grid this replaces moved the selection metric by under 0.4% and the reported CE
-    by under 0.006, on a lane whose whole spread between estimators is 0.003. Inheriting
-    costs about 0.005 CE, uniformly, and buys back the majority of the tuning budget.
+    Inheriting the snapshot lane's ensemble size and hybrid weight saves most of the tuning
+    cost; only ``b_scale`` is selected here.
     """
     C.clear_dir(out_dir)
     return ex.run_hgaoenkf_withholding_grid(

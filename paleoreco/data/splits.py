@@ -1,14 +1,8 @@
-"""Train/val/test split utilities for the Prior cube.
+"""Splits of the age axis, and the D-O event windows.
 
-Background on the D-O windows
------------------------------
-The Prior spans ~29,100 to ~49,175 yr BP, covering Greenland D-O events 5
-through 12. Following Liu et al. (2026) Sect. 2.4, each D-O event is
-defined by an analysis window of 300 years before to 600 years after its
-onset. Onsets are taken from Rasmussen et al. 2014 (*Quat. Sci. Rev.* 106,
-Table 2), reported in **b2k** (years before 2000 AD). The Prior is in
-**yr BP** (years before 1950 AD), so ``BP = b2k - 50``.
-``DO_EVENT_WINDOWS`` applies both conversions in one step.
+The prior spans 29,100 to 49,175 yr BP, covering Greenland interstadials 5 to 12. Following
+Liu et al. (2026) Sect. 2.4, each event's window runs from 300 yr before its onset to 600 yr
+after. Onsets are from Rasmussen et al. (2014) Table 2 in b2k, and ``BP = b2k - 50``.
 """
 
 from __future__ import annotations
@@ -55,21 +49,7 @@ DO_EVENT_NUMBERS: tuple[int, ...] = tuple(sorted(DO_EVENT_WINDOWS))
 def assign_event_label(ages: np.ndarray) -> np.ndarray:
     """Label each age with its D-O event number (5..12), or 0 if between events.
 
-    Parameters
-    ----------
-    ages : array-like of int
-        Ages in yr BP. No sort requirement.
-
-    Returns
-    -------
-    np.ndarray of int64, same shape as ``ages``.
-        Element values: ``5..12`` for ages inside the corresponding event
-        window (inclusive on both ends), ``0`` for ages outside every window.
-
-    Notes
-    -----
-    If an age falls in two overlapping windows, the higher-numbered event
-    wins (the loop assigns in ascending event order).
+    Windows are inclusive; where two overlap, the higher-numbered event wins.
     """
     ages = np.asarray(ages, dtype=np.int64)
     labels = np.zeros_like(ages)

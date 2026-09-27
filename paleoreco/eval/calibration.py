@@ -1,9 +1,8 @@
 """Calibration metrics: whether a posterior's stated uncertainty matches its errors.
 
 Skill metrics (:mod:`paleoreco.eval.da`) ask how wrong a reconstruction is; these ask
-whether it knew. Each function takes flat, aligned 1-D arrays and accepts either a
-Gaussian posterior (``mean``/``var``) or an ensemble (``samples``), so a variational
-method and a generative one score identically.
+whether it knew. Each function takes flat, aligned 1-D arrays and a Gaussian posterior
+(``mean``/``var``) or an ensemble (``samples``).
 
 The variance passed in must match what the truth is: scoring against a *noisy
 observation* requires the observation error to be added to the posterior variance

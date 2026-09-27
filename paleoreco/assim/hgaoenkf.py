@@ -1,75 +1,29 @@
-"""Hybrid gain analog offline EnKF: a data-selected covariance blended with the static one.
+"""Hybrid gain analog offline EnKF (HGAOEnKF), with multiscale tendency augmentation (MTA).
 
 Sun et al. (2024) build the prior ensemble from the archive states that best match the
-observations of the assimilation at hand, so its covariance describes the climate regime
-being reconstructed rather than the average of the whole run. A k-member covariance over
-thousands of cells is badly undersampled, so the analysis blends it with the static
-covariance through a hybrid gain: one prior mean, one innovation, two gains summed at
-weight ``hybrid_w``. Sun et al. Eq. 4 gives the mean update and Eq. 5 the deviation update,
-both of which this implements. They reach that form through the ensemble framework of Lei
-et al. (2021), citing Penny (2014) for the hybrid gain idea; Penny's own scheme applies the
-two gains in sequence and leaves the deviations untouched, so it is the ancestor rather than
-the algorithm here.
+observations, then blend its covariance with the static B through a hybrid gain: one prior
+mean, one innovation, and two gains summed at weight ``hybrid_w`` (their Eq. 4 for the
+mean, Eq. 5 for the deviations). At ``hybrid_w = 0`` the gain is purely static, at 1 purely
+analog; the prior mean is the analog mean at every weight. Selection rules live in
+:mod:`paleoreco.assim.analog`.
 
-``hybrid_w`` is Sun et al.'s hybrid weight alpha: at 0 the gain is purely static, at 1
-purely analog. The prior mean is the analog mean at every weight. Weight 0 reproduces the
-mean of their AOEnKF-B but not its spread, since Eq. 5 reduces the analog deviations where
-AOEnKF-B carries the climatological ones. At weight 1 the static gain leaves the update
-entirely, and B reaches the analysis only through whatever the selection rule makes of it, so
-the hybrid is a limit of the scheme rather than a fixed part of it.
+MTA appends centred first differences of the archive around each selected member, at
+``tendency_lag_yr`` and ``tendency_extra_lags_yr``, and second differences at
+``tendency_curvature_yr``, to the analog deviations, weighted by ``tendency_theta``.
+``tendency_normalise`` puts every block on the reference lag's amplitude, and
+``preserve_obs_trace`` rescales the augmented ensemble to the unaugmented one's
+observation-space trace, so MTA reallocates variance rather than inflating it and stays
+separable from ``b_scale``. With ``tendency_theta = 0`` the estimator is the published one.
 
-How candidates are ranked is a choice the family leaves open; :mod:`paleoreco.assim.analog`
-holds the rules, and ``selection`` names one.
+Conventions follow 3DVar: anomaly space, nearest-cell H, pixel-space results. Unlike Sun et
+al., who taper the gain and assimilate serially, both ``P H^T`` and ``H P H^T`` are tapered
+and the update is a batch one, so the taper must be PSD in its own right.
+``analog_localization_km`` optionally gives the analog covariance its own lengthscale (Sun
+et al. Table 2).
 
-Two terms extend that scheme, both zero by default and both nested: at zero the analysis is
-the published one. The tendency term augments the analog deviations with the archive's local
-rate of change around each selected member, differenced over ``tendency_lag_yr``. Selection
-draws members that agree with the observations, so they agree with each other there too and
-the covariance is flattest in the directions the gain leans on hardest; the tendency modes
-never had to agree with anything, and they restore that spread out of the archive's time
-ordering, which selection otherwise reads only to build the exclusion band. The redundancy
-term is its selection-side counterpart and lives with the rules.
-
-One lag samples one timescale. ``tendency_extra_lags_yr`` carries the same construction at
-further lags and ``tendency_curvature_yr`` at second differences, so the prior gains the
-archive's flow across the band of timescales D-O variability actually occupies rather than
-at a single one. ``tendency_normalise`` puts every block on the amplitude of the reference
-lag, without which a stack is dominated by its longest lag and is little more than a
-rescaled copy of it. The reference carries no distinction beyond setting that amplitude:
-choosing a different one rescales every block by one factor, which ``tendency_theta`` already
-spans. Both default to the single-lag term exactly.
-
-``preserve_obs_trace`` is what makes such a stack comparable to the estimator it extends.
-``b_scale`` multiplies the covariance, so a constant factor on that covariance is a
-relabelling of the amplitude a lane sweeps; the ``k - 1`` normalizer and the reference lag's
-own amplitude are both such constants, and neither moves an analysis. Augmenting the
-deviations is not constant: it inflates the prior by an amount that grows with
-``tendency_theta``, so the amplitude that suits the stack moves with the weight and the two
-cannot be read apart. Rescaling the augmented ensemble to the unaugmented one's
-observation-space trace holds the amplitude where it was, which leaves weight and amplitude
-separable and the comparison about which directions the prior carries.
-
-The state and observation conventions are pixel 3DVar's: anomaly space throughout, H is
-nearest-cell selection, and the returned :class:`AnalysisResult` is pixel-space. Both
-covariances carry a Schur taper from the prior that built the static one, except that Sun et
-al. Table 2 give the flow-dependent covariance its own localization lengthscale, tighter
-than the static one as the ensemble shrinks; ``analog_localization_km`` is that lengthscale.
-Their values are radians on another model, grid and network, so the schedule transfers but
-the number does not.
-
-Where the taper is applied is a departure from Sun et al. worth stating. Their Eq. 1 puts
-it on the gain, ``rho o K``, and they assimilate one observation at a time, so no
-observation-space covariance is ever tapered and the taper never has to be positive
-definite. Here both ``P H^T`` and ``H P H^T`` are tapered and the update is a batch one,
-which is what makes ``(I - KH) P`` a posterior covariance and the square-root update
-consistent, and which is why the taper has to be PSD in its own right.
-
-One property of Eq. 5 is worth knowing when reading the posterior spread: the deviations
-start from whatever built the analog covariance but are reduced by a gain that is part
-static, so the mean and the spread come from different mixtures. A square-root update guarantees the
-spread shrinks only when the gain matches the covariance the deviations came from, which
-here holds at ``hybrid_w = 1`` and is approached as the weight rises. At low weight the
-per-cell variance can exceed the analog ensemble's own by a few per cent.
+The deviations are reduced by a partly static gain, so the posterior spread is guaranteed to
+shrink only at ``hybrid_w = 1``; at low weight the per-cell variance can exceed the analog
+ensemble's own by a few per cent.
 """
 
 from __future__ import annotations
@@ -100,12 +54,9 @@ from paleoreco.assim.priors import Prior, taper_obs_blocks
 class _HybridSweepGain:
     """Per-network objects that do not depend on the observation values.
 
-    The static block factorizes once here, as it does for 3DVar. The analog block cannot:
-    it depends on which states the observations select, so it is built in
-    :meth:`HGAOEnKF.apply_sweep`. What can be prepared is everything selection needs
-    (``pool_at_obs``, ``eligible``, ``obs_channel`` for the per-channel correlation rule,
-    and ``static`` for the evidence rule) and the reduced taper the analog blocks are
-    masked with.
+    The static block factorizes once here. The analog block depends on which states are
+    selected, so it is built in :meth:`HGAOEnKF.apply_sweep`; this stages what selection
+    needs and the taper the analog blocks are masked with.
     """
 
     gather: np.ndarray
@@ -121,22 +72,13 @@ class _HybridSweepGain:
 class HGAOEnKF(Method):
     """Analog offline EnKF with a hybrid gain over a fixed background covariance.
 
-    ``pool`` is the archive of candidate states as anomalies about the same mean ``B`` was
-    built from, ``(n_pool, D)``; ``k`` members are drawn from it per assimilation.
-    ``exclude_yr`` drops candidates within that many years of the age being reconstructed,
-    which matters only where the archive spans that age. ``evidence_scale`` is the
-    background amplitude the evidence rule scores against and is unused by the others.
-    ``analog_localization_km`` localizes the analog covariance alone; ``None`` gives it the
-    static covariance's lengthscale, so the two are tapered identically.
-    ``tendency_theta`` weights the archive's local tendency modes into the analog
-    covariance and ``tendency_lag_yr`` is the interval they are differenced over;
-    ``tendency_extra_lags_yr`` differences at further intervals and
-    ``tendency_curvature_yr`` at second differences, both empty by default;
-    ``tendency_normalise`` rescales every block to the reference lag's amplitude, so which
-    lag is the reference sets a scale ``tendency_theta`` already spans;
-    ``preserve_obs_trace`` holds the augmented ensemble at the unaugmented one's
-    observation-space trace, which keeps the flow weight and ``b_scale`` separable.
-    ``redundancy_theta`` charges a candidate for resembling one already selected.
+    ``pool`` holds the candidate states, ``(n_pool, D)``, as anomalies about the mean ``B``
+    was built from; ``k`` members are selected per assimilation. ``exclude_yr`` drops
+    candidates within that many years of the target age. ``evidence_scale`` is used by the
+    evidence rule only. ``analog_localization_km=None`` tapers the analog covariance like
+    the static one. The ``tendency_*`` and ``preserve_obs_trace`` arguments configure MTA,
+    as described in the module docstring; ``redundancy_theta`` is the evidence rule's
+    redundancy penalty.
     """
 
     def __init__(self, pool: np.ndarray, pool_ages: np.ndarray, B: np.ndarray,
@@ -163,26 +105,20 @@ class HGAOEnKF(Method):
             raise ValueError(f"tendency_theta must be non-negative; got {tendency_theta}")
         if tendency_lag_yr < 0.0:
             raise ValueError(f"tendency_lag_yr must be non-negative; got {tendency_lag_yr}")
-        # A weighted tendency with no lag differences a state against itself, which would
-        # be a silent no-op rather than the term the caller asked for.
+        # A zero lag would difference a state against itself: a silent no-op.
         if tendency_theta > 0.0 and tendency_lag_yr <= 0.0:
             raise ValueError("a positive tendency_theta needs a positive tendency_lag_yr; "
                              f"got {tendency_lag_yr}")
         extra = tuple(float(v) for v in tendency_extra_lags_yr)
         curvature = tuple(float(v) for v in tendency_curvature_yr)
-        # A non-positive extra lag differences a state against itself exactly as a
-        # non-positive reference lag would, so it is rejected for the same reason.
         if any(v <= 0.0 for v in extra + curvature):
             raise ValueError("every tendency lag must be positive; got extra "
                              f"{extra} and curvature {curvature}")
-        # Blocks beyond the reference one are weighted by the same theta, so with the term
-        # switched off they would silently be nothing rather than the stack asked for.
+        # Extra blocks share theta, so with theta off they would silently vanish.
         if (extra or curvature) and tendency_theta <= 0.0:
             raise ValueError("extra or curvature tendency lags need a positive "
                              f"tendency_theta; got {tendency_theta}")
-        # Blocks are keyed by lag when their neighbours are looked up but stacked as a
-        # list, so a repeated first difference would be carried twice at full weight
-        # rather than once, which reads as a lag that carries more weight than it was given.
+        # A repeated lag would be stacked twice, doubling its weight.
         if float(tendency_lag_yr) in extra or len(set(extra)) != len(extra):
             raise ValueError("tendency_extra_lags_yr must not repeat a lag or the "
                              f"reference {tendency_lag_yr}; got {extra}")
@@ -190,15 +126,11 @@ class HGAOEnKF(Method):
             raise ValueError(f"tendency_curvature_yr must not repeat a lag; got {curvature}")
         if redundancy_theta < 0.0:
             raise ValueError(f"redundancy_theta must be non-negative; got {redundancy_theta}")
-        # The penalty is a cosine in the coordinates the evidence score whitens by, so it
-        # has no meaning under a rule that never forms them.
+        # The penalty is defined in the evidence rule's whitened coordinates.
         if redundancy_theta > 0.0 and selection != ANALOG_EVIDENCE:
             raise ValueError("redundancy_theta is defined against the evidence rule's "
                              f"whitened score; selection is {selection!r}")
-        # A non-finite or non-positive lengthscale makes every Gaspari-Cohn comparison
-        # false, so the taper returns its pre-allocated zeros and silences the analog
-        # covariance instead of localizing it. The analysis stays finite, so nothing
-        # downstream would surface it.
+        # A non-positive or non-finite lengthscale would silently zero the analog taper.
         if analog_localization_km is not None and not (
                 np.isfinite(analog_localization_km) and analog_localization_km > 0.0):
             raise ValueError("analog_localization_km must be positive and finite, or None "
@@ -216,10 +148,8 @@ class HGAOEnKF(Method):
         self.evidence_scale = float(evidence_scale)
         self.taper_meta = {key: taper_meta[key]
                            for key in ("localization_km", "shrinkage_lambda", "alpha")}
-        # Only the lengthscale is separable. Inheriting the shrinkage and the channel
-        # coupling is a tuning-cost decision rather than the better estimate: a k-member
-        # covariance is more undersampled than the static one, not less, so on sampling
-        # grounds it would want more shrinkage, not the same.
+        # Only the lengthscale can differ; shrinkage and coupling are inherited to limit
+        # tuning cost.
         self.analog_localization_km = analog_localization_km
         self.analog_taper_meta = dict(self.taper_meta)
         if analog_localization_km is not None:
@@ -231,20 +161,16 @@ class HGAOEnKF(Method):
         self.tendency_normalise = bool(tendency_normalise)
         self.preserve_obs_trace = bool(preserve_obs_trace)
         self.redundancy_theta = float(redundancy_theta)
-        # One block per (lag, order). The reference lag leads, so it is the amplitude the
-        # others are normalised against and the single-lag term is the head of the list.
+        # One (lag, is_second_order) block each; the reference lag leads the list.
         self._tendency_blocks = (
             tuple([(self.tendency_lag_yr, False)]
                   + [(lag, False) for lag in extra]
                   + [(lag, True) for lag in curvature])
             if self.tendency_theta > 0.0 else ())
-        # The neighbours depend on the archive's age axis alone, so they are the same for
-        # every network and every analysis this estimator runs.
+        # Neighbours depend only on the age axis, so they are computed once.
         self._tendency_pair = {lag: self._tendency_neighbours(lag)
                                for lag, _ in self._tendency_blocks}
-        # Every block is put on the reference block's amplitude, so each amplitude is measured
-        # once over the pool rather than once per block it is compared against. A difference
-        # over a longer lag is larger, and an unnormalised stack is dominated by its longest.
+        # Without normalisation the longest lag, having the largest differences, dominates.
         self._tendency_scale = {}
         if self.tendency_normalise and self._tendency_blocks:
             amplitude = {block: self._block_amplitude(block) for block in self._tendency_blocks}
@@ -264,11 +190,8 @@ class HGAOEnKF(Method):
                     eligible: np.ndarray | None) -> np.ndarray:
         """Raw difference rows for one (lag, order) block, before centring or weighting.
 
-        The neighbour lookup clamps at the archive's ends, so a row there spans less than the
-        nominal interval. Dividing a first difference through the interval actually differenced
-        carries it at the block's own amplitude, leaving an end row a one-sided difference
-        rather than a centred one shrunk towards zero. A second difference has no such reading:
-        with one arm clamped it collapses towards a first difference, so those rows drop out.
+        Neighbours clamp at the archive's ends. A first difference there is rescaled to the
+        nominal interval; a second difference with a clamped arm is dropped.
         """
         lag, second = block
         lo, hi = self._tendency_pair[lag]
@@ -277,9 +200,8 @@ class HGAOEnKF(Method):
         if eligible is not None:
             keep = keep & eligible[a] & eligible[b]
         if second:
-            # Tested on the age asked for rather than the interval returned: a lag that is not
-            # a whole number of archive steps rounds one arm short for every member, which
-            # would empty the block instead of trimming the ends the archive cannot span.
+            # Tested on the requested ages, so a lag that is not a whole number of steps
+            # does not empty the block.
             age = self.pool_ages[members]
             keep = (keep & (age - lag >= self.pool_ages.min())
                     & (age + lag <= self.pool_ages.max()))
@@ -288,8 +210,7 @@ class HGAOEnKF(Method):
         if second:
             return (self.pool[b[keep]] - 2.0 * self.pool[members[keep]]
                     + self.pool[a[keep]])
-        # The factor is 1 wherever both arms are whole, so an interior row is the centred
-        # difference it always was.
+        # The factor is 1 for interior rows.
         span = (self.pool_ages[b] - self.pool_ages[a])[keep]
         return (0.5 * (self.pool[b[keep]] - self.pool[a[keep]])
                 * (2.0 * lag / span)[:, None])
@@ -297,8 +218,7 @@ class HGAOEnKF(Method):
     def _block_amplitude(self, block: tuple[float, bool]) -> float:
         """Rms of one block's difference rows over the whole pool.
 
-        Measured on the pool rather than per analysis, so it is a property of the archive
-        and does not move with the observations.
+        A property of the archive, independent of the observations.
         """
         rows = self._block_rows(np.arange(len(self.pool)), block, None)
         return float(np.sqrt((rows ** 2).mean())) if len(rows) else 0.0
@@ -307,12 +227,8 @@ class HGAOEnKF(Method):
                        eligible: np.ndarray | None) -> np.ndarray:
         """Centred tendency deviations for the selected members, one block per lag.
 
-        A member contributes nothing to a block where the exclusion band rules out either
-        neighbour, which is what stops a lane whose archive spans the analysis age from
-        reaching back inside that band through the tendency, nothing where the two
-        neighbours coincide and there is no interval to difference, and nothing to a
-        curvature block where the archive's end leaves it one short arm. The test is per
-        block, so a long lag can drop a member that a short one keeps.
+        A member is dropped from a block when either neighbour falls in the exclusion band,
+        when its neighbours coincide, or when a second difference runs off the archive.
         """
         rows = []
         for block in self._tendency_blocks:
@@ -331,9 +247,7 @@ class HGAOEnKF(Method):
                        gain: _HybridSweepGain) -> float:
         """Factor holding ``dev`` at ``base``'s trace in whitened observation space.
 
-        The gain reads the ensemble only through ``H X'`` against R, so matching that
-        trace is what leaves ``b_scale`` meaning the amplitude it meant before the extra
-        rows were added. Returns 1.0 where the augmented ensemble is already the base one.
+        Keeps ``b_scale`` meaning the same amplitude with and without the extra rows.
         """
         g, r = gain.gather, gain.r_diag
         t_base = float(((base[:, g] ** 2) / r[None, :]).sum())
@@ -346,8 +260,7 @@ class HGAOEnKF(Method):
                       b_scales: np.ndarray, *, age: float | None = None) -> _HybridSweepGain:
         """Factorize the static gain and stage everything selection needs.
 
-        ``age`` is the age being reconstructed; it drives the exclusion band, and is unused
-        where the archive is disjoint from the target in time.
+        ``age`` is the target age, used for the exclusion band.
         """
         g = np.asarray(gather)
         n_cells = self.shape[1] * self.shape[2]
@@ -363,9 +276,7 @@ class HGAOEnKF(Method):
     def select(self, gain: _HybridSweepGain, y_anom: np.ndarray) -> np.ndarray:
         """Pool indices of the analog ensemble for one observation vector.
 
-        Exposed rather than kept inside the analysis so a driver can record which states
-        were chosen; the selection is a pure function of the observations, so recomputing
-        it costs one pass over the pool at the observation cells.
+        Public so a driver can record which states were chosen.
         """
         if self.selection in (ANALOG_CORRELATION, ANALOG_CORRELATION_PERCHAN):
             per_chan = self.selection == ANALOG_CORRELATION_PERCHAN
@@ -373,8 +284,7 @@ class HGAOEnKF(Method):
                                        channel=gain.obs_channel if per_chan else None,
                                        eligible=gain.eligible)
         if self.selection == ANALOG_EVIDENCE:
-            # The static block is already factorized for the gain, so the marginal
-            # likelihood costs one product over the pool rather than a second solve.
+            # Reuses the static factorization, so no second solve.
             return evidence_indices(gain.pool_at_obs, y_anom, gain.static, self.k,
                                     eligible=gain.eligible, scale=self.evidence_scale,
                                     redundancy=self.redundancy_theta)
@@ -385,9 +295,7 @@ class HGAOEnKF(Method):
                     background_anom: np.ndarray) -> list[AnalysisResult]:
         """Analysis at every ``b_scale`` for one innovation, one result per ``b_scale``.
 
-        ``b_scale`` scales both covariances, so it keeps its meaning as the amplitude of
-        the background relative to the observations; the ensemble deviations scale with its
-        square root to match.
+        ``b_scale`` scales both covariances.
         """
         g = gain.gather
         selected = self.select(gain, y_anom)
@@ -399,10 +307,8 @@ class HGAOEnKF(Method):
             if self.preserve_obs_trace:
                 dev = dev * self._trace_rescale(base, dev, gain)
         h_dev = dev[:, g].T                                   # (m, n_dev)
-        # The normalizer counts the members, not the rows: the tendency rows are extra
-        # directions added to the same k-member ensemble, so at zero weight they contribute
-        # nothing and the covariance is the published one exactly. Counting the rows instead
-        # would scale both blocks by one constant, which b_scale already spans.
+        # Normalised by the k members, not the rows: tendency rows are extra directions on
+        # a k-member ensemble, not extra members.
         P_obs = (dev.T @ h_dev.T) / (self.k - 1.0)            # B_a H^T, never B_a itself
         S_obs = (h_dev @ h_dev.T) / (self.k - 1.0)            # H B_a H^T
         if gain.taper is not None:
@@ -421,11 +327,7 @@ class HGAOEnKF(Method):
                          + (1.0 - w) * mean_gain_apply(gain.static, b, d))
             post = dev.T - (w * sqrt_gain_apply(analog, b, h_dev)
                             + (1.0 - w) * sqrt_gain_apply(gain.static, b, h_dev))
-            # Normalized by the members for the reason P_obs is: the tendency rows are extra
-            # directions on one k-member ensemble, not extra members. Counting the rows would
-            # state a posterior spread on a scale the prior it is read against never used.
-            # Each block is centred, so no mean is removed, and where the stack is off this
-            # is the sample variance over the k members.
+            # Normalised by k as P_obs is; every block is centred, so no mean is removed.
             scale = b / (self.k - 1.0)
             out.append(AnalysisResult(
                 mean_anom=x_a.reshape(self.shape),
@@ -451,9 +353,7 @@ def make_hgaoenkf(
 ):
     """A method factory building :class:`HGAOEnKF` from a built prior.
 
-    The candidate pool is recovered from ``prior.ages`` rather than passed alongside, so it
-    is always the same states, in the same anomaly frame, that the prior's covariance was
-    built from.
+    The pool is taken from ``prior.ages``, so it is always the states B was built from.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
 

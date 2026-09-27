@@ -1,11 +1,9 @@
-"""HGAOEnKF-MT: the analog ensemble augmented with a multiscale flow stack.
+"""MTA-HGAOEnKF: the evidence-rule ensemble with multiscale tendency augmentation.
 
-Selection makes the k analogs agree precisely in the directions the observations
-constrain, so the covariance is flattest exactly where the gain leans hardest. The
-archive's own rate of change never had to agree with anything and restores spread there,
-and D-O variability has structure across timescales that a single difference cannot
-sample. The stack defines the estimator and is swept separately rather than tuned; the
-grid varies its weight, whose zero corner drops it.
+Selection makes the k analogs agree in the directions the observations constrain, so the
+analog covariance is flattest where the gain relies on it most. MTA restores spread there
+from the archive's own first and second differences at several lags. The lags are fixed;
+the grid sweeps the weight theta, whose zero corner is HGAOEnKF with the evidence rule.
 """
 
 from __future__ import annotations

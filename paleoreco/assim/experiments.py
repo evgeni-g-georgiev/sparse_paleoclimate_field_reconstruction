@@ -1,62 +1,23 @@
-"""Experiment runners for data-assimilation reconstruction.
+"""Runners for the three evaluation lanes, and the grids that tune over them.
 
-Three evaluation lanes, all method-agnostic through the :class:`Method` contract:
+* :func:`run_ppe`: the pseudo-proxy snapshot lane. The older half of the archive builds the
+  prior; each younger-half state is a truth, observed through two real network geometries,
+  one selecting the operating point and one reporting it.
+* :func:`run_trajectory`: the pseudo-proxy time series lane. The same split, reconstructed in
+  sequence, with each observation read at its own sample's offset in time, so skill can be
+  resolved by timescale.
+* :func:`run_withholding`: the real-proxy lane. Nested cross-validation over proxy sites.
 
-* :func:`run_ppe` - same-model pseudo-proxy experiments: the prior cube is split
-  chronologically, B and the climatology come from one half, and truths are drawn from
-  the other. Each truth borrows two real-proxy network shapes and one noise vector each,
-  the first selecting ``b_scale`` and the second reporting it.
-* :func:`run_withholding` - nested cross-validation over proxy sites: select
-  ``b_scale`` on a held-out fold, report on a fresh fold.
-* :func:`run_trajectory` - a consecutive run of states, differing from the lane above in
-  two things: an observation reads the state at its own sample's offset in time rather
-  than at the analysis age, and the reported arm assimilates the network the age actually
-  has. The first is what lets it score skill by timescale, which the other two lanes
-  cannot, since they grade one snapshot at a time.
+The ``*_pixel_grid`` wrappers tune the covariance taper jointly with ``b_scale``; the
+``run_hgaoenkf_*`` wrappers tune the analog ensemble size and hybrid weight at an inherited
+taper. Both keep fields for the winning configuration only.
 
-:func:`run_ppe_pixel_grid` and :func:`run_withholding_pixel_grid` wrap these over a
-coarse localization/shrinkage/coupling grid, jointly selecting the operating point with
-``b_scale`` on the held-out selection split and persisting only the winning config's
-fields. :func:`run_hgaoenkf_ppe_grid` and :func:`run_hgaoenkf_withholding_grid` do the
-same over the analog ensemble size and hybrid weight, at a taper those grids already
-settled and under one analog selection rule, which names the estimator through
-:func:`hgaoenkf_estimator`; :func:`run_hgaoenkf_withholding_variants` scores how the
-ensemble is chosen.
-
-A row's ``method`` composes the estimator with its treatment of observation staleness
-(:func:`method_label`), so several estimators share one schema without colliding and every
-row says which pair of choices produced it. ``analog_k`` and ``hybrid_w`` carry the analog
-parameters and are NaN for an estimator that draws no ensemble.
-
-Each writes a tidy long-format metrics CSV (one row per method/space/localization_km/
-shrinkage_lambda/alpha/analog_k/hybrid_w/lane/fold/b_scale/background/split/do_event/
-channel/metric), the analysis fields as npz, and a config.json. ``b_scale`` is the background-covariance
-amplitude the analysis used; ``split`` is ``selection`` (used to pick the operating
-point) or ``test`` (reported). The withholding lane uses ``R = diag(sse + rep_var)``,
-adding the per-channel representativeness variance so a point proxy is not trusted to
-resolve its grid cell exactly; the pseudo-proxy lane keeps ``diag(sse)`` because its
-synthetic observations sample the exact grid cell. Scoring is in anomaly space; CE,
-RMSE, and correlation are shift-invariant so the anomaly-space values equal their degC
-counterparts.
-
-The withholding and trajectory lanes also carry the temporal twin of ``rep_var``: a
-sample is dated to a block rather than to a moment, so it reports on a state some way off
-in time from the one it is assimilated at. ``temporal_modes`` chooses which treatments of
-that to score, from leaving it alone through charging it as extra observation error to
-also correcting the attenuation a lagged state carries, so the treatments sit side by side
-in one schema and any two are paired over the same ages. A lane comparing estimators holds
-the treatment fixed instead, which keeps the difference between them the estimator. The
-PPE lane stays out of it: its observations read the state being reconstructed, which is
-what makes it the no-staleness reference the trajectory lane is read against.
-
-Every lane emits skill metrics (``ce``, ``corr``, ``rmse``, ``rrmse``, ``amplitude``,
-plus field-only ``ssim``) and calibration metrics (``crps``, ``crpss``, ``rcrv_bias``,
-``rcrv_dispersion``, ``coverage90``), scored against the prior ``N(0, b_scale diag B)``
-as the CRPSS reference so it matches CE's climatology baseline. Every lane also carries
-prior-free ``nearest``/``idw`` reference rows, tagged ``background="none"``, which is the
-context a bare CE cannot supply. The trajectory lane adds timescale-resolved metrics,
-named ``{corr,ce,amp}_lp{window}`` for the low-pass series and ``..._bp{a}_{b}`` for a
-band, keeping the timescale in the metric name so the row schema is unchanged.
+Every lane writes a long-format ``metrics.csv`` (one row per configuration, ``b_scale``,
+split, event, channel and metric), an analysis npz and a config.json. ``split`` is
+``selection`` (used to choose the operating point) or ``test`` (reported). A row's ``method``
+combines the estimator with its treatment of observation staleness (:func:`method_label`).
+Scoring is in anomaly space. Prior-free ``nearest`` and ``idw`` reference rows are tagged
+``background="none"``.
 """
 
 from __future__ import annotations
@@ -99,93 +60,59 @@ from paleoreco.assim.priors import Prior, build_prior, great_circle_km_between
 from paleoreco.assim.threedvar import ThreeDVar
 from paleoreco.eval import calibration, da
 
-# A method factory turns a built prior and the field shape into an estimator, so a
-# lane can run pixel 3DVar or a latent method behind one call. The estimator must
-# expose the sweep surface (prepare_sweep / apply_sweep / post_var_sweep) and return
-# pixel-space AnalysisResult, like ThreeDVar.
+# Builds an estimator from a prior and the field shape. The estimator must provide
+# prepare_sweep and apply_sweep and return AnalysisResult objects.
 MethodFactory = Callable[[Prior, "tuple[int, int, int]"], Method]
 
 B_SCALES = (0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
-# Coarse tuning grid for the pixel regularizer (localization / shrinkage / channel
-# coupling); ``None`` localization is "off", the raw sample covariance. Lengthscales are
-# chordal, so they are read against the 12742 km diameter rather than the 20015 km of arc
-# between antipodes: a value above the diameter still damps, it just never reaches zero.
+# Taper grid (localization, shrinkage, channel coupling); ``None`` means no localization.
+# Lengthscales are chordal, so the relevant scale is the 12742 km diameter.
 LOCALIZATION_KM_GRID = (None, 12500.0, 20000.0)
 SHRINKAGE_GRID = (0.0, 0.25, 0.5)
 ALPHA_GRID = (0.0, 0.5, 1.0)
 SEL_TOL = 0.0   # 0 = pure argmin of selection RRMSE; >0 prefers the simpler config within this relative band
-# Analog-ensemble tuning grid: how many prior states form the ensemble, and how much of
-# the gain their covariance carries against the static one. The weight spans Sun et al.'s
-# whole family, from their AOEnKF-B at 0 to their AOEnKF at 1, so the published ablation
-# ladder falls out of the sweep rather than needing separate runs.
+# Analog grid: ensemble size and hybrid weight. The weight spans Sun et al.'s AOEnKF-B (0)
+# to AOEnKF (1).
 K_GRID = (20, 40, 60, 100)
 HYBRID_W_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
-# The two terms that extend the analog scheme, each swept from off. The tendency weight
-# scales the archive's local rate of change into the analog covariance and the lag is the
-# interval it is differenced over; the redundancy penalty charges a candidate for
-# resembling one already selected. Zero on both axes is the published estimator, so the
-# ablation is a set of rows in the same grid rather than a separate run.
+# Grids for the extension terms. Zero on every axis is the published estimator.
 TENDENCY_THETA_GRID = (0.0, 1.0)
 TENDENCY_LAG_YR_GRID = (200.0, 400.0)
-# The redundancy penalty is held off rather than swept. It buys a covariance that spans
-# more directions by passing over the candidates that fit best, so it trades the quality of
-# the ensemble mean for the quality of the ensemble spread. That trade only pays where the
-# gain is large enough for the covariance to carry the analysis: the PPE lane selects
-# ``b_scale`` 2-5 and the penalty wins there, but the trajectory lane's observations are
-# stale enough that it selects 0.3, and at that amplitude the analysis is close to the
-# prior mean alone, so the penalty is a cost with nothing to set against it. Held at zero
-# it is nested away, and the estimator that remains extends the published one through the
-# tendency term alone. The rule keeps its ``redundancy`` argument, so restoring the axis
-# here is all that a sweep needs.
+# The redundancy penalty is held at zero rather than swept.
 REDUNDANCY_THETA_GRID = (0.0,)
-# The timescales multiscale tendency augmentation differences the archive over. A single
-# lag samples a single band of variability, and the reference lag sets the amplitude the
-# other blocks are normalised against, so moving it is equivalent to rescaling the weight.
-# The stack is a property of the estimator rather than an axis: tuning it as well would add
-# a knob the estimator it extends never had, which is what the weight grid is for.
+# The MTA lags, fixed a priori rather than tuned; only the weight theta is gridded.
 MT_REFERENCE_LAG_YR = 400.0
 MT_EXTRA_LAGS_YR = (200.0, 800.0, 1200.0, 1600.0, 2400.0, 3200.0)
 MT_CURVATURE_YR = (400.0, 1600.0)
 MT_THETA_GRID = (0.0, 1.0, 2.0)
-# Stacks a sensitivity pass scores the shipped one against, as ``(extra lags, curvature)``.
-# All run at the same weight and the same observation-space trace, so the only difference
-# between them is the set of timescales. ``1lag`` is the single-difference term.
+# Stacks the sensitivity pass compares, as ``(extra lags, curvature)``. ``1lag`` is the
+# single first difference.
 MT_STACKS = {
     "1lag": ((), ()),
     "3lag": ((800.0, 1600.0), ()),
     "7lag": (MT_EXTRA_LAGS_YR, ()),
     "7lag_curv": (MT_EXTRA_LAGS_YR, MT_CURVATURE_YR),
 }
-# Width of the band around the analysis age dropped from the analog pool, and the widths
-# a sensitivity pass sweeps. Only bites where the prior spans the age being reconstructed.
+# Exclusion band around the target age, and the widths the sensitivity pass sweeps.
 EXCLUDE_YR = 1000.0
 EXCLUDE_YR_GRID = (0.0, 1000.0, 2000.0)
-# Lengthscales for the analog covariance's own taper, swept at a fixed (k, hybrid_w).
-# ``None`` is whatever the static covariance carries, so the grid brackets both that value
-# and the tighter one Sun et al. (2024) Table 2 predicts as the ensemble shrinks.
+# Lengthscales for the analog covariance's own taper; ``None`` inherits the static one.
 ANALOG_LOCALIZATION_GRID_PPE = (None, 5000.0, 8000.0, 12500.0, 20000.0)
-# Observations a borrowed network must carry to be drawn. The thinnest proxy ages hold a
-# handful of sites, and an analysis built on those says nothing about the estimator.
+# Minimum observations for a network to be drawn.
 MIN_OBS = 10
 # Attempts to find a borrowed network whose offsets stay on the archive at one age.
 _MAX_SHAPE_DRAWS = 20
 LANE_PPE = "ppe"
 LANE_TRAJECTORY = "trajectory"
 
-# Which estimator produced a row. The method label composes it with the treatment of
-# observation staleness, so two estimators can share the metrics CSV without colliding and
-# every row still says which pair of choices it came from.
+# Estimator tags, combined with the staleness treatment by :func:`method_label`.
 ESTIMATOR_3DVAR = "3dvar"
 ESTIMATOR_HGAOENKF = "hgaoenkf"
-# The analog estimator carrying a multiscale flow stack. It selects by the same rule as the
-# tag below it, so it is named here rather than derived from a selection rule.
+# MTA-HGAOEnKF.
 ESTIMATOR_HGAOENKF_MT = f"{ESTIMATOR_HGAOENKF}_mt"
 _TEMPORAL_SUFFIX = {TEMPORAL_OFF: "", TEMPORAL_ADD: "_temporal_add",
                     TEMPORAL_DEFLATE: "_temporal_deflate"}
-# Estimator tag per analog selection rule. The map is explicit rather than derived from the
-# rule string so a tag can be renamed without renaming the rule it selects by: the baseline
-# is the published one and holds the bare name, and the rule with no published counterpart
-# is tagged for what it is rather than for how it scores.
+# Estimator tag per selection rule; the published misfit rule keeps the bare name.
 _HGAOENKF_TAG = {
     ANALOG_MISFIT: ESTIMATOR_HGAOENKF,
     ANALOG_EVIDENCE: f"{ESTIMATOR_HGAOENKF}_evidence",
@@ -204,17 +131,11 @@ def hgaoenkf_estimator(selection: str) -> str:
     return _HGAOENKF_TAG[selection]
 
 
-# One method label per treatment, so the three sit side by side in the shared row schema
-# and every comparison between them is paired over the same ages.
 METHOD_BASE = method_label(ESTIMATOR_3DVAR)
 TEMPORAL_METHODS = {method_label(ESTIMATOR_3DVAR, mode): mode for mode in TEMPORAL_MODES}
 
-# Timescales the trajectory lane resolves. Low-pass keeps everything slower than the
-# window, so it is cumulative and reads high wherever the slow components carry the
-# variance; a band subtracts one low-pass from another and is the honest per-timescale
-# view. Both are reported.
-# Edge trimming costs a full window at each end, so a band wider than the run leaves
-# nothing to score.
+# Timescales the trajectory lane resolves. A low-pass window keeps everything slower than
+# it; a band is the difference of two low-passes and isolates one timescale.
 LOWPASS_WINDOWS = (25, 100, 250, 500, 1000, 2000)
 BANDS = ((25, 100), (100, 250), (250, 500), (500, 1000), (1000, 2000))
 # Metrics the RRMSE selection never reads, so a grid scan computes them for the winner only.
@@ -223,12 +144,9 @@ _FULL_METRICS = frozenset({"ssim", "crps", "crpss", "rcrv_bias", "rcrv_dispersio
 
 # Taper columns for prior-free (naive) rows, which carry no regularizer.
 _NAN_REG = {"localization_km": np.nan, "shrinkage_lambda": np.nan, "alpha": np.nan}
-# The extension terms, named once so a row's columns cannot drift from the keywords the
-# estimator was built with.
+# The extension terms, named once so row columns match the estimator keywords.
 TERM_KEYS = ("tendency_theta", "tendency_lag_yr", "redundancy_theta")
-# How the flow stack was built, recorded so a row says which estimator wrote it. These stay
-# out of TERM_KEYS: that tuple drives the grid's winner selection, and neither switch is
-# tuned, so admitting them there would add axes to a search that does not vary them.
+# MTA switches recorded on each row; not in TERM_KEYS because they are not tuned.
 _STACK_KEYS = ("tendency_normalise", "preserve_obs_trace")
 # Analog-ensemble columns for rows from an estimator that draws no analog ensemble.
 _NAN_ANALOG = {"analog_k": np.nan, "hybrid_w": np.nan,
@@ -241,10 +159,8 @@ def analog_cols(k: int, hybrid_w: float, *, tendency_theta: float = 0.0,
                 preserve_obs_trace: bool = False) -> dict:
     """The analog columns for a row, as :func:`_NAN_REG` does for the taper.
 
-    The extension terms default to off, which is what an estimator that does not carry
-    them is: a row saying zero and a row from before they existed mean the same thing.
-    The two switches are booleans on the estimator and floats here, so one column type
-    serves every analog column and a reader can compare them without a cast.
+    The extension terms default to off. The two switches are stored as floats so every
+    analog column shares one type.
     """
     return {"analog_k": float(k), "hybrid_w": float(hybrid_w),
             "tendency_theta": float(tendency_theta),
@@ -260,11 +176,8 @@ def analog_cols(k: int, hybrid_w: float, *, tendency_theta: float = 0.0,
 def _obs_geometry(o: dict, lats: np.ndarray, lons: np.ndarray, safe_flat: np.ndarray) -> dict:
     """Gather indices, error variance, site coords and block centres for usable observations.
 
-    ``keep`` is the mask the other fields were filtered by, so a caller can carry an
-    extra column of ``o`` through the same filter without restating the rule. ``centre``
-    is the midpoint of each sample's dating block, which an observation operator needs to
-    know how far in time the sample sits from the state it is used to constrain; it is
-    absent where the caller did not attach one.
+    ``keep`` is the filter mask, so a caller can apply it to other columns of ``o``.
+    ``centre`` is each sample's dating-block midpoint, present only if the caller attached it.
     """
     gather = obs_cell_index(o["lat"], o["lon"], o["channel"], lats, lons)
     keep = safe_flat[gather] & (o["sse"] > 0)
@@ -285,12 +198,8 @@ def _draw_shapes(long: pd.DataFrame, rng: np.random.Generator,
                  n: int, min_obs: int) -> list[tuple[int, dict]]:
     """``n`` distinct proxy ages and their networks, each holding at least ``min_obs`` rows.
 
-    Drawn from the shared ``rng`` so a run is reproducible from its seed; an age
-    contributes only network geometry, not any climate time. The floor matters because the
-    thinnest ages carry a handful of sites, and an analysis built on those says nothing
-    about the estimator. The source age rides along because a borrowed sample's distance in
-    time is an offset within its own network, not the absolute date its block centre
-    carries.
+    An age contributes only its network geometry. The source age is returned because a
+    borrowed sample's time offset is relative to its own network's age.
     """
     picked = []
     for a in rng.permutation(long["age"].unique()):
@@ -310,8 +219,7 @@ def _draw_shapes(long: pd.DataFrame, rng: np.random.Generator,
 def _pad_obs(test_obs: list[dict], T: int) -> tuple[np.ndarray, ...]:
     """Ragged per-truth test-shape obs to padded ``(T, max_obs)`` arrays for npz.
 
-    ``obs_n`` gives the real count per truth so the field gallery can drop the padding
-    when overlaying the assimilated sites.
+    ``obs_n`` is the real count per truth, so a reader can drop the padding.
     """
     max_obs = max((len(o["val"]) for o in test_obs), default=0)
     obs_lat = np.full((T, max_obs), np.nan)
@@ -335,9 +243,8 @@ def _pad_obs(test_obs: list[dict], T: int) -> tuple[np.ndarray, ...]:
 def _naive_geometry(lats: np.ndarray, lons: np.ndarray, geom: dict, n_chan: int) -> list:
     """Per-channel nearest index and IDW weights mapping obs values to a field.
 
-    The distances depend only on the network, not the observed values, so they are
-    built once and applied to every noisy/corrupted observation vector by
-    :func:`_naive_apply`. Channels with no observations get ``None``.
+    Depends only on the network, so it is built once per network. Channels with no
+    observations get ``None``.
     """
     n_lat, n_lon = len(lats), len(lons)
     lat_cell = np.repeat(lats, n_lon)
@@ -377,10 +284,8 @@ def _naive_obs_predictions(assim: dict, target: dict, n_chan: int) -> tuple[dict
     """Prior-free predictions at withheld sites, and each one's distance to the nearest
     assimilated site.
 
-    No field is built, unlike :func:`_naive_geometry`: withholding only ever reads the
-    reconstruction at the withheld sites, so one per-channel great-circle block between
-    target and assimilated sites yields both baselines and the void distance. A channel
-    with no assimilated observation keeps the climatological zero.
+    No field is built: withholding only reads predictions at the withheld sites. A channel
+    with no assimilated observation predicts zero.
     """
     n_t = len(target["lat"])
     out = {"nearest": np.zeros(n_t), "idw": np.zeros(n_t)}
@@ -454,12 +359,9 @@ def _calibration_rows(truth: np.ndarray, mean: np.ndarray, var: np.ndarray,
                       ref_var: np.ndarray, groups: list, base: dict) -> list[dict]:
     """CRPS / CRPSS / RCRV / coverage rows over flat, aligned arrays.
 
-    ``groups`` is ``(do_event, channel_name, mask)`` triples, so a field lane can group by
-    event and channel while an observation lane groups by channel alone. ``var`` is the
-    predictive variance the residual is scored against: the posterior variance for a
-    noise-free truth, plus the observation error when the truth is itself a measurement.
-    The CRPSS reference is the prior ``N(0, ref_var)``, the same do-nothing forecast CE
-    scores against.
+    ``groups`` is ``(do_event, channel_name, mask)`` triples. ``var`` is the predictive
+    variance: the posterior variance for a noise-free truth, plus the observation error
+    when the truth is a measurement. The CRPSS reference is the prior ``N(0, ref_var)``.
     """
     crps_model = calibration.crps_gaussian(truth, mean, var)
     crps_ref = calibration.crps_gaussian(truth, np.zeros_like(truth), ref_var)
@@ -486,9 +388,8 @@ def _field_calibration_rows(truth_anom: np.ndarray, recon_anom: np.ndarray,
                             base: dict) -> list[dict]:
     """Calibration rows in field space, for one ``b_scale`` of a PPE lane.
 
-    Flattens over (truth, channel, valid cell) once and masks per group so the event and
-    channel breakdowns share one CRPS evaluation. The truth is a model state carrying no
-    observation error, so the predictive variance is the posterior variance alone.
+    The truth is a model state with no observation error, so the predictive variance is
+    the posterior variance alone.
     """
     t = truth_anom[:, :, safe_valid]
     r = recon_anom[:, :, safe_valid]
@@ -508,11 +409,8 @@ def _ssim_rows(truth_anom: np.ndarray, recon_anom: np.ndarray, safe_valid: np.nd
                events: np.ndarray, base: dict) -> list[dict]:
     """Masked SSIM rows, per channel and pooled, for all ages and per event.
 
-    Field space only: SSIM is a 2-D structural metric with no observation-space
-    analogue. ``data_range`` is per channel over the valid cells of the whole truth
-    stack, fixed so per-truth SSIMs share the stabilising constants and average.
-    The ``pooled`` channel is the mean of the per-channel SSIMs (multichannel SSIM),
-    not the concatenation pooling used for CE/RMSE.
+    ``data_range`` is fixed per channel over the whole truth stack, so per-truth SSIMs are
+    comparable. ``pooled`` is the mean of the per-channel SSIMs.
     """
     rows = []
     groups = _event_groups(events)
@@ -537,9 +435,8 @@ def _timescale_metric_rows(truth_f: np.ndarray, recon_f: np.ndarray, safe_valid:
                            trim: int, suffix: str, base: dict) -> list[dict]:
     """Median per-cell corr / CE / amplitude of one filtered truth-recon pair.
 
-    The median over cells rather than a pooled or regional statistic: after a wide
-    filter a regional index retains few independent points and its correlation swings
-    on the handful that remain.
+    A median over cells, since after a wide filter a pooled statistic has few independent
+    points.
     """
     n = len(truth_f)
     if n - 2 * trim < 3:
@@ -563,9 +460,8 @@ def _timescale_rows(truth_anom: np.ndarray, recon_anom: np.ndarray, safe_valid: 
                     base: dict, *, step_yr: float, windows, bands) -> list[dict]:
     """Skill by timescale for a consecutive run of states.
 
-    Emits ``{corr,ce,amp}_lp{window}`` from the low-pass series and ``..._bp{a}_{b}``
-    from the difference of two, which is the only view that separates skill at one
-    timescale from skill inherited off a slower component carrying most of the variance.
+    Emits ``{corr,ce,amp}_lp{window}`` for each low-pass series and ``..._bp{a}_{b}`` for
+    each band.
     """
     lp_t = {w: da.lowpass_time(truth_anom, w, step_yr) for w in set(windows) | {b for ab in bands for b in ab}}
     lp_r = {w: da.lowpass_time(recon_anom, w, step_yr) for w in lp_t}
@@ -584,19 +480,15 @@ def _timescale_rows(truth_anom: np.ndarray, recon_anom: np.ndarray, safe_valid: 
 def _append_csv(path: str, rows: list[dict]) -> None:
     """Append metric rows to the tidy CSV, reconciling a file written to a narrower schema.
 
-    A plain append writes the header only for a new file, so rows carrying a column the
-    file predates would land one field out of step from the first extra column onward, and
-    nothing downstream would surface it. Where the headers already agree, which is every
-    append within one schema, only the header is read.
+    Rows with a column the file lacks would otherwise be misaligned, so the file is
+    rewritten with the wider header. When the headers agree only the header is read.
     """
     df = pd.DataFrame(rows)
     if os.path.exists(path):
         header = list(pd.read_csv(path, nrows=0).columns)
         if header != list(df.columns):
-            # Ordered by the incoming rows rather than by the file, so the reconciled
-            # header is the one the next append will bring and the rewrite happens once
-            # instead of on every append thereafter. Written aside and moved into place,
-            # since a rewrite interrupted midway would otherwise lose the whole lane.
+            # Ordered by the incoming rows so the rewrite happens once. Written to a
+            # temporary file and moved, so an interrupted rewrite loses nothing.
             cols = list(df.columns) + [c for c in header if c not in df.columns]
             merged = pd.concat([pd.read_csv(path), df], ignore_index=True)[cols]
             tmp = f"{path}.tmp"
@@ -629,24 +521,16 @@ def _score_ppe_lane(
 ) -> tuple[list[dict], dict, dict]:
     """Score a built prior against a stack of truth anomalies (no file writes).
 
-    Returns ``(rows, npz_arrays, skill)``: the tidy metric rows, the analysis-npz dict,
-    and the skill-vs-distance dict; :func:`_write_ppe_artifacts` persists them.
+    Returns ``(rows, npz_arrays, skill)``, which :func:`_write_ppe_artifacts` persists.
 
-    Every truth draws two real-proxy network shapes and one noise vector each: the first
-    shape is the ``selection`` split, the second the ``test`` split. Metric rows for both
-    span the whole ``b_scales`` sweep (``split`` column), so the operating point is chosen
-    against observations the reported analysis never saw. R is ``diag(sse)`` and each
-    pseudo-observation is the truth at its nearest cell plus ``N(0, sse)`` noise: the
-    synthetic network samples the exact grid cell, so it carries no representativeness
-    error to model. Single climatological background. ``make_method`` selects the estimator
-    (default pixel :class:`ThreeDVar`); ``space``/``reg_cols`` tag the rows, as do
-    ``estimator`` (which names the rows' method) and ``method_cols`` (the analog columns,
-    absent for a static-covariance estimator). ``full_metrics=False`` skips the field SSIM,
-    the calibration rows and the skill-vs-distance curve, none of which feed the RRMSE
-    selection, which is the saving a grid scan takes.
-
-    Calibration is scored on the test shape only, where the posterior variance is kept,
-    and against the noise-free truth so the predictive variance is the posterior alone.
+    Each truth draws two real network shapes with independent noise: the first is the
+    ``selection`` split, the second the ``test`` split, so the operating point is chosen on
+    observations the reported analysis never saw. Each pseudo-observation is the truth at
+    its nearest cell plus ``N(0, sse)`` noise, and R is ``diag(sse)``. ``make_method``
+    defaults to :class:`ThreeDVar`; ``space``, ``reg_cols``, ``estimator`` and
+    ``method_cols`` tag the rows. ``full_metrics=False`` skips SSIM, calibration and skill
+    against distance, which the rRMSE selection does not need. Calibration is scored on the
+    test split only.
     """
     rng = np.random.default_rng(seed)
     shape = (len(VARS), len(lats), len(lons))
@@ -685,8 +569,7 @@ def _score_ppe_lane(
             if split != "test":
                 continue
             for bj in range(n_b):
-                # Read off the analyses rather than asked for separately: an estimator
-                # whose covariance depends on the observations has no value-free spread.
+                # Taken from the analyses: an analog estimator's spread depends on y.
                 post_test[bj, ti] = res[bj].posterior_var
             naive_geom = _naive_geometry(lats, lons, geom, len(VARS))
             for kind in naive_test:
@@ -758,9 +641,7 @@ def _write_ppe_artifacts(out_dir: str, lane: str, rows: list[dict],
                          b_scale: float | None = None) -> None:
     """Persist a scored PPE lane: metrics CSV (appended), analysis npz, skill npz, config.
 
-    ``b_scale`` keeps the fields at that amplitude alone, in float32. Nothing reads the
-    losing scales, and over a few hundred truths the whole sweep is two orders of
-    magnitude larger than the one field a reader wants.
+    ``b_scale`` keeps the fields at that amplitude only, in float32.
     """
     os.makedirs(out_dir, exist_ok=True)
     _append_csv(os.path.join(out_dir, "metrics.csv"), rows)
@@ -806,11 +687,9 @@ def run_ppe(
 ) -> pd.DataFrame:
     """Same-model PPE for one taper config: truths are a held-out chronological chunk.
 
-    The ascending age axis splits at its midpoint; the older half builds B and the
-    climatology, the younger half (subsampled every ``truth_stride`` states) supplies
-    truths, each anomalised by the subsampled set's own mean so the inter-chunk offset
-    cancels. Scoring and held-out selection follow :func:`_score_ppe_lane`; rows and
-    files are tagged ``ppe``. :func:`run_ppe_pixel_grid` wraps this over the taper grid.
+    The older half of the age axis builds B and the climatology; the younger half, every
+    ``truth_stride`` states, supplies truths anomalised about their own mean. Scoring follows
+    :func:`_score_ppe_lane`.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
     prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
@@ -847,12 +726,9 @@ def _chronological_split_meta(ages_i, prior_idx, truth_idx, truth_stride):
             "chunk_b_ages": [int(ages_i[truth_idx].min()), int(ages_i[truth_idx].max())]}
 
 
-# Where each arm's observation network comes from. The two same-model lanes share every
-# other choice, so this is the one line of provenance that tells them apart.
+# Where each arm's observation network comes from, recorded in the config.
 DRAWN_NETWORK = "a proxy age drawn at random"
 OWN_NETWORK = "the age's own proxy network"
-# The pseudo-proxy lane draws for both arms: its truths are model states with no proxy
-# network of their own, so geometry is borrowed and climate time is discarded.
 _PPE_NETWORKS = {"selection": DRAWN_NETWORK, "test": DRAWN_NETWORK}
 
 
@@ -882,8 +758,7 @@ def _age_step(ages: np.ndarray) -> float:
 def _max_block_lag(long: pd.DataFrame, step_yr: float) -> int:
     """Widest gap in age steps between an age and its own sample's block centre.
 
-    Sizes the structure function to the network that will use it, so no observation
-    has to fall back on a clipped lag.
+    Sizes the structure function so no observation needs a clipped lag.
     """
     lag = (long["age"] - long["centre"]).abs().to_numpy(dtype=np.float64)
     return int(np.floor(lag.max() / step_yr + 0.5)) if len(lag) else 0
@@ -893,9 +768,7 @@ def _network_at_age(long: pd.DataFrame, age: int, lats: np.ndarray, lons: np.nda
                     safe_flat: np.ndarray, min_obs: int) -> dict | None:
     """The proxy network an age actually carries, or ``None`` where it is too thin.
 
-    ``None`` is the youngest end of the record, which holds no pollen at all. The caller
-    records those ages rather than reconstructing them from a network borrowed from
-    somewhere else.
+    The caller records those ages rather than borrowing a network for them.
     """
     o = observations_at_age(long, int(age))
     if not len(o.get("age", [])):
@@ -908,16 +781,9 @@ def transplanted_source(centre: np.ndarray, shape_age: int, age: int,
                         ages_i: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Archive index each observation reads, and which ones land on the axis.
 
-    A sample's distance in time is an offset within the network it came from, not the
-    absolute date its block centre carries, so a network borrowed from ``shape_age``
-    reports on ``age + (centre - shape_age)``. Carrying the absolute centre instead would
-    ask for a state tens of thousands of years away, past the reach of any structure
-    function. Where the network is the age's own, ``shape_age`` is ``age`` and the offset
-    is the sample's own lag, which is what it means anywhere else in the project.
-
-    Offsets running off either end of the archive have no state to read and are dropped.
-    :func:`nearest_age_index` would clamp them to the end age, which passes a state off as
-    an observation of a moment it does not describe.
+    A network borrowed from ``shape_age`` reports on ``age + (centre - shape_age)``: the
+    time offset is relative to the network's own age. Offsets that run off the archive are
+    dropped rather than clamped to its ends.
     """
     src_age = float(age) + (np.asarray(centre, dtype=np.float64) - float(shape_age))
     on_axis = (src_age >= ages_i[0]) & (src_age <= ages_i[-1])
@@ -939,37 +805,19 @@ def run_trajectory(
 ) -> pd.DataFrame:
     """Reconstruct a consecutive run of states and score skill by timescale.
 
-    Built like :func:`_score_ppe_lane` and differing from it in one thing, which is what
-    the lane exists to measure. The older half of the age axis builds B and the
-    climatology; every state of the younger half is a truth, so the analyses form a time
-    series rather than a set of independent snapshots. Each truth carries two observation
-    realisations, one selecting the operating point and one reporting it, with one noise
-    vector each.
+    The split is :func:`_score_ppe_lane`'s, but every younger-half state is a truth, so the
+    analyses form a time series. Each observation reads the state at its own sample's
+    offset in time, while scoring is against the state at the analysis age.
 
-    The reported arm assimilates the network the age actually has, which is what a
-    reconstruction of that age would have. Consecutive real networks share almost every
-    site, so the series moves with the climate rather than with the geometry. The
-    selection arm borrows a network drawn from another age, so the operating point is
-    chosen against observations the reported analysis never saw; a drawn network is itself
-    a real one, so the amplitude is selected over that population rather than tuned to the
-    age it is applied at. Ages carrying no usable network are recorded and left out.
+    The test arm assimilates each age's own network, which changes little between
+    neighbouring ages. The selection arm borrows a network from another age, so the
+    operating point is chosen on observations the reported analysis never saw. Ages with
+    no usable network are recorded and skipped.
 
-    Where the PPE lane reads an observation from the state being reconstructed, here each
-    observation reads the state at its own sample's offset in time: a sample describes its
-    own moment, not the moment it is assimilated at. Scoring is against the state at the
-    analysis age either way.
-
-    The temporal variants answer that staleness rather than remove it: one charges it as
-    extra observation error, the other also corrects the attenuation a lagged state
-    carries. Their structure function comes from the prior ages alone, so the truth half
-    never informs the operator that reconstructs it. ``temporal_modes`` chooses which to
-    run, so a lane comparing estimators can hold the treatment fixed rather than
-    re-deciding it per estimator.
-
-    The tapers are inputs, not a grid: they answer a spatial question the PPE lane already
-    settles, and re-gridding them over a 400-state run is not affordable. Only ``b_scale``
-    is swept. The selection shape carries skill rows alone, since pooled RRMSE is the only
-    thing read off it, so the timescale metrics are never optimised against.
+    ``temporal_modes`` chooses how staleness is treated (see
+    :func:`paleoreco.assim.observations.apply_temporal_error`); the structure function
+    comes from the prior ages only. The taper is inherited, and only ``b_scale`` is swept.
+    The selection arm is scored on skill alone, so the timescale metrics are never tuned on.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
     step_yr = _age_step(ages_i)
@@ -991,9 +839,8 @@ def run_trajectory(
     truth_cube = cube[truth_idx].astype(np.float64)
     truth_clim = truth_cube.mean(axis=0)
     truth_anoms = truth_cube - truth_clim
-    # A block centre near the chunk boundary can land in the older half, so observations
-    # are read from the whole run. Centring on the truth climatology keeps one anomaly
-    # frame; B still sees prior ages only, so nothing about the truth half leaks into it.
+    # Observations are read from the whole run, since a block centre can fall in the older
+    # half; B still sees prior ages only.
     all_anoms = cube.reshape(len(ages_i), -1).astype(np.float64) - truth_clim.ravel()
     long = sample_block_centres(long)
     S, prior_var_cell = temporal_structure_function(
@@ -1006,8 +853,7 @@ def run_trajectory(
 
     rng = np.random.default_rng(seed)
     truth_ages = ages_i[truth_idx]
-    # float32 accumulators: six field stacks over a 400-state sweep would otherwise run to
-    # gigabytes, and the metrics upcast in their reductions anyway.
+    # float32 keeps the field stacks to a manageable size.
     recon = {split: {m: [] for m in labels} for split in splits}
     post = {m: [] for m in labels}
     naive = {"nearest": [], "idw": []}
@@ -1015,22 +861,16 @@ def run_trajectory(
     analog_index, obs_n, shape_ages = [], [], []
     t0 = time.time()
     for ti, age in enumerate(truth_ages):
-        # The reported arm assimilates the network the age actually has. Consecutive real
-        # networks share almost every site, so the reconstructed series moves with the
-        # climate; a network drawn afresh each age shares about half its sites and puts
-        # that turnover straight into the fastest band the lane is read for.
+        # Test arm: the age's own network. A freshly drawn network each age would add
+        # site turnover to the fastest band.
         own = _network_at_age(long, int(age), lats, lons, safe_flat, min_obs)
         if own is None:
             skipped.append(int(age))
             continue
         sources = {"test": (int(age), own, *transplanted_source(own["centre"], int(age),
                                                                age, ages_i))}
-        # The selection arm borrows a network from elsewhere, so the operating point is
-        # chosen against observations the reported analysis never saw. A drawn shape is
-        # itself a real network from another age, so b_scale is selected over that
-        # population rather than tuned to the one age it is applied at. Its transplanted
-        # offsets can run off the archive, and a shape that loses too many that way is
-        # drawn again.
+        # Selection arm: a network borrowed from another age, redrawn if too many of its
+        # offsets run off the archive.
         for _ in range(_MAX_SHAPE_DRAWS):
             (shape_age, geom), = _draw_shapes(long, rng, lats, lons, safe_flat, 1, min_obs)
             src, on_axis = transplanted_source(geom["centre"], shape_age, age, ages_i)
@@ -1048,9 +888,7 @@ def run_trajectory(
             g = geom["gather"][on_axis]
             sse = geom["sse"][on_axis]
             stale = all_anoms[src, g] + rng.normal(0.0, np.sqrt(sse))
-            # The lag is read off the age the observation was actually drawn from, not off
-            # the offset before rounding, so the correction answers the staleness this
-            # lane built rather than a rounding of it.
+            # The lag is taken from the age actually read, after rounding.
             rho, resid = temporal_terms(S, prior_var_cell, g,
                                         np.abs(ages_i[src] - age), step_yr)
             drawn[split] = (shape_age, geom, on_axis, g, sse, stale, rho, resid)
@@ -1069,10 +907,7 @@ def run_trajectory(
                     np.stack([x.posterior_var for x in res]).astype(np.float32))
                 if method != base_label:
                     continue
-                # Which prior states the analysis drew on, where the estimator chooses
-                # them. The set turns over between neighbouring ages, a high-frequency
-                # source a fixed-covariance analysis does not have, so the band metrics
-                # need it alongside.
+                # The selected analog members, where the estimator selects them.
                 if hasattr(tv, "select"):
                     analog_index.append(tv.select(gain, yv))
                 naive_geom = _naive_geometry(
@@ -1089,18 +924,13 @@ def run_trajectory(
         raise ValueError(f"only {len(covered)} ages carried a usable network; "
                          "nothing to score")
     covered = np.asarray(covered)
-    # The timescale filters convolve along the age axis at one spacing, and _age_step reads
-    # the whole archive rather than the scored run, so a gap inside the covered ages would
-    # mis-time every band with nothing to catch it. Ages with no pollen sit at the young
-    # end of the record and leave the rest contiguous; anything else is a bug.
+    # The timescale filters assume contiguous ages; skipped ages may only sit at the end.
     if np.any(np.diff(covered) != 1):
         raise ValueError("the scored ages are not consecutive; the timescale filters "
                          "assume a uniform step")
 
     covered_ages = truth_ages[covered]
-    # The anomaly frame stays the whole younger half rather than the scored subset, so the
-    # climatology is a property of the chunk and the numbers stay comparable across runs
-    # that cover different ages.
+    # The anomaly frame is the whole younger half, not just the scored ages.
     truth_run = truth_anoms[covered]
     recon = {split: {m: np.stack(v, axis=1) for m, v in methods.items()}
              for split, methods in recon.items()}          # (n_b, n_covered, C, H, W)
@@ -1138,8 +968,7 @@ def run_trajectory(
     win = select_best_config(_selection_rrmse(rows, LANE_TRAJECTORY, base_label),
                              sel_tol=sel_tol)
     bw = int(np.argmin(np.abs(np.asarray(b_scales) - win["b_scale"])))
-    # Fields for the winner only: the whole sweep over a 400-state run is two orders of
-    # magnitude larger than one field and nothing reads the losing scales.
+    # Fields for the selected b_scale only.
     npz_arrays = {
         "truth_anom": truth_run.astype(np.float32), "truth_clim": truth_clim,
         "clim_mean": prior.clim_mean.astype(np.float64), "safe_valid": safe_valid,
@@ -1152,16 +981,13 @@ def run_trajectory(
         "post_var": post[base_label][bw],
         "prior_var": tv.diagB.reshape(shape),
         "obs_n": np.asarray(obs_n),
-        # Where the reported arm's network came from, which is the age itself here and a
-        # borrowed age on the lane that draws. Nothing downstream can rebuild the
-        # assimilated network without it.
+        # The age each test network came from, needed to rebuild it later.
         "shape_ages": np.asarray(shape_ages, dtype=np.int64),
         "skipped_ages": np.asarray(skipped, dtype=np.int64),
     }
     if analog_index:
         npz_arrays["analog_index"] = np.stack(analog_index)
-    # The corrected variants ride alongside under their own keys, at the same b_scale as
-    # the baseline so a paired difference over ages is what a reader gets by subtracting.
+    # The temporal variants, stored at the baseline's b_scale so they can be differenced.
     for method in labels:
         if method == base_label:
             continue
@@ -1189,8 +1015,7 @@ def _write_trajectory_artifacts(out_dir: str, lane: str, rows: list[dict],
                                 npz_arrays: dict, config: dict) -> None:
     """Persist a scored trajectory lane: metrics CSV (appended), analysis npz, config.
 
-    No skill-vs-distance npz: the lane keeps one network per age rather than a repeated
-    geometry, so the distance curve the PPE lane builds has no counterpart here.
+    No skill-vs-distance npz, since the network changes with every age.
     """
     os.makedirs(out_dir, exist_ok=True)
     _append_csv(os.path.join(out_dir, "metrics.csv"), rows)
@@ -1237,8 +1062,7 @@ def _withholding_rows(actual: np.ndarray, pred: np.ndarray, channel: np.ndarray,
 def _obs_channel_groups(channel: np.ndarray) -> list:
     """``(do_event, channel_name, mask)`` triples for observation-space calibration.
 
-    Real proxies carry no D-O event label, so the event axis stays ``all`` and only the
-    channel breakdown varies.
+    Real proxies carry no D-O event label, so the event is always ``all``.
     """
     groups = [("all", "pooled", np.ones(len(channel), dtype=bool))]
     return groups + [("all", name, channel == c) for c, name in enumerate(VARS)]
@@ -1248,17 +1072,11 @@ def _obs_channel_groups(channel: np.ndarray) -> list:
 class _TargetPredictions:
     """Withheld-site predictions for one assim/target split, pooled over ages.
 
-    ``pred`` and ``post_var`` map a method label to an ``(n_b, N)`` array, one row per
-    ``b_scale``; the rest are ``(N,)`` and shared, because they describe the withheld
-    observation rather than the analysis that predicts it. ``prior_var`` is the
-    background variance at each target cell, which is the CRPSS reference;
-    ``distance_km`` is how far the site sits from the nearest assimilated one, the axis
-    that separates interpolation from extrapolation. ``rep_var`` is the per-channel
-    representativeness variance carried to the target sites so the predictive spread can
-    include the proxy's deviation from its cell mean, and ``resid_var`` is its temporal
-    twin: what the withheld sample's own distance in time leaves unexplained. ``site``
-    is the cluster a resampling scheme has to respect, since a sample repeats across
-    every age in its block.
+    ``pred`` and ``post_var`` map a method label to an ``(n_b, N)`` array; the other fields
+    are ``(N,)`` and describe the withheld observation. ``prior_var`` is the CRPSS
+    reference, ``distance_km`` the distance to the nearest assimilated site, ``rep_var`` and
+    ``resid_var`` the spatial and temporal error terms at the target, and ``site`` the unit
+    a resampling test must redraw whole.
     """
 
     actual: np.ndarray
@@ -1287,22 +1105,13 @@ def _predict_targets(
 ) -> _TargetPredictions:
     """Assimilate the assim-set sites age by age, predict the target-set sites.
 
-    Climatological background (zero anomaly), ``R = diag(sse + rep_var)`` before the
-    temporal term, where ``rep_lookup`` holds the per-channel representativeness
-    variance. Observations enter
-    in anomaly space ``y - my`` so the proxy-vs-model offset cancels. A withheld
-    observation is scored only when its own age also carries an assimilated one, so an age
-    holding just one side of the split contributes nothing.
+    Observations enter as anomalies ``y - my`` against a zero background, with
+    ``R = diag(sse + rep_var)`` before the temporal term. A withheld observation is scored
+    only at ages that also carry an assimilated one.
 
-    One analysis per temporal method, each with its own R and so its own factorization.
-    The withheld observation is attenuated by its own distance in time exactly as the
-    assimilated ones are, so predicting it means applying that attenuation rather than
-    undoing it: the prediction carries ``rho``, and ``actual`` is left alone. That factor
-    is a property of the withheld sample, not of the analysis, so it applies to every
-    method including the uncorrected one; scoring one attenuated and another not would
-    settle the comparison by the scoring rule. The prior-free baselines keep the raw
-    observations, since they predict an observation from observations and already sit on
-    the attenuated scale.
+    Each temporal method runs its own analysis. Every prediction, including the uncorrected
+    method's, is multiplied by the withheld sample's own ``rho``, so all methods are scored
+    on the same attenuated scale; the prior-free baselines already sit on it.
     """
     bg_zero = np.zeros(len(clim_flat))
     actual, channel, sse, prior_var, dist, rep, resid, site = [], [], [], [], [], [], [], []
@@ -1326,8 +1135,7 @@ def _predict_targets(
 
         for method, mode in labels.items():
             yv, r = apply_temporal_error(y_anom, r_kept, rho_k, resid_k, mode)
-            # The age reaches the estimator here because this lane's prior spans it, so an
-            # analog step could otherwise select the simulation's own state at the target.
+            # The age drives the analog exclusion band, since this prior spans it.
             res = tv.apply_sweep(tv.prepare_sweep(gk, r, b_scales, age=int(age)), yv, bg_zero)
             pred[method].append(
                 np.stack([rho_w * res[bj].predict_obs(gw) for bj in range(n_b)]))
@@ -1397,31 +1205,18 @@ def _score_withholding_lane(
 ) -> tuple[str, list[dict], dict]:
     """Nested-CV site withholding for one built prior (no file writes).
 
-    Returns ``(lane, rows, predictions)``. Two passes over the same ``k_folds`` site
-    partition, tagged with a ``split`` column so the operating point is chosen on held-out
-    predictions and reported on a disjoint fold. The selection pass (``split='selection'``)
-    assimilates 3 folds and predicts a 4th (the val fold, rotated so every fold is val
-    once), pooling those predictions across the rotation. The reporting pass
-    (``split='test'``) assimilates 4 folds and predicts the 5th, per fold and pooled. A
-    fold serves as a val target in one rotation and a test target in another, so for a
-    single global operating point a mild dependence remains; the reported test predictions
-    are never scored during selection. Observations enter in anomaly space ``y - my``;
-    ``R = diag(sse + rep_var)`` before the temporal term, with the representativeness
-    variance estimated per fold from the assimilated sites alone, so a withheld site never
-    informs the update or the spread that scores it; the background is climatological.
-    ``temporal_modes`` chooses which treatments of observation staleness to score, so a
-    grid scan can spend its passes on the taper and leave the comparison between
-    treatments to the winner. ``use_rep_var`` drops the representativeness term from R and
-    from the predictive spread, which is what an ablation over the noise budget varies.
-    ``space``/``reg_cols``/``estimator``/``method_cols`` tag the rows.
+    Returns ``(lane, rows, predictions)``. Two passes over one partition of the sites into
+    ``k_folds`` folds:
 
-    Alongside the skill rows each ``b_scale`` carries calibration scored against the
-    proxy, whose own error and representativeness variance join the posterior spread since
-    the residual holds both. The pooled test set also yields prior-free ``nearest``/``idw``
-    rows, emitted once because they depend on neither the taper nor ``b_scale``, and the
-    predictions dict keeps the posterior and prior variance, the proxy error and
-    representativeness variance, and the distance to the nearest assimilated site so
-    calibration and skill-vs-void can be rebuilt without a re-run.
+    * selection: for each fold ``i``, assimilate every fold except ``i`` and ``i + 1`` and
+      predict fold ``i + 1``, pooling over the rotation;
+    * test: for each fold, assimilate the other ``k_folds - 1`` and predict it.
+
+    The representativeness variance is estimated from the assimilated sites alone, so a
+    withheld site never informs the analysis that scores it. ``temporal_modes`` chooses the
+    staleness treatments scored; ``use_rep_var=False`` drops the spatial term from R and
+    from the predictive spread. Calibration adds the proxy's own error terms to the
+    posterior spread. ``predictions`` keeps what is needed to rescore without a re-run.
     """
     shape = (len(VARS), len(lats), len(lons))
     n_cells = len(lats) * len(lons)
@@ -1439,16 +1234,13 @@ def _score_withholding_lane(
     labels = {method_label(estimator, mode): mode for mode in temporal_modes}
     base_label = next(iter(labels))
 
-    # Each sample's own position on the age axis, and the structure function that says
-    # what sitting away from it costs. The ages are the ones the background was built
-    # from, so the correction and B describe the same prior.
+    # Block centres, and the structure function over the same ages B was built from.
     long = sample_block_centres(long)
     step_yr = _age_step(np.asarray(ages, dtype=np.int64))
     S, prior_var_cell = temporal_structure_function(
         cube, prior_age_indices, max_lag=_max_block_lag(long, step_yr))
 
-    # Estimate rep_var per fold from the assimilated sites only; the flattened cell index
-    # of every row is fixed, so build it once and slice it by site set per fold.
+    # rep_var is re-estimated per fold from the assimilated sites only.
     cell_all = obs_cell_index(long["lat"].to_numpy(), long["lon"].to_numpy(),
                               long["channel"].to_numpy(), lats, lons)
 
@@ -1462,10 +1254,8 @@ def _score_withholding_lane(
         """Skill and calibration rows over the b_scale sweep for every temporal method."""
         out = []
         groups = _obs_channel_groups(tp.channel)
-        # The truth is itself a measurement that deviates from its grid cell and from the
-        # analysis age, so its error, representativeness variance and temporal residual
-        # all join the posterior spread; the prior reference carries the same terms to
-        # stay comparable, and only the background half of it scales with b_scale.
+        # The truth is a measurement, so its error terms join both the posterior spread
+        # and the prior reference; only the background part scales with b_scale.
         obs_var = tp.sse + tp.rep_var + tp.resid_var
         for method in tp.pred:
             for bj, kb in enumerate(b_scales):
@@ -1489,7 +1279,7 @@ def _score_withholding_lane(
 
     rows = []
 
-    # Selection: assimilate 3 folds, predict the val fold; pool across the rotation.
+    # Selection: hold out folds i and i + 1, predict i + 1; pool across the rotation.
     sel = []
     t0 = time.time()
     for i in range(k_folds):
@@ -1505,7 +1295,7 @@ def _score_withholding_lane(
     if sel:
         rows += _rows(_concat_targets(sel), -1, "selection")
 
-    # Reporting: assimilate 4 folds, predict the test fold; per fold and pooled.
+    # Test: hold out fold i and predict it; per fold and pooled.
     pooled = []
     t0 = time.time()
     for i in range(k_folds):
@@ -1533,8 +1323,8 @@ def _score_withholding_lane(
             "sse": tp.sse, "distance_km": tp.distance_km, "rep_var": tp.rep_var,
             "resid_var": tp.resid_var,
             "naive_nearest": tp.naive["nearest"], "naive_idw": tp.naive["idw"]})
-        # The corrected variants ride alongside under their own keys; the uncorrected one
-        # keeps the bare names so anything reading the lane's predictions still finds it.
+        # The temporal variants under their own keys; the uncorrected one keeps the bare
+        # names.
         for method in tp.pred:
             if method == base_label:
                 continue
@@ -1582,10 +1372,8 @@ def run_withholding(
 ) -> pd.DataFrame:
     """Nested-CV site withholding for one taper config.
 
-    ``long`` must carry per-site climatology ``my``; the prior uses all ages, as the
-    held-out quantity is real proxies not model states. Scoring follows
-    :func:`_score_withholding_lane`; :func:`run_withholding_pixel_grid` wraps this over
-    the taper grid.
+    ``long`` must carry the per-site climatology ``my``. The prior uses all ages, since
+    what is held out is real proxies, not model states.
     """
     prior_idx = np.arange(len(ages))
     prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
@@ -1612,12 +1400,10 @@ def run_withholding(
 def select_best_config(sel_rows: pd.DataFrame, *, sel_tol: float = SEL_TOL) -> dict:
     """Winner ``{localization_km, shrinkage_lambda, alpha, b_scale}`` on the selection split.
 
-    ``sel_rows`` is pre-filtered to one (model, lane, split=selection, channel=pooled,
-    do_event=all, metric=rrmse) and carries the four config columns plus ``value``. Among
-    rows within ``sel_tol`` (relative) of the minimum RRMSE, picks the most raw-like by
-    ``(n_active_knobs, |log10(b_scale)|, rrmse)`` where a knob is active when localization
-    is set, shrinkage > 0, or alpha < 1. This banks the coarse grid's noise headroom
-    rather than chasing a spuriously-complex argmin.
+    ``sel_rows`` holds the pooled selection-split rRMSE rows of one method and lane. Among
+    rows within ``sel_tol`` (relative) of the minimum, picks the fewest active tapers, then
+    the ``b_scale`` closest to 1, then the lowest rRMSE. With ``sel_tol = 0`` it is the
+    argmin.
     """
     df = sel_rows.dropna(subset=["value"])
     if df.empty:
@@ -1642,11 +1428,7 @@ def select_best_config(sel_rows: pd.DataFrame, *, sel_tol: float = SEL_TOL) -> d
 def select_analog_config(sel_rows: pd.DataFrame) -> dict:
     """Winner over the analog axes and ``b_scale`` on the selection split.
 
-    A plain argmin, unlike :func:`select_best_config`, whose tie-break prefers the config
-    closest to a raw sample covariance. None of these axes has a "simpler" end to lean
-    toward: the ensemble size and the hybrid weight bracket the static analysis, one at a
-    full-pool ensemble and the other at zero weight, and the extension terms bracket the
-    published estimator at zero. Rows written before an axis existed read as zero on it.
+    A plain argmin: unlike the taper axes, none of these has a simpler end to prefer.
     """
     df = sel_rows.dropna(subset=["value"])
     if df.empty:
@@ -1678,9 +1460,8 @@ def _b_scale_by_method(rows: list[dict], lane: str, sel_tol: float,
                        methods: tuple[str, ...] = tuple(TEMPORAL_METHODS)) -> dict[str, float]:
     """Each temporal variant's own selection-split ``b_scale``.
 
-    Inflating R shifts the background-to-observation balance the analysis wants, so a
-    variant is reported at the amplitude its own selection split prefers rather than at
-    the uncorrected one's.
+    Inflating R shifts the balance between background and observations, so each variant
+    is reported at its own selected amplitude.
     """
     out = {}
     for method in methods:
@@ -1700,11 +1481,9 @@ def run_ppe_pixel_grid(
 ) -> pd.DataFrame:
     """Same-model PPE tuned over the taper grid: full-grid metrics, winner-only fields.
 
-    Scores every ``(localization, shrinkage, alpha)`` config (SSIM and calibration skipped,
-    the RRMSE selection needs neither), jointly selects the operating point with ``b_scale``
-    on the selection split via :func:`select_best_config`, then re-runs the winner with the
-    full metric set to persist its analysis fields. metrics.csv holds the full grid's skill
-    rows plus the winner's SSIM and calibration; the npz holds only the winner.
+    Scores every taper configuration on skill alone, selects jointly with ``b_scale`` via
+    :func:`select_best_config`, then re-runs the winner with every metric and saves its
+    fields.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
     prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
@@ -1759,10 +1538,8 @@ def run_withholding_pixel_grid(
 ) -> pd.DataFrame:
     """Withholding lane tuned over the taper grid: full-grid metrics, winner-only predictions.
 
-    Scores every config's nested-CV, jointly selects the operating point with ``b_scale``
-    on the selection split, then re-runs the winner to persist its predictions npz. The
-    prior-free reference rows do not depend on the taper, so they are kept from the winner
-    pass alone rather than replicated once per config.
+    Scores every taper configuration, selects jointly with ``b_scale``, then re-runs the
+    winner to save its predictions.
     """
     configs, grid_record = _pixel_grid_configs(localization_grid, shrinkage_grid, alpha_grid)
     lane = f"withholding_{fold_kind}"
@@ -1779,9 +1556,8 @@ def run_withholding_pixel_grid(
             make_method=None, space="pixel",
             reg_cols=reg_cols, k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales,
             seed=seed, temporal_modes=(TEMPORAL_OFF,))
-        # The grid answers a spatial question, so it runs the uncorrected method alone and
-        # the winner pass adds the temporal comparison; the prior-free rows come from
-        # there too, since they depend on neither the taper nor b_scale.
+        # The grid runs the uncorrected method only; the winner pass adds the temporal
+        # variants and the prior-free rows.
         all_rows += [r for r in rows if r["method"] == METHOD_BASE]
         _report_progress(f"pixel-grid config ({lane})", ci + 1, len(configs), t0)
 
@@ -1794,8 +1570,7 @@ def run_withholding_pixel_grid(
         make_method=None, space="pixel", reg_cols=reg_w,
         k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales, seed=seed,
         progress_every=progress_every)
-    # The winner pass adds the temporal variants and the prior-free rows; the baseline's
-    # own rows are already in from the grid pass at this same config.
+    # Keep only the new rows; the baseline's are already in from the grid pass.
     all_rows += [r for r in win_rows if r["method"] != METHOD_BASE]
 
     config = _withholding_config(lane, "pixel", prior_w, k_folds, fold_kind, b_scales, seed,
@@ -1812,8 +1587,7 @@ def run_withholding_pixel_grid(
 def analog_term_states(tendency_theta_grid, tendency_lag_yr_grid, redundancy_theta_grid):
     """Distinct ``(tendency_theta, tendency_lag_yr, redundancy_theta)`` states.
 
-    The lag says nothing where the tendency weight is zero, so those combinations collapse
-    to one state rather than running the same estimator once per lag.
+    The lag is irrelevant at zero tendency weight, so those combinations collapse to one.
     """
     states = []
     for theta in tendency_theta_grid:
@@ -1829,8 +1603,7 @@ def _analog_grid_configs(k_grid, hybrid_w_grid,
                          redundancy_theta_grid=(0.0,)):
     """The analog grid points, and a JSON-safe record of the axes.
 
-    The extension-term grids default to off, so a caller that names only ``k`` and
-    ``hybrid_w`` gets the published estimator's grid.
+    The extension-term grids default to off, giving the published estimator's grid.
     """
     states = analog_term_states(tendency_theta_grid, tendency_lag_yr_grid,
                                 redundancy_theta_grid)
@@ -1847,9 +1620,7 @@ def _analog_grid_configs(k_grid, hybrid_w_grid,
 def _mt_kwargs(extra_lags_yr, curvature_yr, normalise, preserve_trace):
     """The flow-stack settings split into the row columns and the estimator keywords.
 
-    The columns are a subset of the keywords rather than a parallel description of them, so
-    a row cannot claim a stack the estimator was not built with. The lag sets stay out of
-    the columns: a tuple has no place in a tidy cell, and the config JSON records them.
+    The lag tuples go to the config JSON rather than the row columns.
     """
     switches = {"tendency_normalise": bool(normalise),
                 "preserve_obs_trace": bool(preserve_trace)}
@@ -1859,7 +1630,7 @@ def _mt_kwargs(extra_lags_yr, curvature_yr, normalise, preserve_trace):
 
 
 def _mt_record(stack: dict) -> dict:
-    """JSON-safe record of the flow stack an analog grid held fixed."""
+    """JSON-safe record of the MTA stack an analog grid held fixed."""
     return {key: (list(value) if isinstance(value, tuple) else value)
             for key, value in stack.items()}
 
@@ -1882,15 +1653,9 @@ def run_hgaoenkf_ppe_grid(
 ) -> pd.DataFrame:
     """Same-model PPE tuned over the analog grid: full-grid metrics, winner-only fields.
 
-    The taper is an input rather than an axis. It answers a spatial question about the
-    static covariance that the pixel grid settles once, and holding it fixed is also what
-    keeps the comparison against 3DVar a comparison of estimators rather than of two
-    differently regularized covariances.
-
-    ``selection`` names the analog rule and so the estimator the rows are tagged with, which
-    is what lets two rules share a metrics CSV and still be compared row for row. The flow
-    stack is held across the grid rather than swept, so ``estimator`` names an estimator two
-    rules cannot distinguish; it defaults to the tag the rule alone implies.
+    The taper is inherited from 3DVar, so the comparison is between estimators rather than
+    between regularisations. ``selection`` names the analog rule; ``estimator`` overrides
+    the row tag, e.g. for MTA-HGAOEnKF, which shares a rule with another estimator.
     """
     ages_i = np.asarray(ages, dtype=np.int64)
     prior_idx, truth_idx = chronological_half_split(ages_i, stride=truth_stride)
@@ -1915,10 +1680,8 @@ def run_hgaoenkf_ppe_grid(
               full_metrics, progress=None):
         terms = dict(tendency_theta=tendency_theta, tendency_lag_yr=tendency_lag_yr,
                      redundancy_theta=redundancy_theta)
-        # A stack needs a positive weight to be anything, and the estimator rejects one
-        # without it, so the zero-weight corner drops the stack rather than failing to
-        # build. That corner is the ablation the grid is read for, and its columns say the
-        # flow was off rather than describing a stack the analysis never carried.
+        # At zero weight the stack is dropped, since the estimator rejects a stack it
+        # cannot use.
         on = tendency_theta > 0.0
         return _score_ppe_lane(
             truth_anoms, prior, long, lats, lons,
@@ -1981,20 +1744,10 @@ def run_hgaoenkf_withholding_grid(
 ) -> pd.DataFrame:
     """Withholding lane tuned over the analog grid: full-grid metrics, winner-only predictions.
 
-    This lane's prior spans every age including the one being reconstructed, so
-    ``exclude_yr`` drops a band around the target from the analog pool. Without it the
-    analog step can select the simulation's own state there, which both degenerates the
-    method into a per-age background and inherits whatever alignment the proxy chronology
-    was given against that simulation.
-
-    ``temporal_mode`` is fixed rather than swept: which treatment of observation staleness
-    to use is settled on the 3DVar lanes, and varying it here would confound the analog
-    parameters with it. ``report_temporal_modes`` are the treatments the winner is then
-    scored under, so the staleness ladder is read at one operating point rather than
-    re-selecting the analog parameters per treatment. ``selection`` names the analog rule
-    and so the estimator the rows are tagged with; the flow stack is held across the grid
-    rather than swept, so ``estimator`` names an estimator two rules cannot distinguish and
-    defaults to the tag the rule alone implies.
+    This lane's prior spans the target age, so ``exclude_yr`` stops selection from picking
+    the simulation's own state there. ``temporal_mode`` is fixed during the grid;
+    ``report_temporal_modes`` are the treatments the winner is then scored under.
+    ``selection`` and ``estimator`` are as in :func:`run_hgaoenkf_ppe_grid`.
     """
     prior_idx = np.arange(len(ages))
     prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
@@ -2040,9 +1793,7 @@ def run_hgaoenkf_withholding_grid(
     _, win_rows, predictions = score(
         win["analog_k"], win["hybrid_w"], win["tendency_theta"], win["tendency_lag_yr"],
         win["redundancy_theta"], report_temporal_modes, progress=progress_every)
-    # The winner's rows under the selection treatment are already in from the grid pass at
-    # this same config; what the re-run adds is the other treatments, the prior-free
-    # references and the predictions npz.
+    # The re-run adds the other treatments, the prior-free rows and the predictions npz.
     all_rows += [r for r in win_rows if r["method"] != label]
 
     config = _withholding_config(
@@ -2059,40 +1810,26 @@ def run_hgaoenkf_withholding_grid(
 
 
 def analog_variant_estimator(rule: str, exclude_yr: float) -> str:
-    """Estimator tag for one width of the exclusion band.
-
-    The width is a modelling choice rather than a tuned parameter, so it names the
-    estimator and composes into the method label the same way a treatment of staleness
-    does, instead of adding a column to the shared row schema.
-    """
+    """Estimator tag for one width of the exclusion band."""
     return f"{ESTIMATOR_HGAOENKF}_{rule}_excl{int(exclude_yr)}"
 
 
 def analog_localization_estimator(rule: str, km: float | None) -> str:
     """Estimator tag for one lengthscale of the analog covariance's own taper.
 
-    ``None`` is the lengthscale the static covariance carries, so it tags as ``static``
-    rather than as a number that would differ between lanes.
+    ``None`` inherits the static lengthscale and is tagged ``static``.
     """
     suffix = "static" if km is None else f"{int(km)}"
     return f"{hgaoenkf_estimator(rule)}_loc{suffix}"
 
 
 def evidence_scale_estimator(scale: float) -> str:
-    """Estimator tag for one value of the evidence rule's background scale.
-
-    A sensitivity pass, not a tuning axis: the scale is held at one value everywhere else,
-    so it names the estimator rather than joining the analog grid.
-    """
+    """Estimator tag for one value of the evidence rule's background scale."""
     return f"{hgaoenkf_estimator(ANALOG_EVIDENCE)}_c{scale:g}"
 
 
 def mt_stack_estimator(name: str) -> str:
-    """Estimator tag for one flow stack, named by its entry in :data:`MT_STACKS`.
-
-    A sensitivity pass rather than a tuning axis, for the reason the evidence scale is:
-    the stack defines the estimator, so it names it instead of joining the analog grid.
-    """
+    """Estimator tag for one MTA stack, named by its entry in :data:`MT_STACKS`."""
     return f"{ESTIMATOR_HGAOENKF_MT}_{name}"
 
 
@@ -2109,15 +1846,8 @@ def run_hgaoenkf_withholding_variants(
 ) -> pd.DataFrame:
     """Score variations on how the analog covariance is built, at a fixed ``(k, hybrid_w)``.
 
-    ``variants`` pairs an estimator tag with the :func:`make_hgaoenkf` keywords that vary,
-    so one pass can sweep the exclusion width, the analog lengthscale, or the selection
-    rule without any of them joining the tuning grid. None of them is a knob to optimise:
-    the exclusion width says how much of the skill comes from the analog step being allowed
-    to select the simulation's own neighbourhood of the target age, and the lengthscale
-    answers the ensemble-size question Sun et al. (2024) Table 2 poses.
-
-    Rows land in their own directory under estimator-tagged method labels, so the
-    head-to-head comparison is not cluttered by variants that are not candidates for it.
+    ``variants`` pairs an estimator tag with the :func:`make_hgaoenkf` keywords it changes.
+    These are sensitivity passes, not tuning; their rows are written to their own directory.
     """
     prior_idx = np.arange(len(ages))
     prior = build_prior(cube, ages, lats, lons, prior_idx, valid,
@@ -2135,15 +1865,13 @@ def run_hgaoenkf_withholding_variants(
             make_method=make_hgaoenkf(cube, ages, lats, lons, k=k, hybrid_w=hybrid_w,
                                       evidence_scale=evidence_scale, **kw),
             estimator=tag,
-            # A variant that varies an extension term or the flow stack has to say so in
-            # its rows, or the sweep is labelled as though the term were off.
+            # Record any extension term or MTA setting the variant changes.
             method_cols=analog_cols(k, hybrid_w, **{key: kw[key]
                                                     for key in TERM_KEYS + _STACK_KEYS
                                                     if key in kw}),
             temporal_modes=(temporal_mode,),
             k_folds=k_folds, fold_kind=fold_kind, b_scales=b_scales, seed=seed)
-        # The prior-free references do not depend on any of this, and the grid pass has
-        # already written them.
+        # The prior-free rows are already written by the grid pass.
         all_rows += [r for r in rows if r["background"] != "none"]
         _report_progress("analog variant", vi + 1, len(variants), t0)
 
