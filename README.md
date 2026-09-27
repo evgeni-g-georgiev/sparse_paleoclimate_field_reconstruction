@@ -153,8 +153,8 @@ mtco_sd = np.sqrt(z["post_var"][c, :, 0])
 Some limits on reading it:
 
 - The posterior is overconfident on every evaluation lane, so `post_var` understates the error.
-- Variability faster than about a century is not resolved: dating uncertainty in the pollen
-  exceeds it, and on the time series lane the 25 to 100 yr band scores below climatology.
+- Variability faster than about 250 years is not resolved: dating uncertainty in the pollen
+  exceeds it, and on the time series lane the 25–100 and 100–250 yr bands score below climatology.
 - Skill falls with distance from the network, and most of the grid is far from it.
 - The 36 ages from 29,975 to 29,100 BP have no pollen. There the field is the climatology and
   the variance is the prior's, scaled by c.
