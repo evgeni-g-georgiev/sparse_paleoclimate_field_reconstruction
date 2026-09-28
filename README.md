@@ -5,7 +5,7 @@ Assimilation: Spatially Complete Reconstruction of Dansgaard–Oeschger Temperat
 Marine Isotope Stage 3**
 
 MSc Computing individual project, Department of Computing, Imperial College London, 2026.\
-Author: Evgeni Galinov Georgiev. Supervisor: Dr Sibo Cheng.
+Author: Evgeni Galinov Georgiev. Supervisor: Dr. Sibo Cheng.
 
 This repository holds the code for the thesis: the three estimators it compares, the
 experiments that score them, the MIS3 reconstruction, and the notebook that draws every figure
