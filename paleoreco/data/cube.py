@@ -16,16 +16,10 @@ import numpy as np
 import pandas as pd
 
 
-# ----------------------------------------------------------------------------
-# Constants describing the Prior grid and channel order.
-# ----------------------------------------------------------------------------
-GRID_SHAPE: tuple[int, int] = (32, 64)  # (n_lat, n_lon) at 5.625-degree resolution
-VARS: tuple[str, str] = ("mtco", "mtwa")  # channel order convention used package-wide
+# Channel order, used package-wide.
+VARS: tuple[str, str] = ("mtco", "mtwa")
 
 
-# ----------------------------------------------------------------------------
-# Prior cube construction.
-# ----------------------------------------------------------------------------
 def build_prior_cube(
     prior_csv: str = "data/Prior.csv",
     cache_path: str | None = "data/cache/prior_cube.npz",
@@ -82,29 +76,17 @@ def build_prior_cube(
     return result
 
 
-def compute_zscore_stats(
+def cell_climatology(
     cube: np.ndarray,
-    train_age_indices: Sequence[int] | np.ndarray,
+    age_indices: Sequence[int] | np.ndarray,
     valid: np.ndarray,
     eps: float = 1e-6,
 ) -> dict:
-    """Per-cell ``mean``, ``std`` and ``safe_valid`` over the ages at ``train_age_indices``.
+    """Per-cell ``mean`` and ``safe_valid`` over the ages at ``age_indices``.
 
     ``safe_valid`` drops cells whose std on either channel is below ``eps``, such as
-    permanent ice; their std is set to 1.0 so dividing by it stays finite.
+    permanent ice, since a cell that never varies has no covariance to assimilate into.
     """
-    train_age_indices = np.asarray(train_age_indices, dtype=np.int64)
-    sub = cube[train_age_indices]  # (n_train, 2, n_lat, n_lon)
-    mean = sub.mean(axis=0)         # (2, n_lat, n_lon)
-    std = sub.std(axis=0)           # (2, n_lat, n_lon)
-
-    degenerate = (std < eps).any(axis=0)              # (n_lat, n_lon)
-    safe_valid = valid & ~degenerate                  # (n_lat, n_lon)
-
-    std_safe = np.where(safe_valid[None], std, 1.0).astype(np.float32)
-
-    return {
-        "mean": mean.astype(np.float32),
-        "std": std_safe,
-        "safe_valid": safe_valid,
-    }
+    sub = cube[np.asarray(age_indices, dtype=np.int64)]   # (n_ages, 2, n_lat, n_lon)
+    degenerate = (sub.std(axis=0) < eps).any(axis=0)    # (n_lat, n_lon)
+    return {"mean": sub.mean(axis=0).astype(np.float32), "safe_valid": valid & ~degenerate}

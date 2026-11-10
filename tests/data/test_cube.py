@@ -1,4 +1,4 @@
-"""Tests for the Prior-cube loader and its per-cell stats (paleoreco.data.cube)."""
+"""Tests for the Prior-cube loader and its per-cell climatology (paleoreco.data.cube)."""
 
 from __future__ import annotations
 
@@ -6,12 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from paleoreco.data import (
-    GRID_SHAPE,
-    VARS,
-    build_prior_cube,
-    compute_zscore_stats,
-)
+from paleoreco.data import VARS, build_prior_cube, cell_climatology
 
 
 def _write_prior_csv(path, *, drop_one=False) -> None:
@@ -52,22 +47,20 @@ def test_build_prior_cube_raises_on_missing_cell(tmp_path):
         build_prior_cube(str(csv), cache_path=None)
 
 
-def test_grid_and_vars_constants():
-    assert GRID_SHAPE == (32, 64)
+def test_channel_order():
     assert VARS == ("mtco", "mtwa")
 
 
 def test_degenerate_cells_are_masked(cube, valid):
-    """A cell with no variance across the train ages is dropped from ``safe_valid``.
+    """A cell with no variance across the given ages is dropped from ``safe_valid``.
 
-    Normalised scoring divides by that std, so keeping the cell would put an infinity
-    into the innovation rather than leaving the cell unconstrained.
+    It has no covariance for an observation to update, so it is left unconstrained.
     """
     cube = cube.copy()
     cube[:, 0, 2, 3] = -4.0
     train_idx = np.arange(cube.shape[0])
 
-    stats = compute_zscore_stats(cube, train_idx, valid)
+    stats = cell_climatology(cube, train_idx, valid)
     assert not stats["safe_valid"][2, 3]
     assert stats["safe_valid"].sum() == valid.sum() - 1
     # The climatology still describes every cell, masked or not.
