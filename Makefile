@@ -2,45 +2,44 @@
 #
 # Targets are independent so any stage can be re-run on its own, which means make will
 # not chase prerequisites for you: the order in `all` is the order they have to run in.
-# See scripts/README.md for what each stage costs.
+# See scripts/README.md for what each stage inherits.
 
 PY := paleo/bin/python
 
-.PHONY: all test smoke check 3dvar hgaoenkf evidence mt ablations product figures \
-        trajectories
+.PHONY: all test smoke check 3dvar evidence mta product figures trajectories
 
-all: check 3dvar hgaoenkf evidence mt ablations product figures
+all: check 3dvar evidence mta product figures
 
 test:
-	$(PY) -m pytest -q
+	$(PY) -m pytest
 
-# Every experiment stage at reduced size, into outputs/_smoke, in a few minutes. Exercises
-# the wiring before committing to a full run; the results notebook needs full artefacts.
+# Every stage at reduced size, into outputs/_smoke, then the results notebook against those
+# artefacts. Exercises the wiring before committing to a full run. The executed notebook is
+# written to outputs/_smoke, so the tracked copy is left as it is.
+SMOKE_OUT := outputs/_smoke
 smoke:
 	$(PY) scripts/00_check_data.py
 	$(PY) scripts/01_3dvar.py --smoke
-	$(PY) scripts/02_hgaoenkf.py --smoke
-	$(PY) scripts/03_hgaoenkf_evidence.py --smoke
-	$(PY) scripts/04_hgaoenkf_mt.py --smoke
-	$(PY) scripts/05_ablations.py --smoke
-	$(PY) scripts/06_product.py --smoke
+	$(PY) scripts/02_evidence.py --smoke
+	$(PY) scripts/03_mta.py --smoke
+	$(PY) scripts/04_product.py --smoke
+	PALEORECO_OUTPUTS=$(SMOKE_OUT) $(THREADS) $(PY) -m nbconvert --to notebook --execute \
+	    --ExecutePreprocessor.kernel_name=python3 --ExecutePreprocessor.timeout=1800 \
+	    --output-dir $(SMOKE_OUT) notebooks/final_results.ipynb
 
-# Re-run one lane against the operating points already on disk. Every script takes
-# `--only <stage>`; `make <script>` with no flag runs all of its stages.
+# Re-run the time-series lane against the operating points already on disk. Every script
+# takes `--only <stage>`; `make <script>` with no flag runs all of its stages.
 trajectories:
-	$(PY) scripts/01_3dvar.py --only trajectory
-	$(PY) scripts/02_hgaoenkf.py --only trajectory
-	$(PY) scripts/03_hgaoenkf_evidence.py --only trajectory
-	$(PY) scripts/04_hgaoenkf_mt.py --only trajectory
+	$(PY) scripts/01_3dvar.py --only time-series
+	$(PY) scripts/02_evidence.py --only time-series
+	$(PY) scripts/03_mta.py --only time-series
 	$(MAKE) figures
 
 check:      ; $(PY) scripts/00_check_data.py
 3dvar:      ; $(PY) scripts/01_3dvar.py
-hgaoenkf:   ; $(PY) scripts/02_hgaoenkf.py
-evidence:   ; $(PY) scripts/03_hgaoenkf_evidence.py
-mt:         ; $(PY) scripts/04_hgaoenkf_mt.py
-ablations:  ; $(PY) scripts/05_ablations.py
-product:    ; $(PY) scripts/06_product.py
+evidence:   ; $(PY) scripts/02_evidence.py
+mta:        ; $(PY) scripts/03_mta.py
+product:    ; $(PY) scripts/04_product.py
 
 # Executes the results notebook in place: every report figure, table and quoted number,
 # read from the stored artefacts. Single-threaded BLAS keeps the numbers identical run to run.

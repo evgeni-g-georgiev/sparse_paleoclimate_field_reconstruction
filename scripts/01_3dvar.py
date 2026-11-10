@@ -1,9 +1,12 @@
-"""3DVar across the three lanes.
+"""3DVar: the covariance taper, and 3DVar on every lane.
 
-Runs first. The regularizer it selects on the same-model lane is inherited by every
-analog estimator there, and the one it selects on the real-proxy lane is inherited by
-their withholding runs, so the comparison between estimators is a comparison of
-estimators rather than of differently regularized covariances.
+Runs first. The taper it selects on the snapshot lane is inherited by every analog
+estimator on every lane, so the comparison between estimators is a comparison of estimators
+rather than of differently regularized covariances.
+
+The observation-model ablation also lives here, carried by 3DVar so no analog parameter is
+confounded with it: the withholding lane under the stated error alone and with each of the
+spatial and temporal terms. The full model is the withholding run itself.
 """
 
 from __future__ import annotations
@@ -13,21 +16,8 @@ import _common as C
 from paleoreco import paths
 from paleoreco.assim import experiments as ex
 
-# The pixel regularizer: distance taper, shrinkage toward the diagonal, channel coupling.
-# The lengthscales are chordal, so they span what the taper does across a 12742 km diameter
-# rather than what its nominal support is: 5000 reaches zero inside the sphere, 12500 leaves
-# 0.19 between antipodes, and 35000 leaves 0.82, which is nearly the untapered corner.
-GRID = dict(
-    localization_grid=(None, 5000.0, 8000.0, 12500.0, 20000.0, 25000.0, 35000.0),
-    shrinkage_grid=(0.0, 0.25, 0.5, 0.75),
-    alpha_grid=(0.0, 0.25, 0.5, 0.75, 1.0),
-)
-SMOKE_GRID = dict(localization_grid=(None, 20000.0), shrinkage_grid=(0.0,),
-                  alpha_grid=(1.0,))
-SMOKE_B = (1.0, 5.0)
-
 ESTIMATOR = ex.ESTIMATOR_3DVAR
-STAGES = ["ppe taper grid", "withholding taper grid", "trajectory"]
+STAGES = ["taper-grid", "snapshot", "time-series", "withholding", "obs-model"]
 
 
 def main() -> None:
@@ -35,28 +25,39 @@ def main() -> None:
     stages = C.Stages("01_3dvar", STAGES)
     cube, ages, lats, lons, valid = C.load_prior(C.SMOKE_AGES if smoke else None)
     long_ppe, long_wh = C.load_networks(ages if smoke else None)
-    grid = SMOKE_GRID if smoke else GRID
-    b_scales = SMOKE_B if smoke else ex.B_SCALES
+    data = (cube, ages, lats, lons, valid)
+    b_scales = C.SMOKE_B if smoke else ex.B_SCALES
+    d_grid = paths.grid_dir(ex.GRID_TAPER)
 
-    d_ppe = paths.run_dir(ESTIMATOR, paths.LANE_PPE)
-    if stages.run(STAGES[0]):
-        C.clear_dir(d_ppe)
-        ex.run_ppe_pixel_grid(cube, ages, lats, lons, valid, long_ppe, str(d_ppe),
-                              b_scales=b_scales, progress_every=25, **grid)
+    if stages.run("taper-grid"):
+        ex.run_taper_grid(*data, long_ppe, C.clear_dir(d_grid), b_scales=b_scales,
+                          **(C.SMOKE_TAPER_GRID if smoke else ex.TAPER_GRID))
 
-    if stages.run(STAGES[1]):
-        d_wh = paths.run_dir(ESTIMATOR, paths.LANE_WITHHOLDING)
-        C.clear_dir(d_wh)
-        ex.run_withholding_pixel_grid(cube, ages, lats, lons, valid, long_wh, str(d_wh),
-                                      b_scales=b_scales, fold_kind="random",
-                                      progress_every=1, **grid)
+    if stages.run("snapshot"):
+        taper = ex.taper_from_row(ex.select(ex.read_metrics(d_grid)))
+        ex.run_snapshot(*data, long_ppe, C.clear_dir(paths.run_dir(ESTIMATOR, paths.LANE_PPE)),
+                        estimator=ESTIMATOR, taper=taper, b_scales=b_scales)
 
-    if stages.run(STAGES[2]):
-        d_traj = paths.run_dir(ESTIMATOR, paths.LANE_TRAJECTORY)
-        C.clear_dir(d_traj)
-        ex.run_trajectory(cube, ages, lats, lons, valid, long_ppe, str(d_traj),
-                          b_scales=b_scales, progress_every=25,
-                          **C.inherited_taper(d_ppe / "ppe_config.json"))
+    if stages.run("time-series"):
+        taper, _ = C.operating_point(ESTIMATOR)
+        ex.run_trajectory(*data, long_ppe,
+                          C.clear_dir(paths.run_dir(ESTIMATOR, paths.LANE_TRAJECTORY)),
+                          estimator=ESTIMATOR, taper=taper, b_scales=b_scales)
+
+    if stages.run("withholding"):
+        taper, _ = C.operating_point(ESTIMATOR)
+        ex.run_withholding(*data, long_wh,
+                           C.clear_dir(paths.run_dir(ESTIMATOR, paths.LANE_WITHHOLDING)),
+                           estimator=ESTIMATOR, taper=taper, b_scales=b_scales)
+
+    if stages.run("obs-model"):
+        taper, _ = C.operating_point(ESTIMATOR)
+        for model in ex.OBS_MODEL_ARMS:
+            print(f"  arm {model.name}", flush=True)
+            ex.run_withholding(
+                *data, long_wh,
+                C.clear_dir(paths.ablation_dir(ex.ABLATION_OBS_MODEL) / model.name),
+                estimator=ESTIMATOR, taper=taper, model=model, b_scales=b_scales)
     stages.done()
 
 
