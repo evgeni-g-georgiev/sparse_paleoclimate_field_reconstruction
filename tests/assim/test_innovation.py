@@ -1,20 +1,15 @@
-"""Tests for grid lookup, innovation, and standardisation (paleoreco.assim.innovation)."""
+"""Tests for the nearest-cell observation operator (paleoreco.assim.innovation)."""
 
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from paleoreco.assim.innovation import (
     nearest_age_index,
     nearest_lat_index,
     nearest_lon_index,
     obs_cell_index,
-    obs_operator_scale,
-    predicted_sd,
-    standardise,
 )
-from paleoreco.assim.scoring import ANOMALY, NORMALISED
 
 
 def test_nearest_lat_index():
@@ -43,18 +38,3 @@ def test_obs_cell_index_flat_layout():
     # mtwa -> channel 1; lat 0.0 -> ilat 1; lon 90 -> ilon 1.
     assert g[0] == 1 * n_cells + 1 * 2 + 1
 
-
-def test_predicted_sd_and_standardise():
-    prior_var = np.array([4.0])
-    sse = np.array([5.0])
-    sy = np.array([3.0])
-    assert predicted_sd(prior_var, sse, sy, ANOMALY)[0] == pytest.approx(3.0)        # sqrt(9)
-    assert predicted_sd(prior_var, sse, sy, NORMALISED)[0] == pytest.approx(1.0)     # 3 / sy
-    assert standardise(np.array([6.0]), np.array([3.0]))[0] == pytest.approx(2.0)
-
-
-def test_obs_operator_scale():
-    prior_var = np.array([4.0])
-    sy = np.array([2.0])
-    assert obs_operator_scale(prior_var, sy, ANOMALY)[0] == pytest.approx(1.0)
-    assert obs_operator_scale(prior_var, sy, NORMALISED)[0] == pytest.approx(1.0)   # sqrt(4)/2

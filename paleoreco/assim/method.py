@@ -1,83 +1,62 @@
 """Common contract every reconstruction method implements.
 
-A method consumes a background and a set of observations for one assimilation and
-returns an :class:`AnalysisResult`, which carries the posterior mean and, where the
-method can produce one, the posterior variance.
+A method factorizes its gain once per observation network over a sweep of background
+amplitudes, then analyses one innovation against it, returning one
+:class:`AnalysisResult` per amplitude. A scan that only reads the posterior mean asks
+for ``mean_only`` and skips the spread, which is most of the cost of an ensemble update.
 
-All fields are in anomaly space (state minus per-cell climatology, observations
-minus their per-cell climatology); :meth:`AnalysisResult.to_celsius` maps back.
+All fields are in anomaly space: state minus per-cell climatology, observations minus
+their per-site climatology.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 
-
-@dataclass(frozen=True)
-class Observations:
-    """One assimilation's observations, reduced to what the update needs.
-
-    ``gather`` indexes the flattened ``(2, n_lat, n_lon)`` state at each
-    observation's grid cell (the action of H, nearest-cell selection); ``y_anom``
-    is the observation in anomaly space; ``sse`` is its error variance (R's
-    diagonal entry).
-    """
-
-    gather: np.ndarray
-    y_anom: np.ndarray
-    sse: np.ndarray
+if TYPE_CHECKING:
+    from paleoreco.assim.priors import Prior
 
 
 @dataclass(frozen=True)
 class AnalysisResult:
     """Posterior of one assimilation, in anomaly space.
 
-    ``mean_anom`` is ``(2, n_lat, n_lon)``; ``posterior_var`` (same shape) is filled
-    by whichever method can produce it. ``posterior_cross_var`` is ``(n_lat, n_lon)``,
-    the posterior covariance between the two channels at each cell: the spread of a
-    seasonal contrast is a difference of correlated channels, which per-channel
-    variances alone cannot give.
+    ``mean_anom`` is ``(2, n_lat, n_lon)``; ``posterior_var`` (same shape) is ``None`` for a
+    mean-only analysis. ``posterior_cross_var`` is ``(n_lat, n_lon)``, the posterior
+    covariance between the two channels at each cell, filled by the methods that sample
+    it: the spread of a seasonal contrast is a difference of correlated channels, which
+    per-channel variances alone cannot give.
     """
 
     mean_anom: np.ndarray
     posterior_var: np.ndarray | None = None
     posterior_cross_var: np.ndarray | None = None
 
-    def to_celsius(self, clim_mean: np.ndarray) -> np.ndarray:
-        """Posterior mean in degC: anomaly plus the per-cell climatology."""
-        return self.mean_anom + clim_mean
-
     def predict_obs(self, gather: np.ndarray) -> np.ndarray:
         """Posterior-mean anomaly at the given flat cell indices (H applied)."""
         return self.mean_anom.ravel()[gather]
 
-    def predict_obs_var(self, gather: np.ndarray) -> np.ndarray | None:
-        """Posterior variance at those cells, or ``None`` if the method reports no spread.
-
-        Scoring calibration in observation space needs the spread where the observations
-        are, not the whole map.
-        """
-        if self.posterior_var is None:
-            return None
+    def predict_obs_var(self, gather: np.ndarray) -> np.ndarray:
+        """Posterior variance at the given flat cell indices."""
         return self.posterior_var.ravel()[gather]
 
 
 class Method(ABC):
-    """A reconstruction method: background plus observations to a posterior."""
+    """A reconstruction method: a background and observations to a posterior."""
 
     @abstractmethod
-    def analyze(self, obs: Observations, background_anom: np.ndarray) -> AnalysisResult:
-        """Assimilate ``obs`` into ``background_anom`` (flattened state anomaly)."""
+    def prepare_sweep(self, gather: np.ndarray, r_diag: np.ndarray, b_scales: np.ndarray):
+        """Everything one network needs that does not depend on the observation values."""
 
-    def analyze_many(
-        self, obs: Observations, backgrounds: list[np.ndarray]
-    ) -> list[AnalysisResult]:
-        """Analyses for several backgrounds that share one observation network.
+    @abstractmethod
+    def apply_sweep(self, gain, y_anom: np.ndarray, background_anom: np.ndarray, *,
+                    mean_only: bool = False) -> list[AnalysisResult]:
+        """The analysis at every amplitude of ``gain`` for one observation vector."""
 
-        The default calls :meth:`analyze` per background; a method whose gain does not
-        depend on the background can override it to factorize once.
-        """
-        return [self.analyze(obs, bg) for bg in backgrounds]
+
+# Builds a method from a prior and the field shape.
+MethodFactory = Callable[["Prior", "tuple[int, int, int]"], Method]

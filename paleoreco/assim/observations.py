@@ -1,16 +1,18 @@
-"""Proxy observation network: loading, per-site statistics, per-age slices.
+"""Proxy observation network: loading, per-site statistics, per-age slices, error model.
 
 The observation table (Liu et al. 2026 pollen reconstructions) carries one
 row per ``(site, age)`` with both temperature channels. This module melts it
 to long format (one row per ``(site, channel, age)``) and exposes the pieces
-data assimilation needs: the per-site climatology used for anomaly/normalised
-scoring, the representativeness variance of the network from co-cell proxy
+data assimilation needs: the per-site climatology observations are anomalised
+about, the representativeness variance of the network from co-cell proxy
 pairs, each sample's own position on the age axis, the error that position
 implies when the sample is used at some other age, and the set of observations
 active at a single age.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -24,13 +26,29 @@ _OBS_COLS: dict[str, tuple[str, str]] = {
     "mtwa": ("mtwa", "sse_mtwa"),
 }
 
-# How a sample's distance in time from the analysis age enters the update: ignored,
-# charged as extra observation error, or also corrected for the attenuation a lagged
-# state carries.
-TEMPORAL_OFF = "off"
-TEMPORAL_ADD = "add"
-TEMPORAL_DEFLATE = "deflate"
-TEMPORAL_MODES = (TEMPORAL_OFF, TEMPORAL_ADD, TEMPORAL_DEFLATE)
+
+@dataclass(frozen=True)
+class ObservationModel:
+    """Which error terms R carries beyond each proxy's stated error ``sse``.
+
+    ``spatial`` adds the representativeness variance of a point proxy standing in for its
+    grid cell. ``temporal`` treats a sample used away from its own block centre with
+    :func:`deflate`.
+    """
+
+    spatial: bool
+    temporal: bool
+
+    @property
+    def name(self) -> str:
+        """``sse`` followed by the terms switched on, e.g. ``sse_spatial_temporal``."""
+        terms = [t for t, on in (("spatial", self.spatial), ("temporal", self.temporal)) if on]
+        return "_".join(["sse", *terms])
+
+
+FULL_MODEL = ObservationModel(spatial=True, temporal=True)
+# The lowest lag correlation a sample is credited with; see :func:`temporal_terms`.
+RHO_FLOOR = 0.05
 
 
 def load_observations(obs_csv: str) -> pd.DataFrame:
@@ -96,19 +114,12 @@ def sample_block_centres(long: pd.DataFrame) -> pd.DataFrame:
 
 
 def observation_site_stats(long: pd.DataFrame) -> pd.DataFrame:
-    """Per ``(site, channel)`` mean ``my`` and std ``sy`` of ``y`` across time.
-
-    These are the per-site shift and scale for anomaly and normalised scoring.
-    ``sy`` uses ``ddof=0`` so a single-observation site gives ``sy = 0`` rather
-    than ``NaN``; such sites are unusable under normalised scoring and the caller
-    is expected to drop them.
-    """
-    g = long.groupby(["site", "channel"])["y"]
-    return pd.DataFrame({"my": g.mean(), "sy": g.std(ddof=0)}).reset_index()
+    """Per ``(site, channel)`` mean ``my`` of ``y`` across time, the site's climatology."""
+    return long.groupby(["site", "channel"])["y"].mean().rename("my").reset_index()
 
 
 def attach_site_stats(long: pd.DataFrame, site_stats: pd.DataFrame) -> pd.DataFrame:
-    """Merge ``my``/``sy`` onto the long table, keyed by ``(site, channel)``."""
+    """Merge ``my`` onto the long table, keyed by ``(site, channel)``."""
     return long.merge(site_stats, on=["site", "channel"], how="left")
 
 
@@ -163,7 +174,7 @@ def representativeness_variance(
 
 def temporal_terms(
     S: np.ndarray, var: np.ndarray, gather: np.ndarray, lag_yr: np.ndarray,
-    step_yr: float, *, floor: float = 0.05,
+    step_yr: float, *, floor: float = RHO_FLOOR,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Lag correlation and unexplained variance at each observation's cell and lag.
 
@@ -188,37 +199,39 @@ def temporal_terms(
     return rho, v * (1.0 - rho ** 2)
 
 
-def apply_temporal_error(
-    y_anom: np.ndarray, sse: np.ndarray, rho: np.ndarray, resid_var: np.ndarray,
-    mode: str,
+def deflate(
+    y_anom: np.ndarray, r_diag: np.ndarray, rho: np.ndarray, resid_var: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Observation and error variance corrected for the sample's distance in time.
 
     A sample used away from its own moment reports a state that is both noisier and,
     since a lagged state regresses toward the mean, smaller in magnitude than the one
-    being solved for. ``TEMPORAL_ADD`` answers only the noise, the conventional
-    representativeness inflation. ``TEMPORAL_DEFLATE`` also undoes the attenuation so
-    the observation states its claim at full size, and R carries the cost: it grows as
-    ``1 / rho^2`` while the observation grows as ``1 / rho``, so the gain collapses and
-    a hopelessly stale sample switches itself off.
+    being solved for. Dividing by ``rho`` undoes the attenuation so the observation
+    states its claim at full size, and R carries the cost: it grows as ``1 / rho^2``
+    while the observation grows as ``1 / rho``, so the gain collapses and a hopelessly
+    stale sample switches itself off.
     """
     y = np.asarray(y_anom, dtype=np.float64)
-    r = np.asarray(sse, dtype=np.float64)
-    if mode == TEMPORAL_OFF:
-        return y, r
-    if mode == TEMPORAL_ADD:
-        return y, r + resid_var
-    if mode == TEMPORAL_DEFLATE:
-        return y / rho, (r + resid_var) / rho ** 2
-    raise ValueError(f"unknown temporal mode {mode!r}; expected one of {TEMPORAL_MODES}")
+    r = np.asarray(r_diag, dtype=np.float64)
+    return y / rho, (r + resid_var) / rho ** 2
+
+
+def max_block_lag(long: pd.DataFrame, step_yr: float) -> int:
+    """Widest gap in age steps between an age and its own sample's block centre.
+
+    Sizes the structure function so no observation needs a clipped lag. ``long`` must
+    carry the ``centre`` column of :func:`sample_block_centres`.
+    """
+    lag = (long["age"] - long["centre"]).abs().to_numpy(dtype=np.float64)
+    return int(np.floor(lag.max() / step_yr + 0.5)) if len(lag) else 0
 
 
 def observations_at_age(long: pd.DataFrame, age: int) -> dict[str, np.ndarray]:
     """All observation rows at one age, as a column -> array dict.
 
-    Carries through whatever columns ``long`` holds (including ``my``/``sy`` if
-    :func:`attach_site_stats` was applied), so downstream scoring has the per-site
-    statistics aligned row-for-row.
+    Carries through whatever columns ``long`` holds (including ``my`` if
+    :func:`attach_site_stats` was applied), so the per-site climatology stays aligned
+    row-for-row.
     """
     rows = long[long["age"] == age]
     return {col: rows[col].to_numpy() for col in rows.columns}

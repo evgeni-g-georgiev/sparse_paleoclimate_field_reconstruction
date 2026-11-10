@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from paleoreco.assim.background import background_covariance
-from paleoreco.data import compute_zscore_stats
+from paleoreco.data import cell_climatology
 
 _EARTH_RADIUS_KM = 6371.0
 
@@ -34,8 +34,8 @@ class Prior:
     """A built background: covariance, climatology, mask, and source ages.
 
     ``B`` is ``(D, D)``; ``clim_mean`` is ``(2, n_lat, n_lon)``; ``safe_valid``
-    masks degenerate cells; ``ages`` are the prior ages (yr BP) the per-age
-    background neighbour is drawn from. ``meta`` records the taper choice.
+    masks degenerate cells; ``ages`` are the prior ages (yr BP) B was built from,
+    which an analog estimator draws its pool from. ``meta`` records the taper choice.
     """
 
     B: np.ndarray
@@ -69,7 +69,7 @@ def build_prior(
     anomaly frame is internally consistent.
     """
     prior_age_indices = np.asarray(prior_age_indices, dtype=np.int64)
-    stats = compute_zscore_stats(cube, prior_age_indices, valid)
+    stats = cell_climatology(cube, prior_age_indices, valid)
     clim_mean = stats["mean"]
     safe_valid = stats["safe_valid"]
 
@@ -135,11 +135,6 @@ def great_circle_km_between(
     the observation network.
     """
     return 2.0 * _EARTH_RADIUS_KM * np.arcsin(np.sqrt(_haversine_h(lat_a, lon_a, lat_b, lon_b)))
-
-
-def great_circle_km(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
-    """Pairwise great-circle distances (km) between cells given by lat/lon (deg)."""
-    return great_circle_km_between(lat, lon, lat, lon)
 
 
 def chord_km_between(
@@ -268,7 +263,3 @@ def taper_obs_blocks(
         block = s if block is None else block * s
     return block, block[g]
 
-
-# ---------------------------------------------------------------------------
-# Persistence.
-# ---------------------------------------------------------------------------

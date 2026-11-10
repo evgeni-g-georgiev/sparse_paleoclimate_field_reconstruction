@@ -10,7 +10,7 @@ from paleoreco.assim.priors import (
     chord_km,
     coupling_taper,
     gaspari_cohn,
-    great_circle_km,
+    great_circle_km_between,
     localization_taper,
     regularization_mask,
     shrinkage_taper,
@@ -34,7 +34,7 @@ def test_gaspari_cohn_endpoints_and_support():
 def test_great_circle_quarter_circumference():
     lat = np.array([0.0, 0.0])
     lon = np.array([0.0, 90.0])
-    d = great_circle_km(lat, lon)
+    d = great_circle_km_between(lat, lon, lat, lon)
     assert d[0, 0] == pytest.approx(0.0, abs=1e-6)
     assert np.allclose(d, d.T)
     assert d[0, 1] == pytest.approx(_R * np.pi / 2, rel=1e-6)
@@ -60,7 +60,7 @@ def test_chord_and_great_circle_stay_consistent_through_the_half_angle():
     """One haversine feeds both readings, so neither can drift without the other noticing."""
     rng = np.random.default_rng(0)
     lat, lon = rng.uniform(-90, 90, 40), rng.uniform(-180, 180, 40)
-    arc = great_circle_km(lat, lon)
+    arc = great_circle_km_between(lat, lon, lat, lon)
     assert np.allclose(chord_km(lat, lon), 2.0 * _R * np.sin(arc / (2.0 * _R)))
 
 
@@ -105,7 +105,8 @@ def _antipodal_grid(n_lat=8, n_lon=16):
 def test_the_psd_grid_really_does_contain_an_antipodal_pair():
     """Guards the test below, which is toothless on a grid that stays within a hemisphere."""
     lats, lons = _antipodal_grid()
-    d = great_circle_km(np.repeat(lats, len(lons)), np.tile(lons, len(lats)))
+    cell_lat, cell_lon = np.repeat(lats, len(lons)), np.tile(lons, len(lats))
+    d = great_circle_km_between(cell_lat, cell_lon, cell_lat, cell_lon)
     assert d.max() == pytest.approx(np.pi * _R, rel=1e-9)
 
 

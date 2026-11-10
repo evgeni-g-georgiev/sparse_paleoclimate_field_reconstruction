@@ -1,8 +1,9 @@
-"""Unit tests for the representativeness-variance estimator (paleoreco.assim.observations).
+"""Unit tests for the observation error model (paleoreco.assim.observations).
 
 ``representativeness_variance`` pools co-cell, co-age proxy pairs into a per-channel
 variance; these check it against a brute-force pair computation and pin the contract that
-keeps the withholding estimate leakage-free (the ``sites`` filter).
+keeps the withholding estimate leakage-free (the ``sites`` filter). The temporal terms are
+checked against a structure function with a known lag correlation.
 """
 
 from __future__ import annotations
@@ -14,9 +15,8 @@ import pandas as pd
 import pytest
 
 from paleoreco.assim.observations import (
-    TEMPORAL_ADD,
-    TEMPORAL_DEFLATE,
-    apply_temporal_error,
+    ObservationModel,
+    deflate,
     representativeness_variance,
     temporal_terms,
 )
@@ -136,43 +136,34 @@ def test_residual_variance_uses_the_floored_correlation():
     assert resid[0] == pytest.approx(1.0 * (1.0 - 0.05 ** 2))
 
 
-def test_zero_lag_leaves_every_mode_untouched():
+def test_zero_lag_leaves_the_observation_untouched():
     y, sse = np.array([2.0]), np.array([0.5])
     rho, resid = temporal_terms(_S, _VAR, _G, np.array([0.0]), 25.0)
-    for mode in (TEMPORAL_ADD, TEMPORAL_DEFLATE):
-        yy, rr = apply_temporal_error(y, sse, rho, resid, mode)
-        assert yy == pytest.approx(y)
-        assert rr == pytest.approx(sse)
+    yy, rr = deflate(y, sse, rho, resid)
+    assert yy == pytest.approx(y)
+    assert rr == pytest.approx(sse)
 
 
-def test_deflate_undoes_the_attenuation_that_add_leaves():
-    """Only deflation recovers the state; inflating R cannot repair a slope.
-
-    A stale reading of a state that has decayed to ``rho`` times its value implies the
-    full-size state, which is what the update is solving for.
+def test_deflation_undoes_the_attenuation():
+    """A stale reading of a state that has decayed to ``rho`` times its value implies the
+    full-size state, which is what the update is solving for; R pays for it in ``rho^2``.
     """
     rho, resid = temporal_terms(_S, _VAR, _G, np.array([50.0]), 25.0)   # rho = 0.5
     truth = np.array([4.0])
-    y = rho * truth                                                     # what a sample reads
-
-    y_add, r_add = apply_temporal_error(y, np.array([0.1]), rho, resid, TEMPORAL_ADD)
-    y_def, r_def = apply_temporal_error(y, np.array([0.1]), rho, resid, TEMPORAL_DEFLATE)
-
-    assert y_add == pytest.approx(2.0)          # still attenuated
-    assert y_def == pytest.approx(truth)        # points at the state being solved for
-    assert r_def == pytest.approx(r_add / rho ** 2)
+    y_def, r_def = deflate(rho * truth, np.array([0.1]), rho, resid)
+    assert y_def == pytest.approx(truth)
+    assert r_def == pytest.approx((0.1 + resid) / rho ** 2)
 
 
 def test_a_stale_observation_is_trusted_less_the_further_it_sits():
     y, sse = np.array([1.0]), np.array([0.5])
-    for mode in (TEMPORAL_ADD, TEMPORAL_DEFLATE):
-        r = [apply_temporal_error(y, sse, *temporal_terms(_S, _VAR, _G,
-                                                          np.array([lag]), 25.0), mode)[1][0]
-             for lag in (0.0, 25.0, 50.0)]
-        assert r[0] < r[1] < r[2], (mode, r)
+    r = [deflate(y, sse, *temporal_terms(_S, _VAR, _G, np.array([lag]), 25.0))[1][0]
+         for lag in (0.0, 25.0, 50.0)]
+    assert r[0] < r[1] < r[2], r
 
 
-def test_apply_temporal_error_rejects_unknown_mode():
-    with pytest.raises(ValueError):
-        apply_temporal_error(np.array([1.0]), np.array([1.0]),
-                             np.array([1.0]), np.array([0.0]), "bogus")
+def test_an_observation_model_is_named_by_the_terms_it_carries():
+    assert ObservationModel(spatial=False, temporal=False).name == "sse"
+    assert ObservationModel(spatial=True, temporal=False).name == "sse_spatial"
+    assert ObservationModel(spatial=False, temporal=True).name == "sse_temporal"
+    assert ObservationModel(spatial=True, temporal=True).name == "sse_spatial_temporal"

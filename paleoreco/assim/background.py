@@ -1,4 +1,4 @@
-"""Background state, error covariance, and temporal structure from the Prior cube.
+"""Background error covariance and temporal structure from the Prior cube.
 
 The state vector is one snapshot ``cube[k]`` of shape ``(2, n_lat, n_lon)``
 flattened in C order to length ``D = 2 * n_lat * n_lon``; channel ``mtco`` fills
@@ -13,25 +13,6 @@ from __future__ import annotations
 import numpy as np
 
 
-def background_state(
-    cube: np.ndarray,
-    mean: np.ndarray,
-    age_index: int,
-    kind: str,
-) -> np.ndarray:
-    """Flattened background state for one age.
-
-    ``per_age`` returns the Prior snapshot at ``age_index``; ``climatological``
-    returns the per-cell time mean (constant across ages, identically zero once
-    anomaly-scored).
-    """
-    if kind == "per_age":
-        return cube[age_index].ravel().astype(float)
-    if kind == "climatological":
-        return mean.ravel().astype(float)
-    raise ValueError(f"unknown background kind {kind!r}; expected 'per_age' or 'climatological'")
-
-
 def background_covariance(cube: np.ndarray, age_indices: np.ndarray) -> np.ndarray:
     """Full ``(D, D)`` sample covariance of Prior anomalies over the given ages.
 
@@ -41,11 +22,6 @@ def background_covariance(cube: np.ndarray, age_indices: np.ndarray) -> np.ndarr
     X = cube[age_indices].reshape(len(age_indices), -1).astype(np.float64)
     X -= X.mean(axis=0, keepdims=True)
     return (X.T @ X) / (len(age_indices) - 1)
-
-
-def background_variance(cov: np.ndarray) -> np.ndarray:
-    """Per-cell background variance, the diagonal of B."""
-    return np.diag(cov).copy()
 
 
 def temporal_structure_function(

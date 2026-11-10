@@ -1,7 +1,7 @@
 """Tests for the gain-form 3DVar analysis (paleoreco.assim.threedvar).
 
-Pins the closed-form algebra against an explicit construction of
-x_a = x_b + B H^T (H B H^T + R)^-1 (y - H x_b) and A = (I - K H) B.
+Pins the amplitude sweep against an explicit construction of
+x_a = x_b + k B H^T (k H B H^T + R)^-1 (y - H x_b) and A = (I - K H) k B.
 """
 
 from __future__ import annotations
@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 
 from paleoreco.assim.threedvar import ThreeDVar
+
+B_SCALES = np.array([0.25, 1.0, 5.0])
 
 
 @pytest.fixture
@@ -23,84 +25,43 @@ def setup():
     sse = np.array([0.5, 1.0, 2.0])
     x_b = rng.normal(size=D)
     y = rng.normal(size=len(gather))
-    return shape, D, B, gather, sse, x_b, y
+    return shape, B, gather, sse, x_b, y
 
 
-def _explicit(B, gather, sse, x_b, y):
-    B_obs = B[:, gather]
-    S = B[np.ix_(gather, gather)] + np.diag(sse)
-    Sinv = np.linalg.inv(S)
-    d = y - x_b[gather]
-    x_a = x_b + B_obs @ Sinv @ d
-    A = B - B_obs @ Sinv @ B_obs.T
-    return x_a, np.diag(A)
+def _explicit(B, gather, sse, x_b, y, k):
+    B_obs = k * B[:, gather]
+    Sinv = np.linalg.inv(k * B[np.ix_(gather, gather)] + np.diag(sse))
+    x_a = x_b + B_obs @ Sinv @ (y - x_b[gather])
+    return x_a, np.diag(k * B - B_obs @ Sinv @ B_obs.T)
 
 
-def test_analysis_matches_explicit_gain(setup):
-    shape, D, B, gather, sse, x_b, y = setup
+def test_every_amplitude_matches_the_explicit_gain(setup):
+    shape, B, gather, sse, x_b, y = setup
     tv = ThreeDVar(B, shape)
-    from paleoreco.assim.method import Observations
-
-    res = tv.analyze(Observations(gather=gather, y_anom=y, sse=sse), x_b)
-    x_a_exp, pv_exp = _explicit(B, gather, sse, x_b, y)
-
-    assert np.allclose(res.mean_anom.ravel(), x_a_exp)
-    assert np.allclose(res.posterior_var.ravel(), pv_exp)
+    sweep = tv.apply_sweep(tv.prepare_sweep(gather, sse, B_SCALES), y, x_b)
+    for k, res in zip(B_SCALES, sweep):
+        x_a, post_var = _explicit(B, gather, sse, x_b, y, k)
+        assert np.allclose(res.mean_anom.ravel(), x_a)
+        assert np.allclose(res.posterior_var.ravel(), post_var)
 
 
 def test_posterior_var_does_not_exceed_prior(setup):
-    shape, D, B, gather, sse, x_b, y = setup
+    shape, B, gather, sse, _, _ = setup
     tv = ThreeDVar(B, shape)
-    gain = tv.prepare(gather, sse)
-    # Assimilation can only reduce variance: diag A <= diag B everywhere.
-    assert np.all(gain.post_var <= np.diag(B) + 1e-9)
-    # Observed cells are strictly reduced.
-    assert np.all(gain.post_var[gather] < np.diag(B)[gather])
+    post_var = tv.post_var_sweep(tv.prepare_sweep(gather, sse, B_SCALES))
+    for k, pv in zip(B_SCALES, post_var):
+        # Assimilation can only reduce variance, and strictly so at the observed cells.
+        assert np.all(pv <= k * np.diag(B) + 1e-9)
+        assert np.all(pv[gather] < k * np.diag(B)[gather])
 
 
-def test_analyze_many_equals_repeated_analyze(setup):
-    shape, D, B, gather, sse, x_b, y = setup
+def test_the_mean_only_analysis_gives_the_full_analysis_mean(setup):
+    """A grid scan reads the mean alone, so skipping the spread must not move it at all."""
+    shape, B, gather, sse, x_b, y = setup
     tv = ThreeDVar(B, shape)
-    from paleoreco.assim.method import Observations
-
-    obs = Observations(gather=gather, y_anom=y, sse=sse)
-    rng = np.random.default_rng(11)
-    bgs = [rng.normal(size=D) for _ in range(3)]
-    many = tv.analyze_many(obs, bgs)
-    for bg, res in zip(bgs, many):
-        single = tv.analyze(obs, bg)
-        assert np.allclose(res.mean_anom, single.mean_anom)
-
-
-def test_sweep_at_unit_scale_matches_plain_analysis(setup):
-    shape, D, B, gather, sse, x_b, y = setup
-    tv = ThreeDVar(B, shape)
-    from paleoreco.assim.method import Observations
-
-    b_scales = np.array([0.5, 1.0, 2.0])
-    sweep_gain = tv.prepare_sweep(gather, sse, b_scales)
-    sweep = tv.apply_sweep(sweep_gain, y, x_b)
-    post_var = tv.post_var_sweep(sweep_gain)
-
-    plain = tv.analyze(Observations(gather=gather, y_anom=y, sse=sse), x_b)
-    unit = list(b_scales).index(1.0)
-    assert np.allclose(sweep[unit].mean_anom, plain.mean_anom)
-    assert np.allclose(post_var[unit], plain.posterior_var.ravel())
-    assert np.allclose(sweep[unit].posterior_var.ravel(), plain.posterior_var.ravel())
-
-
-def test_result_posterior_var_matches_the_value_free_sweep(setup):
-    """The lanes read spread off the analyses rather than asking for it separately.
-
-    A fixed covariance makes the two identical, which is what keeps every stored 3DVar
-    result comparable with one produced by an estimator whose spread depends on the
-    observations and so has no value-free form.
-    """
-    shape, D, B, gather, sse, x_b, y = setup
-    tv = ThreeDVar(B, shape)
-    b_scales = np.array([0.25, 1.0, 5.0])
-    gain = tv.prepare_sweep(gather, sse, b_scales)
-    sweep = tv.apply_sweep(gain, y, x_b)
-    post_var = tv.post_var_sweep(gain)
-    for bj in range(len(b_scales)):
-        assert np.array_equal(sweep[bj].posterior_var.ravel(), post_var[bj])
+    gain = tv.prepare_sweep(gather, sse, B_SCALES)
+    full = tv.apply_sweep(gain, y, x_b)
+    lean = tv.apply_sweep(gain, y, x_b, mean_only=True)
+    for a, b in zip(full, lean):
+        assert np.array_equal(a.mean_anom, b.mean_anom)
+        assert b.posterior_var is None
