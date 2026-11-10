@@ -7,18 +7,12 @@ Marine Isotope Stage 3**
 MSc Computing individual project, Department of Computing, Imperial College London, 2026.\
 Author: Evgeni Galinov Georgiev. Supervisor: Dr. Sibo Cheng.
 
-This repository holds the code for the thesis: the three estimators it compares, the
-experiments that score them, the MIS3 reconstruction, and the notebook that draws every figure
-and table in the report.
+This repository holds the code for the thesis: the estimators it compares, the experiments
+that score them, the MIS3 reconstruction, and the notebook that draws every figure and table
+in the report.
 
-<p align="center">
-  <img src="docs/figures/do_composite.png" width="100%"
-       alt="Interstadial minus stadial MTCO and MTWA maps from the reconstruction, with pollen sites">
-</p>
-
-*The reconstruction's Dansgaard–Oeschger (D–O) composite: interstadial minus stadial
-temperature of the coldest month (MTCO, left) and warmest month (MTWA, right), averaged over
-eight D–O events of MIS3, at background amplitude c = 5. Dots are the pollen sites.*
+> **Results pending the full re-run.** Every number, figure and operating point that depends
+> on a run of the pipeline is marked as pending below.
 
 ## Overview
 
@@ -33,22 +27,20 @@ are near-duplicates (median lag-1 autocorrelation 0.95).
 The hybrid gain analog offline EnKF (HGAOEnKF) of
 [Sun et al. (2024)](https://doi.org/10.1029/2022MS003414) builds its prior ensemble from the
 archive states that best match the observations. In an archive this redundant, selection
-returns near-identical members, the analog covariance collapses, and tuning switches it off
-(hybrid weight α = 0). **MTA-HGAOEnKF** makes two changes:
+returns near-identical members and the analog covariance collapses. **MTA-HGAOEnKF** makes two
+changes:
 
 - **Evidence rule.** Candidates are ranked by their marginal likelihood,
   $`p(\mathbf{y} \mid j) = \mathcal{N}(\mathbf{y};\ \mathbf{H}\mathbf{x}_j,\ \kappa\mathbf{H}\mathbf{B}\mathbf{H}^\top + \mathbf{R})`$,
-  rather than by the R-weighted misfit, which is its κ = 0 case. This trades a slightly worse
-  prior mean for a wider ensemble.
+  rather than by the R-weighted misfit, which is its κ = 0 case. The evidence scale κ is tuned.
 - **Multiscale Tendency Augmentation (MTA).** Around each selected state, first differences of
   the archive at seven lags (200 to 3,200 yr) and second differences at two (400 and 1,600 yr)
-  are appended to the analog deviations. The appended rows are centred, so the prior mean is
-  unchanged, and the stack is rescaled to hold the covariance's observation-space trace fixed,
-  so it reallocates variance rather than inflating it.
+  are added to the analog covariance. A tuned share w of the covariance's whitened
+  observation-space variance is moved from the member deviations to these tendency rows, so
+  MTA reallocates variance rather than inflating it.
 
-With both changes, tuning selects α = 1: the analog covariance carries the whole gain. The
-method is then run on the real pollen network at every age to give a spatially complete MTCO
-and MTWA reanalysis of 49,175 to 29,100 BP, with a posterior variance at every cell.
+The method is then run on the real pollen network at every age to give a spatially complete
+MTCO and MTWA reanalysis of 49,175 to 29,100 BP, with a posterior variance at every cell.
 
 ## Method
 
@@ -58,23 +50,28 @@ and MTWA reanalysis of 49,175 to 29,100 BP, with a posterior variance at every c
 
 *Orange marks what MTA-HGAOEnKF adds to HGAOEnKF.*
 
-With $`\mathbf{X}'`$ the deviations of the $`k`$ selected members and $`\mathbf{T}_i`$ the centred
-difference blocks, the analog covariance becomes
+With $`\mathbf{X}'`$ the deviations of the $`k`$ selected members, $`\mathbf{T}`$ the centred
+difference blocks stacked with each block put on the amplitude of the 400 yr first difference,
+and $`t_X`$, $`t_T`$ their traces in whitened observation space at the observed cells, the
+analog covariance is
 
 ```math
-\mathbf{Z} = \beta \begin{bmatrix} \mathbf{X}' \\ \theta s_1 \mathbf{T}_1 \\ \vdots \\ \theta s_n \mathbf{T}_n \end{bmatrix},
+\mathbf{Z} = \begin{bmatrix} \sqrt{1 - w}\,\mathbf{X}' \\ \sqrt{w\, t_X / t_T}\,\mathbf{T} \end{bmatrix},
 \qquad
-\mathbf{P} = \frac{\mathbf{Z}^\top \mathbf{Z}}{k - 1},
+\mathbf{P} = \frac{\mathbf{Z}^\top \mathbf{Z}}{k - 1}.
 ```
 
-where $`s_i`$ puts every lag on a common amplitude, $`\theta`$ weights the augmentation, and
-$`\beta`$ is set so that $`\mathrm{tr}(\mathbf{R}^{-1/2}\mathbf{H}\mathbf{P}\mathbf{H}^\top\mathbf{R}^{-1/2})`$
-equals that of the unaugmented ensemble. Everything else is the HGAOEnKF update: one prior
-mean, and an analog and a static gain summed at weight α.
+The trace of $`\mathbf{R}^{-1/2}\mathbf{H}\mathbf{P}\mathbf{H}^\top\mathbf{R}^{-1/2}`$ is the
+same at every w. At w = 0 the estimator is HGAOEnKF with the evidence rule; at w = 1 only the
+tendency directions remain, about the same analog mean. Everything else is the HGAOEnKF update:
+one prior mean, and an analog and a static gain summed at weight α. Both covariances share one
+taper.
 
-All three estimators share one observation model. Each sample's stated error is inflated by a
-spatial term for a point proxy standing in for its 5.625° cell, and by a temporal term for a
-sample dated to a block rather than to the age it is assimilated at.
+Each lane uses the observation model its observations call for. On the snapshot lane a
+pseudo-proxy sits on the truth's own cell and age, so R is each sample's stated error. On the
+time-series lane a sample is read at its own dating-block centre, so R adds a temporal term for
+a sample assimilated at another age. On the real-proxy withholding lane and in the product, R
+also adds a spatial term for a point proxy standing in for its 5.625° cell.
 
 ## Results
 
@@ -83,41 +80,25 @@ Each estimator is scored on three evaluation lanes, which answer different quest
 | Lane | Prior | Truth | Observations |
 |---|---|---|---|
 | Pseudo-proxy snapshot | older half of the archive | each younger-half state | a real network's geometry, read from the truth, with site noise |
-| Pseudo-proxy time series | older half | the younger half, in sequence | each sample read at its own dating-block centre, a median 175 yr away |
-| Real-proxy site withholding | all 804 states | withheld pollen | real pollen, five site folds, one held out at a time |
+| Pseudo-proxy time series | older half | the younger half, in sequence | each sample read at its own dating-block centre |
+| Real-proxy site withholding | all 804 states | withheld pollen | real pollen in five site folds, each predicted once from the other four |
 
-Held-out test skill, pooled over both channels (rRMSE lower is better, CE higher is better):
+Only the snapshot lane tunes the covariance taper and the analog parameters. The time-series
+lane inherits them and selects the background amplitude c on its own selection arm. The
+withholding lane inherits them too and reports every c.
 
-| Estimator | Snapshot rRMSE | Snapshot CE | Time series rRMSE | Time series CE | Withholding rRMSE | Withholding CE |
-|---|---:|---:|---:|---:|---:|---:|
-| inverse-distance weighting | 0.8948 | 0.1993 | 0.9476 | 0.1051 | 1.0205 | −0.0413 |
-| 3DVar | 0.5903 | 0.6515 | 0.6981 | 0.5143 | **0.9563** | **0.0854** |
-| HGAOEnKF | 0.5835 | 0.6596 | 0.6794 | 0.5399 | 0.9582 | 0.0819 |
-| MTA-HGAOEnKF | **0.5531** | **0.6941** | **0.6742** | **0.5470** | 0.9587 | 0.0810 |
-
-MTA-HGAOEnKF is best on both pseudo-proxy lanes. It also improves CRPS over HGAOEnKF on all
-three lanes, and it is far less sensitive to the choice of background amplitude than either
-comparator. The withholding lane cannot separate the three estimators: over 5,000 resamples of
-the 187 sites, every pairwise difference has a 95% interval that straddles zero.
-
-<p align="center">
-  <img src="docs/figures/skill_vs_distance.png" width="85%" alt="CE against distance to the nearest observation">
-</p>
-
-*Snapshot lane CE against distance to the nearest assimilated observation. Grey bars show how
-many cells fall in each bin. Most of the gain is far from the network, which is where most of
-the grid lies.*
+*Held-out skill and calibration for 3DVar, HGAOEnKF, evidence-only HGAOEnKF and MTA-HGAOEnKF on
+the three lanes: pending the full re-run.*
 
 ## The reconstruction
 
-The reconstruction is published as `reconstruction_fields.npz` (159 MB) with the
-`reconstruction_config.json` that produced it, attached to the
-[latest release](https://github.com/evgeni-g-georgiev/sparse_paleoclimate_field_reconstruction/releases/latest).
-It holds one analysis per archive age, 49,175 to 29,100 BP at 25-year steps, for both channels
-on the 32 × 64 grid, at five background amplitudes c ∈ {0.3, 1, 2, 5, 10}. The amplitudes are
-published side by side because nothing without a truth can choose between them; the thesis
-quotes c = 5. The configuration is k = 100, α = 1, θ = 2, the nine-block stack above, and the
-evidence rule with κ = 1.
+The reconstruction is written to `outputs/product/` as `reconstruction_fields.npz` with the
+`reconstruction_config.json` that produced it. It holds one analysis per archive age, 49,175 to
+29,100 BP at 25-year steps, for both channels on the 32 × 64 grid, at five background
+amplitudes c ∈ {0.3, 1, 2, 5, 10}. The amplitudes are published side by side because nothing
+without a truth can choose between them. The configuration is MTA-HGAOEnKF at the snapshot
+lane's selected k, α, κ, w and taper, with the stack above and every one of the 804 states as
+the prior; the config records each of them. *The selected values are pending the full re-run.*
 
 | Array | Shape | Units | Contents |
 |---|---|---|---|
@@ -134,7 +115,7 @@ evidence rule with κ = 1.
 | `prior_only` | (804,) | | true at the 36 ages with no pollen |
 | `safe_valid` | (32, 64) | | cells kept by the prior (all of them on this grid) |
 | `prior_mean_anom` | (804, 2, 32, 64) | °C | the analog ensemble mean each analysis updated |
-| `analog_index` | (804, 100) | | archive indices of the 100 members selected at each age |
+| `analog_index` | (804, k) | | archive indices of the k members selected at each age |
 | `chi2_bg`, `chi2_an` | (804,), (5, 804) | | innovation and analysis residual, whitened by R |
 | `desroziers_r` | (5, 804) | | Desroziers ratio; 1 where the assumed R matches the residuals |
 | `innov_r_mean` | (804,) | °C² | mean observation-error variance at each age |
@@ -150,14 +131,10 @@ mtco = z["clim_mean"][0] + z["mean_anom"][c, :, 0]   # (804, 32, 64), °C
 mtco_sd = np.sqrt(z["post_var"][c, :, 0])
 ```
 
-Some limits on reading it:
-
-- The posterior is overconfident on every evaluation lane, so `post_var` understates the error.
-- Variability faster than about 250 years is not resolved: dating uncertainty in the pollen
-  exceeds it, and on the time series lane the 25–100 and 100–250 yr bands score below climatology.
-- Skill falls with distance from the network, and most of the grid is far from it.
-- The 36 ages from 29,975 to 29,100 BP have no pollen. There the field is the climatology and
-  the variance is the prior's, scaled by c.
+The 36 ages from 29,975 to 29,100 BP have no pollen. There the field is the climatology and
+the variance is the prior's, scaled by c. *What the lanes say about reading the rest of the
+field (calibration, the timescales resolved, skill against distance from the network) is
+pending the full re-run.*
 
 ## Getting started
 
@@ -187,31 +164,32 @@ path above. The expected MD5 checksums are `495f7b61a65142af943be8c55eaea8c8` fo
 and `34e330b7a63f84db50dcd6448b41c4fb` for `Observation.csv`. The prior is parsed once and
 cached under `data/cache/`.
 
-## Reproducing the thesis
+## Reproducing the results
 
 ```bash
-make test      # 234 unit and integration tests, about 30 s
-make smoke     # every stage at reduced size, into outputs/_smoke
-make all       # the full pipeline, about 16 h on an M1 MacBook Air
+make test      # unit and integration tests, a few seconds
+make smoke     # every stage at reduced size into outputs/_smoke, then the notebook, 5 to 8 min
+make all       # the full pipeline
 make figures   # re-run the results notebook from the stored outputs
 ```
 
-`make all` runs the stages `scripts/00` to `06` in order and then executes
+`make all` runs the stages `scripts/00` to `04` in order and then executes
 `notebooks/final_results.ipynb`, which reads the stored outputs, runs no estimator, and writes
 every figure, table and quoted number in the report. [`scripts/README.md`](scripts/README.md)
-gives each stage's cost, what it inherits, and how to re-run one on its own. BLAS is held to one
-thread: the work is thousands of small eigendecompositions, which run several times slower when
-split across cores.
+gives what each stage inherits and how to re-run one on its own. Setting `PALEORECO_OUTPUTS`
+points every stage and the notebook at another outputs root. BLAS is held to one thread: the
+work is thousands of small eigendecompositions, which run several times slower when split
+across cores.
 
 ## Where things are
 
 ```
 paleoreco/
-  assim/        estimators, observation model, evaluation lanes, reconstruction
-  data/         prior cube loader and age-axis splits
-  eval/         skill (rRMSE, CE, SSIM) and calibration (CRPS, RCRV) metrics
+  assim/        estimators, observation model, evaluation lanes, grids, reconstruction
+  data/         prior cube loader and the age axis
+  eval/         skill (rRMSE, CE, SSIM), calibration (CRPS, RCRV) and the metric rows
   report/       figure and table helpers for the results notebook
-scripts/        pipeline stages 00 to 06
+scripts/        pipeline stages 00 to 04
 notebooks/      final_results.ipynb, the source of every report figure and table
 tests/          unit and integration tests
 docs/figures/   figures used in this README
@@ -219,13 +197,14 @@ docs/figures/   figures used in this README
 
 | In the thesis | In the code |
 |---|---|
-| 3DVar, gain form and whitened amplitude sweep | `paleoreco/assim/threedvar.py` |
+| 3DVar, gain form and whitened amplitude sweep | `paleoreco/assim/threedvar.py`, `ensrf.py` |
 | Localisation L, shrinkage λ, channel coupling γ | `paleoreco/assim/priors.py` |
-| HGAOEnKF hybrid gain; MTA stack and trace preservation | `paleoreco/assim/hgaoenkf.py` |
+| HGAOEnKF hybrid gain; MTA stack and tendency share | `paleoreco/assim/hgaoenkf.py` |
 | Misfit, correlation and evidence selection rules | `paleoreco/assim/analog.py` |
 | Spatial and temporal observation error | `paleoreco/assim/observations.py`, `background.py` |
-| The three evaluation lanes and tuning grids | `paleoreco/assim/experiments.py` |
-| The reconstruction | `paleoreco/assim/reconstruction.py`, `scripts/06_product.py` |
+| The three evaluation lanes | `paleoreco/assim/lanes.py` |
+| Tuning grids and inheritance between lanes | `paleoreco/assim/experiments.py` |
+| The reconstruction | `paleoreco/assim/reconstruction.py`, `scripts/04_product.py` |
 
 ## Data
 
