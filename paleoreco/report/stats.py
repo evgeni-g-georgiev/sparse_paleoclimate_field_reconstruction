@@ -16,11 +16,8 @@ from paleoreco.assim.background import temporal_structure_function
 from paleoreco.assim.ensrf import whitened_block
 from paleoreco.assim.hgaoenkf import HGAOEnKF
 from paleoreco.assim.innovation import obs_cell_index
-from paleoreco.assim.observations import (
-    observations_at_age,
-    sample_block_centres,
-    temporal_terms,
-)
+from paleoreco.assim.lanes import transplanted_source
+from paleoreco.assim.observations import RHO_FLOOR, sample_block_centres, temporal_terms
 from paleoreco.assim.priors import build_prior
 from paleoreco.data import VARS
 from paleoreco.data.splits import chronological_half_split
@@ -31,7 +28,6 @@ DO_POST_YR, DO_PRE_YR = 600, 300
 # Northern extratropics, the band Liu et al. report their seasonal ratio over.
 NET_LAT = 23.5
 N_BOOT = 5000
-RHO_FLOOR = 0.05                # the floor observations.temporal_terms applies
 
 
 # ---------------------------------------------------------------------------
@@ -187,17 +183,15 @@ def trajectory_pool(cube, ages, lats, lons, valid, taper):
 
 
 def mta_stack(pool, pool_ages, lats, lons):
-    """The shipped estimator's tendency stack, built over ``pool``; no analysis is run.
+    """MTA-HGAOEnKF's tendency stack, built over ``pool``; no analysis is run.
 
-    Only the stack geometry is read from it, so the taper passed in is irrelevant.
+    Only the stack geometry and its per-block scales are read from it, so the covariance
+    and the analog settings passed in are irrelevant.
     """
     return HGAOEnKF(pool, pool_ages, np.eye(1), (len(VARS), len(lats), len(lons)),
-                    lats, lons, k=60, hybrid_w=1.0,
+                    lats, lons, k=2, hybrid_w=1.0,
                     taper_meta={"localization_km": None, "shrinkage_lambda": 0.0, "alpha": 1.0},
-                    tendency_theta=2.0, tendency_lag_yr=ex.MT_REFERENCE_LAG_YR,
-                    tendency_extra_lags_yr=ex.MT_EXTRA_LAGS_YR,
-                    tendency_curvature_yr=ex.MT_CURVATURE_YR,
-                    tendency_normalise=True, preserve_obs_trace=True)
+                    stack=ex.MTA_STACK, tendency_share=1.0)
 
 
 def stack_response(mt, periods):
@@ -209,12 +203,11 @@ def stack_response(mt, periods):
     """
     omega = 2 * np.pi / periods
     response = np.zeros_like(periods)
-    for block in mt._tendency_blocks:
-        lag, second = block
+    for (lag, second), scale in mt.tendency_scale.items():
         h = (2 * np.abs(1 - np.cos(omega * lag)) if second else np.abs(np.sin(omega * lag)))
-        response += (mt._tendency_scale[block] * h) ** 2
+        response += (scale * h) ** 2
     response = np.sqrt(response); response /= response.max()
-    one_lag = np.abs(np.sin(omega * ex.MT_REFERENCE_LAG_YR)); one_lag /= one_lag.max()
+    one_lag = np.abs(np.sin(omega * mt.stack.reference)); one_lag /= one_lag.max()
     return response, one_lag
 
 
@@ -234,8 +227,8 @@ def whitened_spectra(prior, long, ages, lats, lons, trajectory):
         r = sl["sse"].to_numpy()
         keep = safe_flat[g] & (r > 0)
         g, r = g[keep], r[keep].astype(np.float64)
-        _, on_axis = ex.transplanted_source(sl["centre"].to_numpy()[keep],
-                                            int(shape_age), int(age), ages)
+        _, on_axis = transplanted_source(sl["centre"].to_numpy()[keep],
+                                         int(shape_age), int(age), ages)
         g, r = g[on_axis], r[on_axis]
         if len(g) < 10:
             continue
@@ -386,53 +379,14 @@ def withheld_mask(kind, distance_km, cell_observed):
     return np.nan_to_num(distance_km, nan=-1.0) > float(kind)
 
 
-def withheld_identity(long, ages, lats, lons, safe_valid, cfg):
-    """``(age, gather, centre, site, channel, actual, sse, cell_observed)`` of every pooled
-    test row of the real-proxy lane, in the order the lane stored its predictions.
-
-    The lane stores what each held-out prediction was, but not the age it sat at, so a second
-    predictor cannot be scored on the same rows without this. It replays the lane's fold
-    partition and age loop over the proxy table and reads nothing from an estimator; the
-    caller checks the result against the stored arrays. ``cell_observed`` marks rows whose own
-    cell also carried an assimilated observation at that age.
-    """
-    long = long[long["age"].isin({int(a) for a in ages})]
-    n_cells = len(lats) * len(lons)
-    safe_flat = np.broadcast_to(safe_valid, (len(VARS), len(lats), len(lons))).ravel()
-    dated = sample_block_centres(long)
-    obs_ages = np.intersect1d(long["age"].unique(), ages)
-    folds = [set(f.tolist()) for f in ex._site_folds(
-        long, int(cfg["k_folds"]), cfg["fold_kind"], int(cfg["seed"]))]
-    every = set(long["site"].unique().tolist())
-    rows = []
-    for fold in folds:
-        assimilated = every - fold
-        for age in obs_ages:
-            o = observations_at_age(dated, int(age))
-            g = obs_cell_index(o["lat"], o["lon"], o["channel"], lats, lons)
-            usable = safe_flat[g] & (o["sse"] > 0) & np.isfinite(o["my"])
-            given = usable & np.array([s in assimilated for s in o["site"]])
-            held = usable & np.array([s in fold for s in o["site"]])
-            if not given.any() or not held.any():
-                continue
-            given_cells = set(g[given].tolist())
-            rows.append(pd.DataFrame({
-                "age": int(age), "gather": g[held], "centre": o["centre"][held],
-                "site": o["site"][held], "channel": g[held] // n_cells,
-                "actual": o["y"][held] - o["my"][held], "sse": o["sse"][held],
-                "cell_observed": [c in given_cells for c in g[held]]}))
-    return pd.concat(rows, ignore_index=True)
-
-
-def loveclim_at_sites(cube, ages, clim_mean, ident, structure, step_yr):
+def loveclim_at_sites(cube, ages, clim_mean, predictions):
     """The simulation as a predictor of the withheld pollen.
 
-    The simulation's anomaly at each row's cell and age is multiplied by the same lag
-    correlation every estimator's prediction carries, which is what makes them comparable.
+    The simulation's anomaly at each withheld row's cell and age is multiplied by the row's
+    lag correlation, as an estimator's prediction is under the temporal term, which is what
+    makes them comparable.
     """
-    gather = ident["gather"].to_numpy()
-    age, centre = ident["age"].to_numpy(), ident["centre"].to_numpy()
-    rho, _ = temporal_terms(*structure, gather, np.abs(age - centre), step_yr)
     anom = (cube.astype(np.float64) - clim_mean).reshape(len(ages), -1)
     index = {int(a): i for i, a in enumerate(ages)}
-    return rho * anom[np.array([index[a] for a in age]), gather]
+    rows = np.array([index[int(a)] for a in predictions["age"]])
+    return predictions["rho"] * anom[rows, predictions["gather"]]

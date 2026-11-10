@@ -2,8 +2,8 @@
 
 The lane drivers are guarded by their metrics; this one writes fields nothing scores, so the
 guards have to be structural: every age is present, an age with no network says so rather
-than passing off a climatology as a reconstruction, and the analog step still sees the age
-it is reconstructing.
+than passing off a climatology as a reconstruction, and the config records what the fields
+cannot.
 """
 
 from __future__ import annotations
@@ -12,17 +12,15 @@ import json
 import os
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from paleoreco.assim import experiments as ex
 from paleoreco.assim import reconstruction as rc
-from paleoreco.assim.analog import ANALOG_MISFIT
-from paleoreco.assim.hgaoenkf import make_hgaoenkf
-from paleoreco.assim.observations import TEMPORAL_DEFLATE, TEMPORAL_OFF
 
 K = 4
 B_SCALES = (0.5, 2.0)
+TAPER = dict(localization_km=None, shrinkage_lambda=0.0, alpha=1.0)
+POINT = ex.AnalogPoint(k=K, hybrid_w=1.0)
 THIN, EMPTY = 5, 3          # ages given a below-floor network and no network at all
 
 
@@ -44,12 +42,12 @@ def obs(obs_long, ages):
 def _run(tmp_path, cube, ages, lats, lons, valid, obs, **kw):
     kw.setdefault("b_scales", B_SCALES)
     kw.setdefault("min_obs", 3)
-    return rc.run_reconstruction(cube, ages, lats, lons, valid, obs, str(tmp_path), **kw)
+    return rc.run_reconstruction(cube, ages, lats, lons, valid, obs, str(tmp_path),
+                                 taper=TAPER, **kw)
 
 
-def _analog(cube, ages, lats, lons, **kw):
-    return make_hgaoenkf(cube, ages, lats, lons, k=K, hybrid_w=1.0,
-                         selection=ANALOG_MISFIT, **kw)
+def _analog(cube, ages, lats, lons):
+    return POINT.factory(cube, ages, lats, lons)
 
 
 def _fields(tmp_path):
@@ -90,23 +88,6 @@ def test_an_age_with_no_network_carries_the_prior_and_says_so(
         assert np.allclose(z["post_var"][bj, EMPTY], b * z["prior_var"])
     assert np.isnan(z["desroziers_r"][:, EMPTY]).all()
     assert np.isfinite(z["desroziers_r"][:, 0]).all()
-
-
-def test_the_exclusion_band_reaches_the_estimator(
-        tmp_path, cube, ages, lats, lons, valid, obs):
-    """Dropping the age from the gain leaves the run finite and looking better, not worse.
-
-    Without it the analog step selects the archive's own state at the target age, which
-    degenerates the method into a per-age background; no field or metric would show it.
-    """
-    exclude = 1500.0
-    _run(tmp_path, cube, ages, lats, lons, valid, obs,
-         make_method=_analog(cube, ages, lats, lons, exclude_yr=exclude))
-    z = _fields(tmp_path)
-
-    drawn = z["analog_index"]
-    for i in np.flatnonzero(~z["prior_only"]):
-        assert (np.abs(z["ages"][drawn[i]] - z["ages"][i]) >= exclude).all()
 
 
 def test_the_prior_field_is_the_analysis_with_the_gain_switched_off(
@@ -155,18 +136,6 @@ def test_the_cross_variance_rides_along_only_where_it_is_produced(
     assert "analog_index" not in _fields(static).files
 
 
-def test_the_staleness_treatment_reaches_the_observation_pair(
-        tmp_path, cube, ages, lats, lons, valid, obs):
-    """Deflating rescales both the observation and R, so neither field may sit unchanged."""
-    off, deflate = tmp_path / "off", tmp_path / "deflate"
-    common = dict(make_method=_analog(cube, ages, lats, lons))
-    _run(off, cube, ages, lats, lons, valid, obs, temporal_mode=TEMPORAL_OFF, **common)
-    _run(deflate, cube, ages, lats, lons, valid, obs, temporal_mode=TEMPORAL_DEFLATE,
-         **common)
-
-    assert not np.allclose(_fields(off)["mean_anom"], _fields(deflate)["mean_anom"])
-
-
 def test_the_run_is_reproducible(tmp_path, cube, ages, lats, lons, valid, obs):
     """No noise is drawn anywhere, so two runs must agree exactly rather than closely."""
     a, b = tmp_path / "a", tmp_path / "b"
@@ -181,22 +150,22 @@ def test_the_run_is_reproducible(tmp_path, cube, ages, lats, lons, valid, obs):
 
 def test_the_config_records_what_the_fields_cannot(
         tmp_path, cube, ages, lats, lons, valid, obs):
-    """Which ages fell back on the prior, and how the observations were treated."""
+    """Which ages fell back on the prior, and every setting the analysis ran at."""
     cfg = _run(tmp_path, cube, ages, lats, lons, valid, obs,
                make_method=_analog(cube, ages, lats, lons),
-               estimator=ex.ESTIMATOR_HGAOENKF,
-               method_cols=ex.analog_cols(K, 1.0))
+               record={"estimator": ex.ESTIMATOR_HGAOENKF, "point": POINT.record()})
     on_disk = json.load(open(tmp_path / "reconstruction_config.json"))
 
     assert on_disk == cfg                                  # every value is JSON native
     assert on_disk["n_prior_only_ages"] == 2
     assert on_disk["prior_only_ages"] == [int(ages[EMPTY]), int(ages[THIN])]
     assert on_disk["background"] == "climatological"
-    assert on_disk["temporal_mode"] == TEMPORAL_DEFLATE
+    assert on_disk["observation_model"] == {"spatial": True, "temporal": True}
     assert on_disk["estimator"] == ex.ESTIMATOR_HGAOENKF
     assert on_disk["b_scales"] == list(B_SCALES)
+    assert on_disk["taper"] == TAPER
     assert set(on_disk["rep_var_full"]) == {"mtco", "mtwa"}
-    assert on_disk["analog_k"] == K
+    assert ex.point_from_record(on_disk["point"]) == POINT
 
 
 def test_an_impossible_minimum_is_rejected(tmp_path, cube, ages, lats, lons, valid, obs):

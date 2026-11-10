@@ -34,8 +34,10 @@ CONNECT = "#7f7f7f"
 ESTIMATORS = (
     (ex.ESTIMATOR_3DVAR, "3DVar", "#6b6b6b", "o"),
     (ex.ESTIMATOR_HGAOENKF, "HGAOEnKF", "#3c5f8f", "s"),
-    (ex.ESTIMATOR_HGAOENKF_MT, "MTA-HGAOEnKF", "#c4692a", "D"),
+    (ex.ESTIMATOR_MTA, "MTA-HGAOEnKF", "#c4692a", "D"),
 )
+# HGAOEnKF with the evidence rule, which is compared with HGAOEnKF on its own.
+EVIDENCE = (ex.ESTIMATOR_EVIDENCE, "evidence-only", "#4a7a3f", "^")
 PRODUCT_C, SIM_C = "#c4692a", "#3c5f8f"
 
 # Differences in skill: blue where a comparator is better, orange where the contribution is.

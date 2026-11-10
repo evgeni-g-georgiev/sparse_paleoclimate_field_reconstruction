@@ -1,13 +1,14 @@
-"""Readers for the raw inputs and for the stored lane, ablation and product artefacts.
+"""Readers for the raw inputs and for the stored lane, grid, ablation and product artefacts.
 
-A lane's ``metrics.csv`` holds a whole grid of configurations, so most reads here are filters
-that pin every configuration column to one value and leave a single row.
+A run's ``metrics.csv`` holds one configuration over the amplitude sweep and a grid's holds a
+whole scan, so most reads here are filters that pin columns to values and leave one row.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -21,9 +22,6 @@ from paleoreco.assim.observations import (
     observation_site_stats,
 )
 from paleoreco.data import build_prior_cube
-
-TAPER_COLS = ("localization_km", "shrinkage_lambda", "alpha")
-POOLED_FOLD = -1
 
 
 @dataclass
@@ -42,16 +40,19 @@ class Inputs:
 
 
 def load_inputs() -> Inputs:
-    """Read the prior cube, both proxy tables and the product."""
+    """Read the prior cube, both proxy tables and the product.
+
+    The cube is cut to the ages the product was run on, which is every age of a full run.
+    """
     p = build_prior_cube(prior_csv=str(paths.PRIOR_CSV), cache_path=str(paths.PRIOR_CACHE))
     long = load_observations(str(paths.OBSERVATION_CSV))
     long = attach_site_stats(long, observation_site_stats(collapse_to_samples(long)))
-    d = paths.product_dir()
-    return Inputs(cube=p["cube"], ages=p["ages"], lats=p["lats"], lons=p["lons"],
-                  valid=p["valid"], long=long,
-                  raw=pd.read_csv(str(paths.OBSERVATION_CSV)),
-                  recon=np.load(d / "reconstruction_fields.npz"),
-                  recon_cfg=json.load(open(d / "reconstruction_config.json")))
+    recon = np.load(paths.PRODUCT / "reconstruction_fields.npz")
+    keep = np.isin(p["ages"], recon["ages"])
+    return Inputs(cube=p["cube"][keep], ages=p["ages"][keep], lats=p["lats"], lons=p["lons"],
+                  valid=p["valid"], long=long, raw=pd.read_csv(str(paths.OBSERVATION_CSV)),
+                  recon=recon,
+                  recon_cfg=json.load(open(paths.PRODUCT / "reconstruction_config.json")))
 
 
 def run_artifact(estimator: str, lane: str, name: str):
@@ -62,31 +63,37 @@ def run_artifact(estimator: str, lane: str, name: str):
 
 def config(estimator: str, lane: str) -> dict:
     """The stored config of one (estimator, lane)."""
-    name = {paths.LANE_PPE: "ppe_config.json",
-            paths.LANE_TRAJECTORY: "trajectory_config.json",
-            paths.LANE_WITHHOLDING: "withholding_random_config.json"}[lane]
-    return run_artifact(estimator, lane, name)
+    return run_artifact(estimator, lane, f"{lane}_config.json")
 
 
-def inherited_taper(estimator: str, lane: str) -> dict:
-    """The covariance taper one lane ran under, keyed as the prior builder expects."""
-    selected = config(estimator, lane)["selected"]
-    return {k: selected[k] for k in TAPER_COLS}
+def point(estimator: str) -> ex.AnalogPoint | None:
+    """The analog settings an estimator ran at on the snapshot lane, ``None`` for 3DVar."""
+    return ex.point_from_record(config(estimator, paths.LANE_PPE)["point"])
 
 
 def metrics(estimator: str, lane: str) -> pd.DataFrame:
     """The metrics table of one (estimator, lane)."""
-    return pd.read_csv(paths.run_dir(estimator, lane) / "metrics.csv")
+    return ex.read_metrics(paths.run_dir(estimator, lane))
 
 
-def ablation_metrics(name: str) -> pd.DataFrame:
+def grid_metrics(name: str) -> pd.DataFrame:
+    """The metrics table of one tuning grid."""
+    return ex.read_metrics(paths.grid_dir(name))
+
+
+def grid_config(name: str) -> dict:
+    """The axes and settings one tuning grid scanned."""
+    return json.load(open(paths.grid_dir(name) / ex.GRID_CONFIG))
+
+
+def ablation_metrics(name: str | Path) -> pd.DataFrame:
     """The metrics table of one ablation."""
-    return pd.read_csv(paths.ablation_dir(name) / "metrics.csv")
+    return ex.read_metrics(paths.ablation_dir(str(name)))
 
 
 def pooled(M: pd.DataFrame) -> pd.DataFrame:
-    """Rows scored over both channels, every event and, where folds exist, all folds."""
-    return M[(M.channel == "pooled") & (M.do_event == "all") & (M.fold == POOLED_FOLD)]
+    """Rows scored over both channels."""
+    return M[M.channel == "pooled"]
 
 
 def pick(M: pd.DataFrame, **cols) -> pd.DataFrame:
@@ -110,48 +117,26 @@ def value(M: pd.DataFrame, metric: str, **cols) -> float:
     return float(rows["value"].iloc[0])
 
 
-def selected_by_amplitude(M: pd.DataFrame, **cols) -> tuple[float, float]:
-    """``(c, selection rRMSE)`` at the amplitude the selection split scores lowest."""
-    sel = pick(M, split="selection", metric="rrmse", **cols)
-    best = sel.loc[sel["value"].idxmin()]
-    return float(best["b_scale"]), float(best["value"])
+def selected(M: pd.DataFrame, **cols) -> pd.Series:
+    """The pooled selection row with the lowest rRMSE among the rows matching ``cols``."""
+    return ex.select(pick(pooled(M), **cols))
+
+
+def test_at(M: pd.DataFrame, row: pd.Series) -> pd.Series:
+    """Pooled test metrics at the configuration and amplitude of a selection row."""
+    keys = [key for key in ("method", *ex.TAPER_COLS, *ex.ANALOG_COLS, "b_scale")
+            if key in M.columns]
+    cols = {key: (None if pd.isna(row[key]) else row[key]) for key in keys}
+    return pick(pooled(M), split="test", **cols).set_index("metric")["value"]
 
 
 def operating_point(estimator: str, lane: str, split: str = "test") -> pd.Series:
-    """Pooled metrics of one (estimator, lane) at the configuration its config selected.
-
-    The snapshot lane scores the analysis as run; the two lanes whose observations are displaced
-    in time score it with the temporal term deflated, the treatment every estimator carries.
-    """
-    cfg = config(estimator, lane)
-    method = (estimator if lane == paths.LANE_PPE
-              else ex.method_label(estimator, ex.TEMPORAL_DEFLATE))
-    M = pick(pooled(metrics(estimator, lane)), method=method, split=split)
-    return M[at_selected(M, cfg, cfg["selected"]["b_scale"])].set_index("metric")["value"]
+    """Pooled metrics of one (estimator, lane) at the amplitude its config selected."""
+    M = pick(pooled(metrics(estimator, lane)), method=estimator, split=split,
+             b_scale=config(estimator, lane)["b_scale"])
+    return M.set_index("metric")["value"]
 
 
-def lane_rows(estimator, lane, file_lane, *, method, split="test", **fixed):
-    """Pooled, all-event metric rows of one lane, filtered to one method and split."""
-    M = pd.read_csv(paths.run_dir(estimator, lane) / "metrics.csv")
-    m = ((M.method == method) & (M.split == split) & (M.channel == "pooled")
-         & (M.do_event == "all") & (M.lane == file_lane))
-    for key, v in fixed.items():
-        m &= np.isclose(M[key], v)
-    return M[m]
-
-
-def at_selected(M, cfg, b_scale):
-    """Mask of the rows a lane's config records as its selected configuration.
-
-    The taper is read from ``selected`` where the lane searched it and from the config's own
-    columns where it was inherited. A key absent from ``selected`` was never varied.
-    """
-    sel = cfg["selected"]
-    m = np.isclose(M["b_scale"], b_scale)
-    for key in TAPER_COLS:
-        v = sel.get(key, cfg.get(key))
-        m &= M[key].isna() if v is None else np.isclose(M[key], v)
-    for key in ("analog_k", "hybrid_w") + ex.TERM_KEYS:
-        if key in sel:
-            m &= np.isclose(M[key], sel[key])
-    return m
+def sweep(M: pd.DataFrame, metric: str, **cols) -> pd.Series:
+    """One pooled metric against ``c`` among the rows matching ``cols``."""
+    return pick(pooled(M), metric=metric, **cols).set_index("b_scale")["value"].sort_index()
